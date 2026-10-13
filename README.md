@@ -1,6 +1,6 @@
 # Photo library repair
 
-`repair_library.py` walks photo directories and produces one file per picture. Exact copies are collapsed first. Near-duplicates are grouped by perceptual hash. Each group then becomes one image: the best pixels, with capture time, GPS, and camera tags chosen from the members. Files stay where they are until the last step, which moves that one image into the result directory.
+`repair_library.py` walks photo directories and produces one file per picture. Exact copies are collapsed first. Near-duplicates are grouped by perceptual hash. Each group then becomes one image: the best pixels, with capture time, GPS, and camera tags chosen from the members. Files stay where they are until the last step, which copies that one image into the result directory. `--move` moves it instead.
 
 The notebooks in `notebooks/` inspect clustering. What each one reads and writes is described under [Notebooks](#notebooks).
 
@@ -35,11 +35,12 @@ python repair_library.py cluster --work work --algorithm optics --optics-max-eps
 python repair_library.py aggregate --work work
 python repair_library.py aggregate --work work --conflicts-only
 python repair_library.py apply --work work --result repaired
+python repair_library.py apply --work work --result repaired --move
 python repair_library.py all --dir PHOTO --work work --result repaired
 python repair_library.py --self-test
 ```
 
-`--dry-run` on `all` or `apply` prints the moves and does not perform them. Apply refuses to overwrite a file that is already in the result directory.
+`--dry-run` on `all` or `apply` prints each copy, or each move when `--move` is set, and does not perform it. Apply refuses to overwrite a file that is already in the result directory.
 
 ## Collection
 
@@ -65,11 +66,11 @@ ExifTool reads every member. One plan is written per cluster, including a one-im
 
 `--conflicts-only` reruns that plan for groups whose `conflicts` list is not empty. Every other group is copied from the existing `plan.json` unchanged. Use it after changing conflict rules so only the groups that were conflicts are read and planned again. Clustering is not repeated. A group that no longer conflicts is saved with an empty `conflicts` list.
 
-- **Pixels.** Largest width times height. Equal resolution prefers a better encoding: HEIC, then JPEG, then TIFF, PNG, WebP, and GIF. File size breaks the remaining ties. This file is the one apply moves.
+- **Pixels.** Largest width times height. Equal resolution prefers a better encoding: HEIC, then JPEG, then TIFF, PNG, WebP, and GIF. File size breaks the remaining ties. This file is the one apply copies, or moves when `--move` is set.
 - **Name.** Shortest basename. Equal lengths use the alphabetically earlier name. The extension is taken from the file bytes so ExifTool can write it.
-- **Capture time, GPS, and camera tags.** Chosen as described under conflicts. Tags are copied from the selected member onto the moved pixel file.
+- **Capture time, GPS, and camera tags.** Chosen as described under conflicts. Tags are copied from the selected member onto the result file.
 
-A conflict does not drop the group. The group is still emitted, and apply still moves its pixel file. `conflicts` on the plan, and later `result/report.json`, records why the metadata was not unanimous.
+A conflict does not drop the group. The group is still emitted, and apply still copies its pixel file. `conflicts` on the plan, and later `result/report.json`, records why the metadata was not unanimous.
 
 ## How conflicts are handled
 
@@ -101,7 +102,7 @@ Description, artist, copyright, keywords, and rating are copied from the other m
 
 ## Apply
 
-Apply moves the pixel source into the result directory under the planned name, then writes the chosen capture time, GPS, and camera tags onto that file with ExifTool. Other cluster members and the exact copies dropped during collection stay in the source directories.
+Apply copies the pixel source into the result directory under the planned name, then writes the chosen capture time, GPS, and camera tags onto that copy with ExifTool. The source file stays in place. `--move` moves the pixel source instead, so it is no longer in the source directory. Other cluster members and the exact copies dropped during collection stay where they are either way.
 
 `result/report.json` lists the output path, the source files, and any conflicts.
 

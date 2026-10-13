@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
-"""Repair a photo library in four steps. Only the last step moves files.
+"""Repair a photo library in four steps. Only the last step writes result files.
 
     python repair_library.py collect --dir PHOTO --work work
     python repair_library.py cluster --work work
     python repair_library.py aggregate --work work
     python repair_library.py apply --work work --result repaired
+    python repair_library.py apply --work work --result repaired --move
     python repair_library.py all --dir PHOTO --work work --result repaired
 
 Collection keeps the earliest byte-identical file. Clustering uses a 256-bit
 perceptual hash and HDBSCAN with Hamming distance. Groups farther apart than
 --max-hamming bits are split, so a cluster means the hashes are actually close.
 Aggregation plans one image per cluster, including single-image clusters.
-Apply moves that image into the result directory and writes merged EXIF.
+Apply copies that image into the result directory and writes merged EXIF.
+Pass --move to move it instead of copying.
 """
 
 from __future__ import annotations
@@ -654,7 +656,7 @@ def aggregate(
     return planned
 
 
-def apply_plan(work: Path, result: Path, exiftool: str, dry_run: bool) -> list[dict]:
+def apply_plan(work: Path, result: Path, exiftool: str, dry_run: bool, move: bool = False) -> list[dict]:
     planned = _read_json(work / "plan.json")
     if not isinstance(planned, list):
         raise SystemExit("plan.json must be a list")
@@ -678,24 +680,26 @@ def apply_plan(work: Path, result: Path, exiftool: str, dry_run: bool) -> list[d
 
     report: list[dict] = []
     jobs: list[tuple[Path, dict]] = []
+    verb = "move" if move else "copy"
     if dry_run:
         for plan, dest in destinations:
-            print(f"would move {plan['pixel_source']} -> {dest}", file=sys.stderr)
+            print(f"would {verb} {plan['pixel_source']} -> {dest}", file=sys.stderr)
             report.append({"output": str(dest), **plan})
-        print(f"dry-run: {len(report)} images would move into {result}", file=sys.stderr)
+        print(f"dry-run: {len(report)} images would {verb} into {result}", file=sys.stderr)
         return report
 
     result.mkdir(parents=True, exist_ok=True)
-    moving = ProgressBar("moving", len(destinations))
+    placing = ProgressBar("moving" if move else "copying", len(destinations))
+    transfer = shutil.move if move else shutil.copy2
     for done, (plan, dest) in enumerate(destinations, start=1):
-        shutil.move(plan["pixel_source"], dest)
+        transfer(plan["pixel_source"], dest)
         jobs.append((dest, plan))
         report.append({"output": str(dest), **plan})
-        moving.set(done)
-    moving.finish()
+        placing.set(done)
+    placing.finish()
     write_copies(exiftool, jobs, ProgressBar("writing metadata", len(jobs)))
     _write_json(result / "report.json", report)
-    print(f"moved {len(report)} images into {result}", file=sys.stderr)
+    print(f"{'moved' if move else 'copied'} {len(report)} images into {result}", file=sys.stderr)
     return report
 
 
@@ -784,10 +788,11 @@ def main(argv: list[str] | None = None) -> None:
         help="recompute only groups already marked as conflicts in plan.json",
     )
 
-    apply_parser = sub.add_parser("apply", help="move the chosen image into the result directory")
+    apply_parser = sub.add_parser("apply", help="copy the chosen image into the result directory")
     apply_parser.add_argument("--work", type=Path, required=True)
     apply_parser.add_argument("--result", type=Path, required=True)
     apply_parser.add_argument("--exiftool", default="exiftool")
+    apply_parser.add_argument("--move", action="store_true", help="move the chosen image instead of copying it")
     apply_parser.add_argument("--dry-run", action="store_true")
 
     all_parser = sub.add_parser("all", help="run collect, cluster, aggregate, and apply")
@@ -802,7 +807,8 @@ def main(argv: list[str] | None = None) -> None:
         help="capture times on files with camera data farther apart than this are a conflict (default 1d)",
     )
     _add_clustering_arguments(all_parser)
-    all_parser.add_argument("--dry-run", action="store_true", help="stop after the plan and do not move files")
+    all_parser.add_argument("--move", action="store_true", help="move the chosen image instead of copying it")
+    all_parser.add_argument("--dry-run", action="store_true", help="print where files would go and do not copy or move them")
 
     argv = list(sys.argv[1:] if argv is None else argv)
     if "--self-test" in argv:
@@ -816,15 +822,12 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "aggregate":
         aggregate(args.work, args.exiftool, args.max_capture_disagreement, args.conflicts_only)
     elif args.command == "apply":
-        apply_plan(args.work, args.result, args.exiftool, args.dry_run)
+        apply_plan(args.work, args.result, args.exiftool, args.dry_run, args.move)
     elif args.command == "all":
         collect(_require_dirs(args.dirs), args.work)
         cluster(args.work, **_clustering_kwargs(args))
         aggregate(args.work, args.exiftool, args.max_capture_disagreement)
-        if args.dry_run:
-            apply_plan(args.work, args.result, args.exiftool, True)
-            return
-        apply_plan(args.work, args.result, args.exiftool, False)
+        apply_plan(args.work, args.result, args.exiftool, args.dry_run, args.move)
     else:
         parser.error(f"unknown command {args.command}")
 
@@ -1045,11 +1048,16 @@ def _self_test() -> int:
         result = root / "result"
         apply_plan(work, result, "exiftool", True)
         assert kept.is_file()
-        moved = apply_plan(work, result, "exiftool", False)
+        copied = apply_plan(work, result, "exiftool", False)
+        assert len(copied) == 2
+        assert kept.is_file()
+        assert newer.is_file()
+        assert (result / "report.json").is_file()
+        moved_result = root / "moved"
+        moved = apply_plan(work, moved_result, "exiftool", False, move=True)
         assert len(moved) == 2
         assert not kept.is_file()
         assert newer.is_file()
-        assert (result / "report.json").is_file()
 
     print("self-test ok")
     return 0
