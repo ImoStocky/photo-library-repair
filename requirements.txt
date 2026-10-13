@@ -3,3 +3,6 @@ pillow
 imagehash
 scikit-learn
 pillow-heif
+pandas
+matplotlib
+jupyter

@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,8 @@ from cluster_lib import _label_singletons
 from merge_group_metadata import (
     ProgressBar,
     assign_output_names,
+    camera_score,
+    capture_instant,
     capture_of,
     index_metadata,
     plan_group,
@@ -41,8 +44,24 @@ from merge_group_metadata import (
 
 HASH_BITS = 256
 DEFAULT_MAX_HAMMING = 32
-CAPTURE_TOLERANCE_SECONDS = 2
+DEFAULT_OPTICS_MAX_EPS = 64
+DEFAULT_OPTICS_EPS = 32
+DEFAULT_MAX_CAPTURE_DISAGREEMENT = 86400.0
 CAPTURE_CONFLICT = "capture times disagree"
+_TIME_FIELDS = {
+    "EXIF:DateTimeOriginal",
+    "EXIF:CreateDate",
+    "EXIF:ModifyDate",
+    "EXIF:DateTimeDigitized",
+    "XMP:CreateDate",
+    "XMP:ModifyDate",
+    "XMP:DateTimeOriginal",
+    "XMP:DateTimeDigitized",
+    "IPTC:DateCreated",
+    "IPTC:TimeCreated",
+    "IPTC:DigitalCreationDate",
+    "IPTC:DigitalCreationTime",
+}
 
 
 def _write_json(path: Path, payload: object) -> None:
@@ -204,6 +223,14 @@ def cluster_bit_matrix(
     min_cluster_size: int = 2,
     min_samples: int = 2,
     max_hamming: int = DEFAULT_MAX_HAMMING,
+    algorithm: str = "hdbscan",
+    hdbscan_epsilon: int = 0,
+    hdbscan_method: str = "eom",
+    allow_single_cluster: bool = False,
+    optics_max_eps: int = DEFAULT_OPTICS_MAX_EPS,
+    optics_cluster_method: str = "xi",
+    optics_xi: float = 0.05,
+    optics_eps: int = DEFAULT_OPTICS_EPS,
 ) -> np.ndarray:
     """Cluster perceptual-hash bits. Each noise point becomes its own cluster."""
     matrix = np.asarray(bits, dtype=bool)
@@ -215,19 +242,52 @@ def cluster_bit_matrix(
         raise ValueError("min_samples must be at least 1")
     if max_hamming < 0:
         raise ValueError("max_hamming must be at least 0")
+    if algorithm not in {"hdbscan", "optics"}:
+        raise ValueError("algorithm must be hdbscan or optics")
+    if not 0 <= hdbscan_epsilon <= HASH_BITS:
+        raise ValueError(f"hdbscan_epsilon must be from 0 to {HASH_BITS}")
+    if hdbscan_method not in {"eom", "leaf"}:
+        raise ValueError("hdbscan_method must be eom or leaf")
+    if not 0 < optics_max_eps <= HASH_BITS:
+        raise ValueError(f"optics_max_eps must be from 1 to {HASH_BITS}")
+    if optics_cluster_method not in {"xi", "dbscan"}:
+        raise ValueError("optics_cluster_method must be xi or dbscan")
+    if not 0 < optics_xi < 1:
+        raise ValueError("optics_xi must be between 0 and 1")
+    if not 0 <= optics_eps <= optics_max_eps:
+        raise ValueError("optics_eps must be from 0 to optics_max_eps")
     count = matrix.shape[0]
     if count == 0:
         return np.array([], dtype=np.int64)
     if count < min_cluster_size:
         return np.arange(count, dtype=np.int64)
 
-    from sklearn.cluster import HDBSCAN
+    if algorithm == "hdbscan":
+        from sklearn.cluster import HDBSCAN
 
-    labels = HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min(min_samples, count),
-        metric="hamming",
-    ).fit_predict(matrix)
+        labels = HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min(min_samples, count),
+            metric="hamming",
+            cluster_selection_epsilon=hdbscan_epsilon / HASH_BITS,
+            cluster_selection_method=hdbscan_method,
+            allow_single_cluster=allow_single_cluster,
+        ).fit_predict(matrix)
+    else:
+        from sklearn.cluster import OPTICS
+
+        options: dict[str, object] = {
+            "min_samples": min(min_samples, count),
+            "min_cluster_size": min(min_cluster_size, count),
+            "metric": "hamming",
+            "max_eps": optics_max_eps / HASH_BITS,
+            "cluster_method": optics_cluster_method,
+        }
+        if optics_cluster_method == "xi":
+            options["xi"] = optics_xi
+        else:
+            options["eps"] = optics_eps / HASH_BITS
+        labels = OPTICS(**options).fit_predict(matrix)
     labeled = _label_singletons(labels)
     return enforce_max_hamming(labeled, matrix, max_hamming)
 
@@ -245,7 +305,20 @@ def _medoid_distances(block: np.ndarray) -> tuple[int, np.ndarray, int]:
     return medoid, distances[medoid], int(distances.max())
 
 
-def cluster(work: Path, min_cluster_size: int, min_samples: int, max_hamming: int) -> list[dict]:
+def cluster(
+    work: Path,
+    min_cluster_size: int = 2,
+    min_samples: int = 2,
+    max_hamming: int = DEFAULT_MAX_HAMMING,
+    algorithm: str = "hdbscan",
+    hdbscan_epsilon: int = 0,
+    hdbscan_method: str = "eom",
+    allow_single_cluster: bool = False,
+    optics_max_eps: int = DEFAULT_OPTICS_MAX_EPS,
+    optics_cluster_method: str = "xi",
+    optics_xi: float = 0.05,
+    optics_eps: int = DEFAULT_OPTICS_EPS,
+) -> list[dict]:
     unique = _read_json(work / "unique.json")
     if not isinstance(unique, dict) or not isinstance(unique.get("survivors"), list):
         raise SystemExit("unique.json must contain a survivors list")
@@ -293,6 +366,14 @@ def cluster(work: Path, min_cluster_size: int, min_samples: int, max_hamming: in
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
         max_hamming=max_hamming,
+        algorithm=algorithm,
+        hdbscan_epsilon=hdbscan_epsilon,
+        hdbscan_method=hdbscan_method,
+        allow_single_cluster=allow_single_cluster,
+        optics_max_eps=optics_max_eps,
+        optics_cluster_method=optics_cluster_method,
+        optics_xi=optics_xi,
+        optics_eps=optics_eps,
     )
     groups: list[dict] = []
     if len(hashed):
@@ -347,30 +428,145 @@ def cluster(work: Path, min_cluster_size: int, min_samples: int, max_hamming: in
         )
     groups.sort(key=lambda group: group["members"][0]["path"])
     _write_json(work / "clusters.json", groups)
+    _write_json(
+        work / "clustering.json",
+        {
+            "algorithm": algorithm,
+            "min_cluster_size": min_cluster_size,
+            "min_samples": min_samples,
+            "max_hamming": max_hamming,
+            "hdbscan_epsilon": hdbscan_epsilon,
+            "hdbscan_method": hdbscan_method,
+            "allow_single_cluster": allow_single_cluster,
+            "optics_max_eps": optics_max_eps,
+            "optics_cluster_method": optics_cluster_method,
+            "optics_xi": optics_xi,
+            "optics_eps": optics_eps,
+        },
+    )
     multi = sum(1 for group in groups if len(group["members"]) > 1)
     print(
-        f"clustered {len(survivors)} images into {len(groups)} groups, {multi} with more than one image, "
+        f"{algorithm} clustered {len(survivors)} images into {len(groups)} groups, "
+        f"{multi} with more than one image, "
         f"{len(cache['errors'])} hash failures, max hamming {max_hamming}",
         file=sys.stderr,
     )
     return groups
 
 
-def annotate_capture_conflict(plan: dict, entries: list[dict], metadata: dict[str, dict]) -> dict:
-    captures = []
-    for entry in entries:
-        when, _source = capture_of(metadata.get(str(entry["path"]), {}))
-        if when is not None:
-            captures.append(when)
-    if len(captures) >= 2 and (max(captures) - min(captures)).total_seconds() > CAPTURE_TOLERANCE_SECONDS:
-        conflicts = list(plan.get("conflicts") or [])
-        if CAPTURE_CONFLICT not in conflicts:
-            conflicts.append(CAPTURE_CONFLICT)
-        plan["conflicts"] = conflicts
+def _stable_exif_value(value: object) -> object:
+    if isinstance(value, list):
+        return tuple(_stable_exif_value(item) for item in value)
+    if isinstance(value, dict):
+        return tuple(sorted((str(key), _stable_exif_value(item)) for key, item in value.items()))
+    if isinstance(value, float):
+        return round(value, 6)
+    return value
+
+
+def exif_fingerprint(meta: dict) -> tuple:
+    """EXIF identity ignoring file paths and capture timestamps."""
+    items = []
+    for key, value in meta.items():
+        if key == "SourceFile" or key.startswith(("File:", "System:", "Composite:")):
+            continue
+        if key in _TIME_FIELDS or "SubSec" in key or "OffsetTime" in key:
+            continue
+        if value in (None, ""):
+            continue
+        items.append((key, _stable_exif_value(value)))
+    return tuple(sorted(items))
+
+
+def _use_capture(plan: dict, when: datetime, path: str) -> dict:
+    plan["capture_time"] = when.strftime("%Y:%m:%d %H:%M:%S")
+    plan["capture_source"] = path
     return plan
 
 
-def aggregate(work: Path, exiftool: str) -> list[dict]:
+def disagreement_seconds(left: datetime, right: datetime) -> float:
+    """Absolute difference. Zones are used when both times can be placed on one timeline."""
+    if (left.tzinfo is None) == (right.tzinfo is None):
+        return abs((left - right).total_seconds())
+    return abs((left.replace(tzinfo=None) - right.replace(tzinfo=None)).total_seconds())
+
+
+def _span_seconds(times: list[datetime]) -> float:
+    if len(times) < 2:
+        return 0.0
+    return max(
+        disagreement_seconds(left, right)
+        for index, left in enumerate(times)
+        for right in times[index + 1 :]
+    )
+
+
+def _earliest(items: list[tuple]) -> tuple:
+    aware = all(item[0].tzinfo is not None for item in items)
+    naive = all(item[0].tzinfo is None for item in items)
+    if aware or naive:
+        return min(items, key=lambda item: item[0])
+    return min(items, key=lambda item: item[0].replace(tzinfo=None))
+
+
+def parse_duration(value: str) -> float:
+    """Accept seconds or a number with s, m, h, or d. Example: 1d."""
+    text = str(value).strip().lower()
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    unit = text[-1:] if text[-1:] in units else ""
+    number = text[:-1] if unit else text
+    try:
+        amount = float(number)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("duration must look like 90, 30m, 12h, or 1d") from error
+    if amount < 0:
+        raise argparse.ArgumentTypeError("duration must be zero or greater")
+    return amount * units.get(unit, 1)
+
+
+def annotate_capture_conflict(
+    plan: dict,
+    entries: list[dict],
+    metadata: dict[str, dict],
+    max_disagreement: float = DEFAULT_MAX_CAPTURE_DISAGREEMENT,
+) -> dict:
+    """Flag disagreeing capture times.
+
+    Without camera data, the earliest capture time is kept and the gap is not a
+    conflict. When camera data is present, a gap larger than max_disagreement
+    is a conflict. Offsets and GPS UTC are included in that gap. The stored
+    time is the earliest camera capture when a camera file has one.
+    """
+    dated: list[tuple[datetime, str, bool, tuple, datetime]] = []
+    for entry in entries:
+        path = str(entry["path"])
+        meta = metadata.get(path, {})
+        instant, _source = capture_instant(meta)
+        local, _local_source = capture_of(meta)
+        if instant is None or local is None:
+            continue
+        dated.append((instant, path, camera_score(meta) > 0, exif_fingerprint(meta), local))
+    if len(dated) < 2:
+        return plan
+
+    has_camera = any(camera_score(metadata.get(str(entry["path"]), {})) > 0 for entry in entries)
+    camera_dated = [item for item in dated if item[2]]
+    chosen = _earliest(camera_dated or dated)
+    _instant, chosen_path, _has_camera, _fingerprint, chosen_local = chosen
+    _use_capture(plan, chosen_local, chosen_path)
+    if not has_camera:
+        return plan
+    if _span_seconds([item[0] for item in dated]) <= max_disagreement:
+        return plan
+
+    conflicts = list(plan.get("conflicts") or [])
+    if CAPTURE_CONFLICT not in conflicts:
+        conflicts.append(CAPTURE_CONFLICT)
+    plan["conflicts"] = conflicts
+    return plan
+
+
+def aggregate(work: Path, exiftool: str, max_capture_disagreement: float = DEFAULT_MAX_CAPTURE_DISAGREEMENT) -> list[dict]:
     groups = _read_json(work / "clusters.json")
     if not isinstance(groups, list):
         raise SystemExit("clusters.json must be a list")
@@ -391,7 +587,7 @@ def aggregate(work: Path, exiftool: str) -> list[dict]:
         if not present:
             continue
         plan = plan_group(present, metadata)
-        plan = annotate_capture_conflict(plan, present, metadata)
+        plan = annotate_capture_conflict(plan, present, metadata, max_capture_disagreement)
         plan["group"] = index
         plan["max_hamming"] = int(group.get("max_hamming") or 0)
         planned.append(plan)
@@ -453,6 +649,58 @@ def _require_dirs(directories: list[Path] | None) -> list[Path]:
     return directories
 
 
+def _add_clustering_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--algorithm", choices=("hdbscan", "optics"), default="hdbscan")
+    parser.add_argument("--min-cluster-size", type=int, default=2)
+    parser.add_argument("--min-samples", type=int, default=2)
+    parser.add_argument(
+        "--max-hamming",
+        type=int,
+        default=DEFAULT_MAX_HAMMING,
+        help="split output groups connected by more than this many differing hash bits",
+    )
+    hdbscan = parser.add_argument_group("HDBSCAN")
+    hdbscan.add_argument(
+        "--hdbscan-epsilon",
+        type=int,
+        default=0,
+        help="merge clusters within this many hash bits",
+    )
+    hdbscan.add_argument("--hdbscan-method", choices=("eom", "leaf"), default="eom")
+    hdbscan.add_argument("--allow-single-cluster", action="store_true")
+    optics = parser.add_argument_group("OPTICS")
+    optics.add_argument(
+        "--optics-max-eps",
+        type=int,
+        default=DEFAULT_OPTICS_MAX_EPS,
+        help="maximum neighborhood radius in hash bits",
+    )
+    optics.add_argument("--optics-cluster-method", choices=("xi", "dbscan"), default="xi")
+    optics.add_argument("--optics-xi", type=float, default=0.05)
+    optics.add_argument(
+        "--optics-eps",
+        type=int,
+        default=DEFAULT_OPTICS_EPS,
+        help="DBSCAN extraction radius in hash bits",
+    )
+
+
+def _clustering_kwargs(args: argparse.Namespace) -> dict:
+    return {
+        "min_cluster_size": args.min_cluster_size,
+        "min_samples": args.min_samples,
+        "max_hamming": args.max_hamming,
+        "algorithm": args.algorithm,
+        "hdbscan_epsilon": args.hdbscan_epsilon,
+        "hdbscan_method": args.hdbscan_method,
+        "allow_single_cluster": args.allow_single_cluster,
+        "optics_max_eps": args.optics_max_eps,
+        "optics_cluster_method": args.optics_cluster_method,
+        "optics_xi": args.optics_xi,
+        "optics_eps": args.optics_eps,
+    }
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -463,13 +711,17 @@ def main(argv: list[str] | None = None) -> None:
 
     cluster_parser = sub.add_parser("cluster", help="perceptual-hash survivors and cluster by Hamming distance")
     cluster_parser.add_argument("--work", type=Path, required=True)
-    cluster_parser.add_argument("--min-cluster-size", type=int, default=2)
-    cluster_parser.add_argument("--min-samples", type=int, default=2)
-    cluster_parser.add_argument("--max-hamming", type=int, default=DEFAULT_MAX_HAMMING)
+    _add_clustering_arguments(cluster_parser)
 
     aggregate_parser = sub.add_parser("aggregate", help="plan one repaired image per cluster")
     aggregate_parser.add_argument("--work", type=Path, required=True)
     aggregate_parser.add_argument("--exiftool", default="exiftool")
+    aggregate_parser.add_argument(
+        "--max-capture-disagreement",
+        type=parse_duration,
+        default=DEFAULT_MAX_CAPTURE_DISAGREEMENT,
+        help="when camera data is present, capture times farther apart than this are a conflict (default 1d)",
+    )
 
     apply_parser = sub.add_parser("apply", help="move the chosen image into the result directory")
     apply_parser.add_argument("--work", type=Path, required=True)
@@ -482,9 +734,13 @@ def main(argv: list[str] | None = None) -> None:
     all_parser.add_argument("--work", type=Path, required=True)
     all_parser.add_argument("--result", type=Path, required=True)
     all_parser.add_argument("--exiftool", default="exiftool")
-    all_parser.add_argument("--min-cluster-size", type=int, default=2)
-    all_parser.add_argument("--min-samples", type=int, default=2)
-    all_parser.add_argument("--max-hamming", type=int, default=DEFAULT_MAX_HAMMING)
+    all_parser.add_argument(
+        "--max-capture-disagreement",
+        type=parse_duration,
+        default=DEFAULT_MAX_CAPTURE_DISAGREEMENT,
+        help="when camera data is present, capture times farther apart than this are a conflict (default 1d)",
+    )
+    _add_clustering_arguments(all_parser)
     all_parser.add_argument("--dry-run", action="store_true", help="stop after the plan and do not move files")
 
     argv = list(sys.argv[1:] if argv is None else argv)
@@ -495,15 +751,15 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "collect":
         collect(_require_dirs(args.dirs), args.work)
     elif args.command == "cluster":
-        cluster(args.work, args.min_cluster_size, args.min_samples, args.max_hamming)
+        cluster(args.work, **_clustering_kwargs(args))
     elif args.command == "aggregate":
-        aggregate(args.work, args.exiftool)
+        aggregate(args.work, args.exiftool, args.max_capture_disagreement)
     elif args.command == "apply":
         apply_plan(args.work, args.result, args.exiftool, args.dry_run)
     elif args.command == "all":
         collect(_require_dirs(args.dirs), args.work)
-        cluster(args.work, args.min_cluster_size, args.min_samples, args.max_hamming)
-        aggregate(args.work, args.exiftool)
+        cluster(args.work, **_clustering_kwargs(args))
+        aggregate(args.work, args.exiftool, args.max_capture_disagreement)
         if args.dry_run:
             apply_plan(args.work, args.result, args.exiftool, True)
             return
@@ -528,6 +784,19 @@ def _self_test() -> int:
     assert len(set(labels[:3].tolist())) == 1
     assert len(set(labels[3:].tolist())) == 1
     assert labels[0] != labels[3]
+    optics_labels = cluster_bit_matrix(
+        matrix,
+        min_cluster_size=2,
+        min_samples=2,
+        max_hamming=32,
+        algorithm="optics",
+        optics_max_eps=32,
+        optics_cluster_method="dbscan",
+        optics_eps=1,
+    )
+    assert len(set(optics_labels[:3].tolist())) == 1
+    assert len(set(optics_labels[3:].tolist())) == 1
+    assert optics_labels[0] != optics_labels[3]
 
     near = same.copy()
     near[:40] = True
@@ -546,11 +815,98 @@ def _self_test() -> int:
     disagreed = annotate_capture_conflict(plan_group(entries, metadata), entries, metadata)
     assert disagreed["pixel_source"] == "/b.jpg"
     assert disagreed["capture_time"] == "2019:06:14 17:32:21"
-    assert CAPTURE_CONFLICT in disagreed["conflicts"]
+    assert disagreed["capture_source"] == "/a.jpg"
+    assert CAPTURE_CONFLICT not in disagreed["conflicts"]
 
     metadata["/b.jpg"]["EXIF:DateTimeOriginal"] = "2019:06:14 17:32:22"
     close = annotate_capture_conflict(plan_group(entries, metadata), entries, metadata)
     assert CAPTURE_CONFLICT not in close["conflicts"]
+
+    camera_preferred = {
+        "/a.jpg": {"EXIF:DateTimeOriginal": "2014:05:20 02:47:18"},
+        "/b.jpg": {
+            "EXIF:DateTimeOriginal": "2021:12:02 13:38:27",
+            "EXIF:Make": "Canon",
+            "EXIF:Model": "EOS",
+        },
+    }
+    preferred = annotate_capture_conflict(plan_group(entries, camera_preferred), entries, camera_preferred)
+    assert CAPTURE_CONFLICT in preferred["conflicts"]
+    assert preferred["capture_time"] == "2021:12:02 13:38:27"
+    assert preferred["capture_source"] == "/b.jpg"
+
+    both_cameras = {
+        "/a.jpg": {
+            "EXIF:DateTimeOriginal": "2014:05:20 02:47:18",
+            "EXIF:Make": "Nikon",
+            "EXIF:Model": "D80",
+        },
+        "/b.jpg": {
+            "EXIF:DateTimeOriginal": "2021:12:02 13:38:27",
+            "EXIF:Make": "Canon",
+            "EXIF:Model": "EOS",
+        },
+    }
+    unresolved = annotate_capture_conflict(plan_group(entries, both_cameras), entries, both_cameras)
+    assert CAPTURE_CONFLICT in unresolved["conflicts"]
+    assert unresolved["capture_time"] == "2014:05:20 02:47:18"
+
+    no_camera_far = {
+        "/a.jpg": {"EXIF:DateTimeOriginal": "2014:05:18 12:00:00"},
+        "/b.jpg": {"EXIF:DateTimeOriginal": "2014:05:20 12:00:00"},
+    }
+    far = annotate_capture_conflict(plan_group(entries, no_camera_far), entries, no_camera_far)
+    assert CAPTURE_CONFLICT not in far["conflicts"]
+    assert far["capture_time"] == "2014:05:18 12:00:00"
+    assert far["capture_source"] == "/a.jpg"
+    within = annotate_capture_conflict(plan_group(entries, no_camera_far), entries, no_camera_far, max_disagreement=3 * 86400)
+    assert CAPTURE_CONFLICT not in within["conflicts"]
+
+    same_utc = {
+        "/a.jpg": {"EXIF:DateTimeOriginal": "2014:05:21 15:00:00", "EXIF:OffsetTimeOriginal": "+12:00"},
+        "/b.jpg": {"EXIF:DateTimeOriginal": "2014:05:20 04:00:00", "EXIF:OffsetTimeOriginal": "+00:00"},
+    }
+    zoned = annotate_capture_conflict(plan_group(entries, same_utc), entries, same_utc)
+    assert CAPTURE_CONFLICT not in zoned["conflicts"]
+    assert zoned["capture_source"] == "/b.jpg"
+
+    zone_gap = {
+        "/a.jpg": {
+            "EXIF:DateTimeOriginal": "2014:05:20 12:00:00",
+            "EXIF:OffsetTimeOriginal": "+14:00",
+            "EXIF:Make": "Canon",
+            "EXIF:Model": "EOS",
+        },
+        "/b.jpg": {
+            "EXIF:DateTimeOriginal": "2014:05:20 12:00:00",
+            "EXIF:OffsetTimeOriginal": "-12:00",
+            "EXIF:Make": "Canon",
+            "EXIF:Model": "EOS",
+        },
+    }
+    zoned_conflict = annotate_capture_conflict(plan_group(entries, zone_gap), entries, zone_gap)
+    assert CAPTURE_CONFLICT in zoned_conflict["conflicts"]
+    assert zoned_conflict["capture_source"] == "/a.jpg"
+
+    duplicate_exif = {
+        "/a.jpg": {
+            "EXIF:DateTimeOriginal": "2014:05:20 02:47:18",
+            "EXIF:Make": "Canon",
+            "EXIF:Model": "EOS",
+            "EXIF:FNumber": 2.8,
+        },
+        "/b.jpg": {
+            "EXIF:DateTimeOriginal": "2021:12:02 13:38:27",
+            "EXIF:Make": "Canon",
+            "EXIF:Model": "EOS",
+            "EXIF:FNumber": 2.8,
+            "File:FileName": "copy.jpg",
+        },
+    }
+    duplicate = annotate_capture_conflict(plan_group(entries, duplicate_exif), entries, duplicate_exif)
+    assert CAPTURE_CONFLICT in duplicate["conflicts"]
+    assert duplicate["capture_time"] == "2014:05:20 02:47:18"
+    assert duplicate["capture_source"] == "/a.jpg"
 
     alone = annotate_capture_conflict(
         plan_group([entries[0]], {"/a.jpg": metadata["/a.jpg"]}),

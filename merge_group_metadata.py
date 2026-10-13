@@ -20,7 +20,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 TIME_KEYS = (
@@ -28,6 +28,12 @@ TIME_KEYS = (
     "EXIF:CreateDate",
     "XMP:CreateDate",
 )
+OFFSET_KEYS = {
+    "EXIF:DateTimeOriginal": ("EXIF:OffsetTimeOriginal", "EXIF:OffsetTime"),
+    "EXIF:CreateDate": ("EXIF:OffsetTimeDigitized", "EXIF:OffsetTime"),
+    "XMP:CreateDate": ("EXIF:OffsetTimeDigitized", "XMP:OffsetTime"),
+    "IPTC:DateCreated": ("EXIF:OffsetTimeOriginal", "EXIF:OffsetTime"),
+}
 TIME_COPY = [
     "-DateTimeOriginal",
     "-SubSecTimeOriginal",
@@ -174,6 +180,109 @@ def capture_of(meta: dict) -> tuple[datetime | None, str | None]:
         if found is not None:
             return found, "IPTC:DateCreated"
     return None, None
+
+
+def parse_offset(value: object) -> timezone | None:
+    """Read an EXIF offset such as +10:00, +1000, or Z."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip().upper().replace(" ", "")
+    if text in {"Z", "UTC"} or (text.endswith("Z") and len(text) > 1 and text[-2].isdigit()):
+        return timezone.utc
+    if len(text) >= 6 and text[-6] in "+-" and text[-3] == ":":
+        text = text[-6:]
+    elif len(text) >= 5 and text[-5] in "+-" and text[-5:].replace("+", "").replace("-", "").isdigit():
+        text = text[-5:-2] + ":" + text[-2:]
+    else:
+        return None
+    sign = 1 if text[0] == "+" else -1
+    try:
+        hours = int(text[1:3])
+        minutes = int(text[4:6])
+    except ValueError:
+        return None
+    if hours > 14 or minutes > 59:
+        return None
+    return timezone(sign * timedelta(hours=hours, minutes=minutes))
+
+
+def _offset_for(meta: dict, key: str | None, raw: object) -> timezone | None:
+    if isinstance(raw, str):
+        found = parse_offset(raw)
+        if found is not None:
+            return found
+    for offset_key in OFFSET_KEYS.get(key or "", ()):
+        found = parse_offset(meta.get(offset_key))
+        if found is not None:
+            return found
+    return None
+
+
+def gps_utc(meta: dict) -> datetime | None:
+    """GPS date and time are stored in UTC."""
+    date_text = meta.get("EXIF:GPSDateStamp")
+    date = None
+    if isinstance(date_text, str) and len(date_text) >= 10:
+        try:
+            date = datetime.strptime(date_text[:10], "%Y:%m:%d")
+        except ValueError:
+            date = None
+    if date is None or date.year < 1990 or date.year > datetime.now().year + 1:
+        return None
+    clock = meta.get("EXIF:GPSTimeStamp")
+    hours = minutes = seconds = None
+    if isinstance(clock, str) and ":" in clock:
+        parts = clock.strip().split(":")
+        if len(parts) >= 3:
+            try:
+                hours, minutes, seconds = (float(part) for part in parts[:3])
+            except ValueError:
+                return None
+    elif isinstance(clock, (list, tuple)) and len(clock) >= 3:
+        try:
+            hours, minutes, seconds = (float(part) for part in clock[:3])
+        except (TypeError, ValueError):
+            return None
+    elif isinstance(clock, (int, float)) and not isinstance(clock, bool):
+        hours, minutes, seconds = float(clock), 0.0, 0.0
+    if date is None or hours is None or minutes is None or seconds is None:
+        return None
+    if not (0 <= hours < 24 and 0 <= minutes < 60 and 0 <= seconds < 60):
+        return None
+    whole = int(seconds)
+    return date.replace(
+        hour=int(hours),
+        minute=int(minutes),
+        second=whole,
+        microsecond=int(round((seconds - whole) * 1_000_000)),
+        tzinfo=timezone.utc,
+    )
+
+
+def capture_instant(meta: dict) -> tuple[datetime | None, str | None]:
+    """Capture time placed on an absolute timeline when a zone or GPS time exists."""
+    for key in TIME_KEYS:
+        raw = meta.get(key)
+        local = parse_capture(raw)
+        if local is None:
+            continue
+        offset = _offset_for(meta, key, raw)
+        if offset is not None:
+            return local.replace(tzinfo=offset), key
+        gps = gps_utc(meta)
+        if gps is not None:
+            return gps, key
+        return local, key
+    local, key = capture_of(meta)
+    if local is None:
+        return None, None
+    offset = _offset_for(meta, key, None)
+    if offset is not None:
+        return local.replace(tzinfo=offset), key
+    gps = gps_utc(meta)
+    if gps is not None:
+        return gps, key
+    return local, key
 
 
 def first_number(meta: dict, keys: tuple[str, ...]) -> float | None:
