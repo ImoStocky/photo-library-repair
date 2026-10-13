@@ -325,11 +325,30 @@ def camera_identity(meta: dict) -> str:
     return f"{make} {model}".strip()
 
 
+_ENCODING_RANK = {
+    "heic": 5,
+    "jpeg": 4,
+    "tiff": 3,
+    "png": 2,
+    "webp": 1,
+    "gif": 0,
+}
+
+
+def encoding_rank(entry: dict) -> int:
+    kind = entry.get("kind")
+    if not isinstance(kind, str):
+        kind = sniff_kind(Path(str(entry.get("path") or "")))
+    return _ENCODING_RANK.get(str(kind or ""), -1)
+
+
 def choose_pixel(entries: list[dict]) -> dict:
-    def rank(entry: dict) -> tuple[int, int]:
+    """Largest image, then better encoding, then larger file."""
+
+    def rank(entry: dict) -> tuple[int, int, int]:
         width = int(entry.get("width") or 0)
         height = int(entry.get("height") or 0)
-        return width * height, int(entry.get("size") or 0)
+        return width * height, encoding_rank(entry), int(entry.get("size") or 0)
 
     return max(entries, key=rank)
 
@@ -440,11 +459,8 @@ def plan_group(entries: list[dict], metadata: dict[str, dict]) -> dict:
         if disagree:
             conflicts.append("gps positions disagree by more than 100 m")
         else:
-            gps_source = max(gps_points, key=lambda item: item[2])[0]
+            gps_source = min(gps_points, key=lambda item: (item[1][0], item[1][1]))[0]
 
-    identities = {identity for _path, identity, _score, _when in cameras if identity}
-    if len(identities) > 1:
-        conflicts.append("camera make/model differs inside the group")
     camera_source = None
     if cameras:
         earliest = min((item for item in cameras if item[3] is not None), key=lambda item: item[3], default=None)
@@ -723,6 +739,24 @@ def _self_test() -> int:
     groups = parse_groups(referenced)
     assert [entry["path"] for entry in groups[0]] == ["/a.jpg", "/b.jpg"]
     assert choose_pixel(groups[0])["path"] == "/b.jpg"
+    equal = [
+        {"path": "/a.heic", "kind": "heic", "width": 100, "height": 100, "size": 1},
+        {"path": "/a.jpg", "kind": "jpeg", "width": 100, "height": 100, "size": 50},
+    ]
+    assert choose_pixel(equal)["path"] == "/a.heic"
+    larger_jpeg = {"path": "/b.jpg", "kind": "jpeg", "width": 200, "height": 200, "size": 1}
+    assert choose_pixel([equal[0], larger_jpeg])["path"] == "/b.jpg"
+    near_gps = {
+        "/north.jpg": {"EXIF:GPSLatitude": -33.8500, "EXIF:GPSLongitude": 151.210},
+        "/south.jpg": {"EXIF:GPSLatitude": -33.8504, "EXIF:GPSLongitude": 151.210},
+    }
+    gps_entries = [
+        {"path": "/north.jpg", "width": 10, "height": 10, "size": 1},
+        {"path": "/south.jpg", "width": 10, "height": 10, "size": 1},
+    ]
+    agreed = plan_group(gps_entries, near_gps)
+    assert agreed["gps_source"] == "/south.jpg"
+    assert agreed["conflicts"] == []
 
     plain = [[{"path": "/a.jpg"}, {"path": "/b.jpg"}]]
     assert len(parse_groups(plain)) == 1

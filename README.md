@@ -1,6 +1,6 @@
 # Photo library repair
 
-`repair_library.py` walks photo directories and produces one file per picture. Exact copies are collapsed first. Near-duplicates are grouped by perceptual hash. Each group then becomes one image: the largest pixels, with capture time, GPS, and camera tags chosen from the members. Files stay where they are until the last step, which moves that one image into the result directory.
+`repair_library.py` walks photo directories and produces one file per picture. Exact copies are collapsed first. Near-duplicates are grouped by perceptual hash. Each group then becomes one image: the best pixels, with capture time, GPS, and camera tags chosen from the members. Files stay where they are until the last step, which moves that one image into the result directory.
 
 `cluster_groups.ipynb` is the earlier Czkawka and UMAP notebook. `investigate_conflicts.ipynb` reviews groups this pipeline marks as conflicts and can rerun clustering into a separate work directory. A trial never calls apply, so it does not move files.
 
@@ -63,7 +63,7 @@ ExifTool reads every member. One plan is written per cluster, including a one-im
 
 `--conflicts-only` reruns that plan for groups whose `conflicts` list is not empty. Every other group is copied from the existing `plan.json` unchanged. Use it after changing conflict rules so only the groups that were conflicts are read and planned again. Clustering is not repeated. A group that no longer conflicts is saved with an empty `conflicts` list.
 
-- **Pixels.** Largest width times height, then largest file size. This file is the one apply moves.
+- **Pixels.** Largest width times height. Equal resolution prefers a better encoding: HEIC, then JPEG, then TIFF, PNG, WebP, and GIF. File size breaks the remaining ties. This file is the one apply moves.
 - **Name.** Shortest basename. Equal lengths use the alphabetically earlier name. The extension is taken from the file bytes so ExifTool can write it.
 - **Capture time, GPS, and camera tags.** Chosen as described under conflicts. Tags are copied from the selected member onto the moved pixel file.
 
@@ -71,39 +71,29 @@ A conflict does not drop the group. The group is still emitted, and apply still 
 
 ## How conflicts are handled
 
-Three checks can add a conflict. They are independent, so one group can carry more than one.
+Members of a cluster are treated as the same picture. Two checks can add a conflict. They are independent, so one group can carry both.
 
 ### Capture time
 
-The clock is read from `DateTimeOriginal`, then `CreateDate`, then XMP `CreateDate`, then IPTC date and time. The value stored on the result is that local clock time (`YYYY:MM:DD HH:MM:SS`).
+The only capture clock is EXIF `DateTimeOriginal`. `CreateDate`, XMP dates, IPTC dates, and file creation time are not capture times. The value stored on the result is the local clock (`YYYY:MM:DD HH:MM:SS`).
 
-The gap between two clocks uses a time zone when both files can be placed on one timeline:
+`OffsetTimeOriginal` is applied when comparing two `DateTimeOriginal` values. An offset written on the timestamp itself (`+10:00`, `+1000`, or `Z`) is used too. If one file has a zone and the other has only a bare clock, the two wall clocks are compared.
 
-- `OffsetTimeOriginal` is applied to `DateTimeOriginal`. `OffsetTimeDigitized` is applied to `CreateDate`. `OffsetTime` is the fallback. An offset written on the timestamp itself (`+10:00`, `+1000`, or `Z`) is used too.
-- If the chosen timestamp has no offset, GPS date and time are used. Those tags are UTC.
-- If one file has a zone or GPS time and the other has only a bare clock, the two wall clocks are compared. A zone on only one file is not treated as a multi-hour gap.
+Camera data means any of make, model, lens, focal length, aperture, exposure time, ISO, or the other camera fields read by `camera_score`. A camera file is assumed to hold the right capture time.
 
 `--max-capture-disagreement` sets the allowed gap. The default is `1d`. `12h`, `90s`, and a bare number of seconds are also accepted.
 
-Camera data means any of make, model, lens, focal length, aperture, exposure time, ISO, or the other camera fields read by `camera_score`.
+- **Two or more files have camera data and `DateTimeOriginal`.** Their capture times are compared. A gap larger than `--max-capture-disagreement` adds `capture times disagree`. Inside that limit, the oldest capture time is kept and the group is not a capture-time conflict. A later time on a file without camera data does not enter this comparison.
+- **No file has camera data.** The earliest `DateTimeOriginal` is kept. The size of the gap does not matter, and the group is not a capture-time conflict.
+- **Camera data is present but none of those files have `DateTimeOriginal`.** No capture time is copied. Creation time is not used instead.
 
-- **No file has camera data.** The earliest capture time is kept. The size of the gap does not matter, and the group is not a capture-time conflict.
-- **Camera data is present.** The absolute gap is measured across every member that has a capture time. A gap larger than `--max-capture-disagreement` adds `capture times disagree`. The time written onto the result is the earliest capture among the files that have both camera data and a capture time.
-- **One dated file, or a one-image cluster.** There is nothing to disagree about.
-
-A group with no capture time on any member keeps the pixel file's existing time and is not a capture-time conflict.
+Camera tags are copied from the file that supplied the chosen camera capture time. If no camera file has `DateTimeOriginal`, tags come from the camera file with the most camera fields.
 
 ### GPS
 
 A position is read from GPS latitude and longitude. `(0, 0)` is ignored. A file with no position does not vote.
 
-If any two positions are more than 100 m apart, the group gets `gps positions disagree by more than 100 m` and no GPS tags are copied. If every position agrees within 100 m, GPS is copied from the member with the most GPS fields.
-
-### Camera make and model
-
-Make and model are compared as text. If two members name different cameras, the group gets `camera make/model differs inside the group`.
-
-Camera tags are still copied. The source is the earliest camera file that also has a capture time. If none of the camera files have a capture time, the file with the most camera fields is used.
+If any two positions are more than 100 m apart, the group gets `gps positions disagree by more than 100 m` and no GPS tags are copied. If every position is within 100 m, the smallest coordinates are copied: the smallest latitude, then the smallest longitude.
 
 Description, artist, copyright, keywords, and rating are copied from the other members and are not conflict checks.
 

@@ -33,9 +33,9 @@ from merge_group_metadata import (
     ProgressBar,
     assign_output_names,
     camera_score,
-    capture_instant,
-    capture_of,
     index_metadata,
+    parse_capture,
+    parse_offset,
     plan_group,
     read_metadata,
     sniff_kind,
@@ -524,45 +524,64 @@ def parse_duration(value: str) -> float:
     return amount * units.get(unit, 1)
 
 
+def exif_capture(meta: dict) -> tuple[datetime | None, datetime | None]:
+    """DateTimeOriginal and its offset. CreateDate and file times are ignored."""
+    raw = meta.get("EXIF:DateTimeOriginal")
+    local = parse_capture(raw)
+    if local is None:
+        return None, None
+    offset = parse_offset(meta.get("EXIF:OffsetTimeOriginal"))
+    if offset is None:
+        offset = parse_offset(raw)
+    instant = local.replace(tzinfo=offset) if offset is not None else local
+    return instant, local
+
+
 def annotate_capture_conflict(
     plan: dict,
     entries: list[dict],
     metadata: dict[str, dict],
     max_disagreement: float = DEFAULT_MAX_CAPTURE_DISAGREEMENT,
 ) -> dict:
-    """Flag disagreeing capture times.
+    """Choose a capture time from DateTimeOriginal.
 
-    Without camera data, the earliest capture time is kept and the gap is not a
-    conflict. When camera data is present, a gap larger than max_disagreement
-    is a conflict. Offsets and GPS UTC are included in that gap. The stored
-    time is the earliest camera capture when a camera file has one.
+    Several files with camera data must agree within max_disagreement. The
+    oldest of those times is kept, and a larger gap is a conflict. With no
+    camera data, the earliest DateTimeOriginal is kept and the gap is not a
+    conflict. CreateDate and file creation time are not capture times.
     """
-    dated: list[tuple[datetime, str, bool, tuple, datetime]] = []
+    dated: list[tuple[datetime, str, bool, datetime]] = []
+    has_camera = False
     for entry in entries:
         path = str(entry["path"])
         meta = metadata.get(path, {})
-        instant, _source = capture_instant(meta)
-        local, _local_source = capture_of(meta)
+        if camera_score(meta) > 0:
+            has_camera = True
+        instant, local = exif_capture(meta)
         if instant is None or local is None:
             continue
-        dated.append((instant, path, camera_score(meta) > 0, exif_fingerprint(meta), local))
-    if len(dated) < 2:
-        return plan
+        dated.append((instant, path, camera_score(meta) > 0, local))
 
-    has_camera = any(camera_score(metadata.get(str(entry["path"]), {})) > 0 for entry in entries)
     camera_dated = [item for item in dated if item[2]]
-    chosen = _earliest(camera_dated or dated)
-    _instant, chosen_path, _has_camera, _fingerprint, chosen_local = chosen
-    _use_capture(plan, chosen_local, chosen_path)
-    if not has_camera:
-        return plan
-    if _span_seconds([item[0] for item in dated]) <= max_disagreement:
+    if has_camera and camera_dated:
+        chosen = _earliest(camera_dated)
+        _instant, chosen_path, _has_camera, chosen_local = chosen
+        _use_capture(plan, chosen_local, chosen_path)
+        plan["camera_source"] = chosen_path
+        if _span_seconds([item[0] for item in camera_dated]) <= max_disagreement:
+            return plan
+        conflicts = list(plan.get("conflicts") or [])
+        if CAPTURE_CONFLICT not in conflicts:
+            conflicts.append(CAPTURE_CONFLICT)
+        plan["conflicts"] = conflicts
         return plan
 
-    conflicts = list(plan.get("conflicts") or [])
-    if CAPTURE_CONFLICT not in conflicts:
-        conflicts.append(CAPTURE_CONFLICT)
-    plan["conflicts"] = conflicts
+    if not has_camera and dated:
+        _instant, chosen_path, _has_camera, chosen_local = _earliest(dated)
+        return _use_capture(plan, chosen_local, chosen_path)
+
+    plan["capture_time"] = None
+    plan["capture_source"] = None
     return plan
 
 
@@ -752,7 +771,7 @@ def main(argv: list[str] | None = None) -> None:
         "--max-capture-disagreement",
         type=parse_duration,
         default=DEFAULT_MAX_CAPTURE_DISAGREEMENT,
-        help="when camera data is present, capture times farther apart than this are a conflict (default 1d)",
+        help="capture times on files with camera data farther apart than this are a conflict (default 1d)",
     )
     aggregate_parser.add_argument(
         "--conflicts-only",
@@ -775,7 +794,7 @@ def main(argv: list[str] | None = None) -> None:
         "--max-capture-disagreement",
         type=parse_duration,
         default=DEFAULT_MAX_CAPTURE_DISAGREEMENT,
-        help="when camera data is present, capture times farther apart than this are a conflict (default 1d)",
+        help="capture times on files with camera data farther apart than this are a conflict (default 1d)",
     )
     _add_clustering_arguments(all_parser)
     all_parser.add_argument("--dry-run", action="store_true", help="stop after the plan and do not move files")
@@ -868,9 +887,10 @@ def _self_test() -> int:
         },
     }
     preferred = annotate_capture_conflict(plan_group(entries, camera_preferred), entries, camera_preferred)
-    assert CAPTURE_CONFLICT in preferred["conflicts"]
+    assert CAPTURE_CONFLICT not in preferred["conflicts"]
     assert preferred["capture_time"] == "2021:12:02 13:38:27"
     assert preferred["capture_source"] == "/b.jpg"
+    assert preferred["camera_source"] == "/b.jpg"
 
     both_cameras = {
         "/a.jpg": {
@@ -944,6 +964,15 @@ def _self_test() -> int:
     assert CAPTURE_CONFLICT in duplicate["conflicts"]
     assert duplicate["capture_time"] == "2014:05:20 02:47:18"
     assert duplicate["capture_source"] == "/a.jpg"
+
+    created_only = {
+        "/a.jpg": {"EXIF:CreateDate": "2010:01:01 00:00:00"},
+        "/b.jpg": {"EXIF:CreateDate": "2020:01:01 00:00:00"},
+    }
+    created = annotate_capture_conflict(plan_group(entries, created_only), entries, created_only)
+    assert created["capture_time"] is None
+    assert created["capture_source"] is None
+    assert CAPTURE_CONFLICT not in created["conflicts"]
 
     previous = [
         {"group": 1, "conflicts": [], "stored_name": "keep.jpg"},
