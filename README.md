@@ -2,7 +2,9 @@
 
 `repair_library.py` walks photo directories and produces one file per picture. Exact copies are collapsed first. Near-duplicates are grouped by perceptual hash. Each group then becomes one image: the best pixels, with capture time, GPS, and camera tags chosen from the members. Files stay where they are until the last step, which moves that one image into the result directory.
 
-`cluster_groups.ipynb` is the earlier Czkawka and UMAP notebook. `investigate_conflicts.ipynb` reviews groups this pipeline marks as conflicts and can rerun clustering into a separate work directory. A trial never calls apply, so it does not move files.
+The notebooks in `notebooks/` inspect clustering. What each one reads and writes is described under [Notebooks](#notebooks).
+
+Code lives in `photo_repair/`. `repair_library.py`, `merge_group_metadata.py`, and `embed_group.py` are the command-line entry points. Photo libraries, pipeline `work/` directories, and JSON dumps of image paths are gitignored.
 
 ## Setup
 
@@ -103,8 +105,24 @@ Apply moves the pixel source into the result directory under the planned name, t
 
 `result/report.json` lists the output path, the source files, and any conflicts.
 
-## Reviewing conflicts
+## Notebooks
 
-Open `investigate_conflicts.ipynb` with `work` pointing at a directory that already has `clusters.json` and `plan.json`. The notebook lists groups whose `conflicts` list is not empty, shows thumbnails, and reads capture time, GPS, and camera fields for the selected group.
+Neither notebook moves photos. Both expect to be opened from this repository so their paths resolve to the project root.
 
-To try other clustering parameters, edit `PARAMETERS` and run the trial cells. They copy `unique.json` and `phash.json` into `work-trial`, then cluster and aggregate there. The original `work` directory and the source photos are left unchanged.
+### `notebooks/cluster_groups.ipynb`
+
+This is the earlier Czkawka and UMAP workflow, separate from `repair_library.py`.
+
+It reads `_groups.json` in the project root: a Czkawka similar-image export (`czkawka_cli image -p`). Each record has a path, size, pixel size, modification time, hash, and difference from the group reference. The notebook loads that file into a table, lets you choose a source-group range and which columns UMAP should use, and embeds those rows with UMAP and HDBSCAN.
+
+On screen it shows the table, a 2D or 3D scatter plot, and, when a point is clicked, thumbnails of that cluster plus `DateTimeOriginal` or `CreateDate` from ExifTool. The image files named in `_groups.json` have to be readable for the thumbnails.
+
+The last cell writes `clusters_groups.json` in the project root, overwriting it. That file is Czkawka group JSON again: one array per cluster, including single-image clusters, with path, size, dimensions, modification time, hash, and difference from the first member. It does not write a repair plan.
+
+### `notebooks/investigate_conflicts.ipynb`
+
+This reviews a repair run after `aggregate`.
+
+It reads `work/clusters.json`, `work/plan.json`, and, when present, `work/clustering.json`. It shows a table of groups whose `conflicts` list is not empty, a contact sheet for one group, and ExifTool capture time, GPS, and camera fields for that group's members. The contact sheet opens the member image files.
+
+A trial copies `work/unique.json` and `work/phash.json` into `work-trial/`, then runs clustering and aggregation there. That writes `work-trial/clusters.json`, `work-trial/clustering.json`, and `work-trial/plan.json`. The trial does not call apply. `work/` and the source photos stay as they were. The notebook then shows the trial conflict table and a contact sheet for one trial group.

@@ -30,9 +30,34 @@ htmlcov/
 .tox/
 .nox/
 
-# Notebooks
+# Notebooks and editor state
 .ipynb_checkpoints/
+.cursor/
 
-# Generated photo copies from earlier runs
+# Photo libraries and repair outputs. These are images or lists of image paths.
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.heic
+*.heif
+*.tif
+*.tiff
+*.dng
+*.cr2
+*.cr3
+*.nef
+*.arw
+*.orf
+*.rw2
+*.raf
+*.raw
+*.json
+
 fixedResultsClustered/
 flat_icloud_mix_best_so_far/
+work/
+work[0-9]*/
+work-*/
+20[0-9][0-9]-*/
