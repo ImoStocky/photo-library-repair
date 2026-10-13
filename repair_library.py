@@ -26,7 +26,7 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from cluster_lib import _label_singletons
 from merge_group_metadata import (
@@ -43,6 +43,7 @@ from merge_group_metadata import (
 )
 
 HASH_BITS = 256
+PHASH_CACHE_VERSION = 2
 DEFAULT_MAX_HAMMING = 32
 DEFAULT_OPTICS_MAX_EPS = 64
 DEFAULT_OPTICS_EPS = 32
@@ -164,9 +165,11 @@ def hex_to_bits(text: str) -> np.ndarray:
 
 
 def perceptual_record(path: Path) -> dict:
+    """Hash the picture as displayed. EXIF orientation is applied first."""
     with Image.open(path) as image:
-        rgb = image.convert("RGB")
-        width, height = image.size
+        oriented = ImageOps.exif_transpose(image) or image
+        rgb = oriented.convert("RGB")
+        width, height = oriented.size
         import imagehash
 
         digest = imagehash.phash(rgb, hash_size=16)
@@ -326,12 +329,14 @@ def cluster(
     register_heif()
 
     cache_path = work / "phash.json"
-    cache = {"by_sha256": {}, "errors": {}}
+    cache = {"version": PHASH_CACHE_VERSION, "by_sha256": {}, "errors": {}}
     if cache_path.is_file():
         loaded = json.loads(cache_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict):
+        if isinstance(loaded, dict) and loaded.get("version") == PHASH_CACHE_VERSION:
             cache["by_sha256"] = dict(loaded.get("by_sha256") or {})
             cache["errors"] = dict(loaded.get("errors") or {})
+        elif isinstance(loaded, dict) and loaded.get("by_sha256"):
+            print("perceptual-hash cache ignored; it was built without EXIF orientation", file=sys.stderr)
 
     hashing = ProgressBar("perceptual hash", len(survivors))
     for done, survivor in enumerate(survivors, start=1):
@@ -991,6 +996,25 @@ def _self_test() -> int:
     )
     assert alone["pixel_source"] == "/a.jpg"
     assert alone["conflicts"] == []
+
+    with tempfile.TemporaryDirectory() as folder:
+        root = Path(folder)
+        display = Image.new("RGB", (48, 24))
+        for x in range(12):
+            for y in range(6):
+                display.putpixel((x, y), (20, 180, 40))
+        upright = root / "upright.jpg"
+        display.save(upright, format="JPEG", quality=95)
+        sideways = root / "sideways.jpg"
+        stored = display.transpose(Image.Transpose.ROTATE_90)
+        exif = Image.Exif()
+        exif[274] = 6
+        stored.save(sideways, format="JPEG", quality=95, exif=exif.tobytes())
+        upright_hash = hex_to_bits(perceptual_record(upright)["phash"])
+        sideways_hash = hex_to_bits(perceptual_record(sideways)["phash"])
+        assert hamming_bits(upright_hash, sideways_hash) <= 12
+        assert perceptual_record(upright)["width"] == 48
+        assert perceptual_record(sideways)["width"] == 48
 
     with tempfile.TemporaryDirectory() as folder:
         root = Path(folder)

@@ -47,7 +47,7 @@ Byte-identical files share a SHA-256 hash. One survivor is kept: the earliest mo
 
 ## Clustering
 
-Each survivor gets a 256-bit perceptual hash (`imagehash.phash`, `hash_size=16`). Hashes are cached in `work/phash.json`. HEIC needs `pillow-heif`.
+Each survivor gets a 256-bit perceptual hash (`imagehash.phash`, `hash_size=16`) after EXIF orientation is applied, so a sideways file matches the same picture stored already rotated. Hashes are cached in `work/phash.json`. HEIC needs `pillow-heif`.
 
 `--algorithm` is `hdbscan` (the default) or `optics`. Both use Hamming distance. Shared flags are `--min-cluster-size`, `--min-samples`, and `--max-hamming` (default 32 bits). After the density algorithm, members connected by more than `--max-hamming` bits are split, so a cluster means the hashes are actually close. Noise points each become their own cluster. A single image is a normal result.
 
