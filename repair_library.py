@@ -566,13 +566,43 @@ def annotate_capture_conflict(
     return plan
 
 
-def aggregate(work: Path, exiftool: str, max_capture_disagreement: float = DEFAULT_MAX_CAPTURE_DISAGREEMENT) -> list[dict]:
+def conflict_group_ids(plans: list[dict]) -> set[int]:
+    return {int(plan["group"]) for plan in plans if plan.get("conflicts")}
+
+
+def replace_plans(previous: list[dict], recomputed: list[dict]) -> list[dict]:
+    """Keep every prior plan, and replace groups that were just recomputed."""
+    by_group = {int(plan["group"]): plan for plan in previous}
+    for plan in recomputed:
+        by_group[int(plan["group"])] = plan
+    return [by_group[group] for group in sorted(by_group)]
+
+
+def aggregate(
+    work: Path,
+    exiftool: str,
+    max_capture_disagreement: float = DEFAULT_MAX_CAPTURE_DISAGREEMENT,
+    conflicts_only: bool = False,
+) -> list[dict]:
     groups = _read_json(work / "clusters.json")
     if not isinstance(groups, list):
         raise SystemExit("clusters.json must be a list")
+    selected = list(enumerate(groups, start=1))
+    previous: list[dict] | None = None
+    if conflicts_only:
+        loaded = _read_json(work / "plan.json")
+        if not isinstance(loaded, list):
+            raise SystemExit("plan.json must be a list")
+        previous = loaded
+        wanted = conflict_group_ids(previous)
+        if not wanted:
+            print("no conflict groups to recompute", file=sys.stderr)
+            return previous
+        selected = [(index, group) for index, group in selected if index in wanted]
+        print(f"recomputing {len(selected)} conflict groups", file=sys.stderr)
     if shutil.which(exiftool) is None:
         raise SystemExit("exiftool not found")
-    paths = [str(member["path"]) for group in groups for member in group.get("members", [])]
+    paths = [str(member["path"]) for _index, group in selected for member in group.get("members", [])]
     readable = [path for path in paths if Path(path).is_file()]
     missing = len(paths) - len(readable)
     if missing:
@@ -582,7 +612,7 @@ def aggregate(work: Path, exiftool: str, max_capture_disagreement: float = DEFAU
     metadata = index_metadata(raw, paths)
 
     planned: list[dict] = []
-    for index, group in enumerate(groups, start=1):
+    for index, group in selected:
         present = [member for member in group.get("members", []) if Path(str(member["path"])).is_file()]
         if not present:
             continue
@@ -591,6 +621,8 @@ def aggregate(work: Path, exiftool: str, max_capture_disagreement: float = DEFAU
         plan["group"] = index
         plan["max_hamming"] = int(group.get("max_hamming") or 0)
         planned.append(plan)
+    if previous is not None:
+        planned = replace_plans(previous, planned)
     assign_output_names(planned)
     _write_json(work / "plan.json", planned)
     conflicts = sum(1 for plan in planned if plan.get("conflicts"))
@@ -722,6 +754,11 @@ def main(argv: list[str] | None = None) -> None:
         default=DEFAULT_MAX_CAPTURE_DISAGREEMENT,
         help="when camera data is present, capture times farther apart than this are a conflict (default 1d)",
     )
+    aggregate_parser.add_argument(
+        "--conflicts-only",
+        action="store_true",
+        help="recompute only groups already marked as conflicts in plan.json",
+    )
 
     apply_parser = sub.add_parser("apply", help="move the chosen image into the result directory")
     apply_parser.add_argument("--work", type=Path, required=True)
@@ -753,7 +790,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "cluster":
         cluster(args.work, **_clustering_kwargs(args))
     elif args.command == "aggregate":
-        aggregate(args.work, args.exiftool, args.max_capture_disagreement)
+        aggregate(args.work, args.exiftool, args.max_capture_disagreement, args.conflicts_only)
     elif args.command == "apply":
         apply_plan(args.work, args.result, args.exiftool, args.dry_run)
     elif args.command == "all":
@@ -907,6 +944,16 @@ def _self_test() -> int:
     assert CAPTURE_CONFLICT in duplicate["conflicts"]
     assert duplicate["capture_time"] == "2014:05:20 02:47:18"
     assert duplicate["capture_source"] == "/a.jpg"
+
+    previous = [
+        {"group": 1, "conflicts": [], "stored_name": "keep.jpg"},
+        {"group": 2, "conflicts": ["capture times disagree"], "stored_name": "old.jpg"},
+        {"group": 4, "conflicts": ["gps positions disagree by more than 100 m"], "stored_name": "gps.jpg"},
+    ]
+    assert conflict_group_ids(previous) == {2, 4}
+    replaced = replace_plans(previous, [{"group": 2, "conflicts": [], "stored_name": "new.jpg"}])
+    assert [plan["stored_name"] for plan in replaced] == ["keep.jpg", "new.jpg", "gps.jpg"]
+    assert replaced[1]["conflicts"] == []
 
     alone = annotate_capture_conflict(
         plan_group([entries[0]], {"/a.jpg": metadata["/a.jpg"]}),
