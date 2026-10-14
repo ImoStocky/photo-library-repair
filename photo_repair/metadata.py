@@ -489,37 +489,117 @@ def plan_group(entries: list[dict], metadata: dict[str, dict]) -> dict:
     }
 
 
-def run_exiftool(args: list[str], progress: ProgressBar | None = None, base: int = 0) -> subprocess.CompletedProcess[str]:
-    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    stderr_parts: list[str] = []
+class ExifTool:
+    """One ExifTool process for a whole read or write.
 
-    def consume_stderr() -> None:
-        assert process.stderr is not None
-        for line in process.stderr:
-            stderr_parts.append(line)
+    Arguments are written to ``exiftool -stay_open True -@ -``. Each command ends
+    with ``-execute`` and is finished when ExifTool prints ``{ready}``.
+    """
+
+    def __init__(self, executable: str):
+        self.process = subprocess.Popen(
+            [executable, "-stay_open", "True", "-@", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            bufsize=0,
+        )
+        self._stderr: list[str] = []
+        self._progress: ProgressBar | None = None
+        self._progress_base = 0
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._thread.start()
+
+    def _drain_stderr(self) -> None:
+        assert self.process.stderr is not None
+        while True:
+            raw = self.process.stderr.readline()
+            if not raw:
+                break
+            line = raw.decode(errors="replace")
+            with self._lock:
+                self._stderr.append(line)
+                progress = self._progress
+                base = self._progress_base
             match = _EXIF_PROGRESS.search(line)
             if match and progress is not None:
                 progress.set(base + int(match.group(1)))
 
-    reader = threading.Thread(target=consume_stderr)
-    reader.start()
-    stdout = process.stdout.read() if process.stdout is not None else ""
-    reader.join()
-    return subprocess.CompletedProcess(args, process.wait(), stdout, "".join(stderr_parts))
+    def run(self, args: list[str], progress: ProgressBar | None = None, base: int = 0) -> tuple[str, str]:
+        command = list(args)
+        executes = sum(1 for arg in command if arg == "-execute")
+        if executes == 0:
+            command.append("-execute")
+            executes = 1
+        with self._lock:
+            start = len(self._stderr)
+            self._progress = progress
+            self._progress_base = base
+        assert self.process.stdin is not None and self.process.stdout is not None
+        self.process.stdin.write(("\n".join(command) + "\n").encode())
+        self.process.stdin.flush()
+        chunks: list[bytes] = []
+        seen = 0
+        while seen < executes:
+            line = self.process.stdout.readline()
+            if not line:
+                raise SystemExit("exiftool closed before it finished the command")
+            if line.strip() == b"{ready}":
+                seen += 1
+                continue
+            chunks.append(line)
+        with self._lock:
+            stderr = "".join(self._stderr[start:])
+            self._progress = None
+        return b"".join(chunks).decode(), stderr
+
+    def close(self) -> None:
+        if self.process.poll() is not None:
+            return
+        try:
+            if self.process.stdin is not None:
+                self.process.stdin.write(b"-stay_open\nFalse\n")
+                self.process.stdin.flush()
+        except BrokenPipeError:
+            pass
+        if self.process.stdout is not None:
+            while self.process.poll() is None:
+                if not self.process.stdout.readline():
+                    break
+        try:
+            self.process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=5)
+        self._thread.join(timeout=1)
+
+    def __enter__(self) -> ExifTool:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.close()
 
 
-def read_metadata(exiftool: str, paths: list[str], progress: ProgressBar | None = None) -> dict[str, dict]:
+def read_metadata(
+    exiftool: str,
+    paths: list[str],
+    progress: ProgressBar | None = None,
+    tool: ExifTool | None = None,
+) -> dict[str, dict]:
     found: dict[str, dict] = {}
     unique = list(dict.fromkeys(paths))
-    for start in range(0, len(unique), 200):
-        chunk = unique[start : start + 200]
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
-            handle.write("\n".join(chunk))
-            list_path = handle.name
-        try:
-            completed = run_exiftool(
+    if not unique:
+        if progress is not None:
+            progress.finish()
+        return found
+    own_tool = tool is None
+    session = tool if tool is not None else ExifTool(exiftool)
+    try:
+        for start in range(0, len(unique), 200):
+            chunk = unique[start : start + 200]
+            stdout, stderr = session.run(
                 [
-                    exiftool,
                     "-progress",
                     "-json",
                     "-n",
@@ -529,23 +609,27 @@ def read_metadata(exiftool: str, paths: list[str], progress: ProgressBar | None 
                     "LargeFileSupport=1",
                     "-d",
                     "%Y:%m:%d %H:%M:%S",
-                    "-@",
-                    list_path,
+                    *chunk,
                 ],
                 progress,
                 start,
             )
-        finally:
-            Path(list_path).unlink(missing_ok=True)
-        if completed.returncode != 0 and not completed.stdout.strip():
-            raise SystemExit(completed.stderr.strip() or "exiftool failed while reading metadata")
-        payload = json.loads(completed.stdout or "[]")
-        if isinstance(payload, dict):
-            payload = [payload]
-        for record in payload:
-            source = record.get("SourceFile")
-            if source:
-                found[str(source)] = record
+            if not stdout.strip():
+                message = stderr.strip() or "exiftool failed while reading metadata"
+                if "Error:" in stderr and start + 200 < len(unique):
+                    print(message, file=sys.stderr)
+                    continue
+                raise SystemExit(message)
+            payload = json.loads(stdout or "[]")
+            if isinstance(payload, dict):
+                payload = [payload]
+            for record in payload:
+                source = record.get("SourceFile")
+                if source:
+                    found[str(source)] = record
+    finally:
+        if own_tool:
+            session.close()
     if progress is not None:
         progress.finish()
     return found
@@ -577,7 +661,12 @@ def assign_output_names(plans: list[dict]) -> None:
             plan["stored_name"] = f"{plan['group']:06d}_{plan['stored_name']}"
 
 
-def write_copies(exiftool: str, jobs: list[tuple[Path, dict]], progress: ProgressBar | None = None) -> None:
+def write_copies(
+    exiftool: str,
+    jobs: list[tuple[Path, dict]],
+    progress: ProgressBar | None = None,
+    tool: ExifTool | None = None,
+) -> None:
     """jobs are (destination, plan). Pixel bytes are already copied."""
     overwrite_cmds: list[list[str]] = []
     fill_cmds: list[list[str]] = []
@@ -601,39 +690,36 @@ def write_copies(exiftool: str, jobs: list[tuple[Path, dict]], progress: Progres
             for path in fill_sources:
                 fill += ["-TagsFromFile", path, *OTHER_COPY]
             fill_cmds.append(fill + [dest_text])
-    errors = _run_exiftool_batch(exiftool, overwrite_cmds, progress)
-    if progress is not None:
-        progress.finish()
-    if fill_cmds:
-        filling = ProgressBar("filling tags", len(fill_cmds))
-        errors += _run_exiftool_batch(exiftool, fill_cmds, filling)
-        filling.finish()
+    own_tool = tool is None
+    session = tool if tool is not None else ExifTool(exiftool)
+    try:
+        errors = _run_exiftool_batch(session, overwrite_cmds, progress)
+        if progress is not None:
+            progress.finish()
+        if fill_cmds:
+            filling = ProgressBar("filling tags", len(fill_cmds))
+            errors += _run_exiftool_batch(session, fill_cmds, filling)
+            filling.finish()
+    finally:
+        if own_tool:
+            session.close()
     if errors:
         print(f"exiftool skipped {errors} file errors; other files were still written", file=sys.stderr)
 
 
-def _run_exiftool_batch(exiftool: str, commands: list[list[str]], progress: ProgressBar | None = None) -> int:
+def _run_exiftool_batch(tool: ExifTool, commands: list[list[str]], progress: ProgressBar | None = None) -> int:
     """Write tags in batches. One bad file is reported and the rest still run."""
     errors = 0
     for start in range(0, len(commands), 40):
         chunk = commands[start : start + 40]
-        args = [exiftool, "-progress"]
-        for index, command in enumerate(chunk):
+        args = ["-progress"]
+        for command in chunk:
             args.extend(command)
-            if index != len(chunk) - 1:
-                args.append("-execute")
-        completed = run_exiftool(args, progress, start)
+            args.append("-execute")
+        _stdout, stderr = tool.run(args, progress, start)
         if progress is not None:
             progress.set(start + len(chunk))
-        if completed.returncode == 0:
-            continue
-        reported = [
-            line
-            for line in (completed.stderr or completed.stdout).splitlines()
-            if line.startswith("Error:")
-        ]
-        if not reported:
-            reported = [(completed.stderr or completed.stdout).strip() or "exiftool failed while writing metadata"]
+        reported = [line for line in stderr.splitlines() if line.startswith("Error:")]
         errors += len(reported)
         for line in reported:
             print(line, file=sys.stderr)
@@ -650,9 +736,23 @@ def process(groups_file: Path, output: Path, exiftool: str, limit: int | None, d
         print(f"skipping {len(missing)} missing files", file=sys.stderr)
     readable = [path for path in paths if Path(path).is_file()]
     reading = ProgressBar("reading metadata", len(dict.fromkeys(readable)))
-    raw = read_metadata(exiftool, readable, reading)
-    metadata = index_metadata(raw, paths)
+    tool = ExifTool(exiftool)
+    try:
+        raw = read_metadata(exiftool, readable, reading, tool=tool)
+        metadata = index_metadata(raw, paths)
+        return _write_group_report(groups, output, metadata, exiftool, dry_run, tool)
+    finally:
+        tool.close()
 
+
+def _write_group_report(
+    groups: list[list[dict]],
+    output: Path,
+    metadata: dict[str, dict],
+    exiftool: str,
+    dry_run: bool,
+    tool: ExifTool,
+) -> list[dict]:
     output.mkdir(parents=True, exist_ok=True)
     planned: list[dict] = []
     for index, entries in enumerate(groups, start=1):
@@ -680,7 +780,7 @@ def process(groups_file: Path, output: Path, exiftool: str, limit: int | None, d
     if copying is not None:
         copying.finish()
     if not dry_run:
-        write_copies(exiftool, jobs, ProgressBar("writing metadata", len(jobs)))
+        write_copies(exiftool, jobs, ProgressBar("writing metadata", len(jobs)), tool=tool)
     (output / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     return report
 

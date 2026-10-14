@@ -6,24 +6,26 @@
     python repair_library.py aggregate --work work
     python repair_library.py apply --work work --result repaired
     python repair_library.py apply --work work --result repaired --move
+    python repair_library.py increment --library-work work --dir INBOX --work work-increment
     python repair_library.py all --dir PHOTO --work work --result repaired
 
-Collection keeps the earliest byte-identical file. Clustering uses a 256-bit
-perceptual hash and HDBSCAN with Hamming distance. Groups farther apart than
---max-hamming bits are split, so a cluster means the hashes are actually close.
-Aggregation plans one image per cluster, including single-image clusters.
-Apply copies that image into the result directory and writes merged EXIF.
-Pass --move to move it instead of copying.
+The 256-bit perceptual hash is the identity of a picture. Distance 0 with the
+same file size keeps the earliest path. Clustering uses that same hash and
+HDBSCAN with Hamming distance. Groups farther apart than --max-hamming bits
+are split. Aggregation plans one image per cluster, including single-image
+clusters. Apply copies that image into the result directory and writes merged
+EXIF. Pass --move to move it instead of copying. increment adds new photos to
+an existing library without clustering the photos already there.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import shutil
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -45,12 +47,14 @@ from photo_repair.metadata import (
 )
 
 HASH_BITS = 256
-PHASH_CACHE_VERSION = 2
+PHASH_CACHE_VERSION = 3
+PREVIEW_EDGE = 64
 DEFAULT_MAX_HAMMING = 32
 DEFAULT_OPTICS_MAX_EPS = 64
 DEFAULT_OPTICS_EPS = 32
 DEFAULT_MAX_CAPTURE_DISAGREEMENT = 86400.0
 CAPTURE_CONFLICT = "capture times disagree"
+AMBIGUOUS_MATCH = "matches more than one library group"
 _TIME_FIELDS = {
     "EXIF:DateTimeOriginal",
     "EXIF:CreateDate",
@@ -86,68 +90,188 @@ def register_heif() -> None:
     pillow_heif.register_heif_opener()
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def iter_files(root: Path):
     for dirpath, _dirnames, filenames in os.walk(root, followlinks=False):
         for name in filenames:
             yield Path(dirpath) / name
 
 
-def collect(directories: list[Path], work: Path) -> dict:
-    """Hash images under directories and keep the earliest byte-identical file."""
-    records: list[dict] = []
+def _hash_workers(jobs: int) -> int:
+    if jobs <= 1:
+        return 1
+    return max(1, min(32, jobs, os.cpu_count() or 1))
+
+
+def file_cache_key(path: str, size: int, mtime_ns: int) -> str:
+    return f"{path}\t{size}\t{mtime_ns}"
+
+
+def empty_cache() -> dict:
+    return {"version": PHASH_CACHE_VERSION, "by_file": {}, "errors": {}}
+
+
+def load_phash_cache(path: Path) -> dict:
+    cache = empty_cache()
+    if not path.is_file():
+        return cache
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return cache
+    if not isinstance(loaded, dict) or loaded.get("version") != PHASH_CACHE_VERSION:
+        if isinstance(loaded, dict) and (loaded.get("by_sha256") or loaded.get("by_file")):
+            print("perceptual-hash cache ignored; it does not match this decoder", file=sys.stderr)
+        return cache
+    cache["by_file"] = dict(loaded.get("by_file") or {})
+    cache["errors"] = dict(loaded.get("errors") or {})
+    return cache
+
+
+def _cached_fields(found: dict) -> dict:
+    return {"phash": found.get("phash"), "width": found.get("width"), "height": found.get("height")}
+
+
+def scan_images(
+    directories: list[Path],
+    label: str = "scanning",
+    min_bytes: int = 0,
+    cache: dict | None = None,
+) -> list[dict]:
+    """Hash every image under directories.
+
+    A resolved path is recorded once. Hard links to the same file are decoded
+    once and still listed. The hash cache key is path, size, and modification
+    time. Images smaller than min_bytes are ignored.
+    """
+    if cache is None:
+        cache = empty_cache()
+    by_file: dict = cache.setdefault("by_file", {})
+    errors: dict = cache.setdefault("errors", {})
+    register_heif()
     seen: set[str] = set()
-    files: list[Path] = []
+    groups: dict[tuple[int, int], list[tuple[Path, os.stat_result]]] = {}
     for directory in directories:
         if not directory.is_dir():
             raise SystemExit(f"not a directory: {directory}")
         for path in iter_files(directory):
-            resolved = str(path.resolve())
-            if resolved in seen or not path.is_file():
+            try:
+                if not path.is_file():
+                    continue
+                resolved = path.resolve()
+                key = str(resolved)
+                if key in seen:
+                    continue
+                seen.add(key)
+                stat = resolved.stat()
+            except OSError:
                 continue
-            seen.add(resolved)
-            files.append(path)
+            if min_bytes and stat.st_size < min_bytes:
+                continue
+            groups.setdefault((stat.st_dev, stat.st_ino), []).append((resolved, stat))
 
-    scanning = ProgressBar("scanning", len(files))
-    for done, path in enumerate(files, start=1):
-        scanning.set(done)
+    pending: list[tuple[tuple[int, int], Path]] = []
+    known: dict[tuple[int, int], dict] = {}
+    for inode, paths in groups.items():
+        found = None
+        for resolved, stat in paths:
+            key = file_cache_key(str(resolved), int(stat.st_size), int(stat.st_mtime_ns))
+            cached = by_file.get(key)
+            if isinstance(cached, dict) and cached.get("phash"):
+                found = cached
+                break
+            if key in errors and found is None:
+                found = {"error": errors[key]}
+        if found is not None and found.get("phash"):
+            known[inode] = found
+        elif found is not None and "error" in found and not found.get("phash"):
+            known[inode] = found
+        else:
+            pending.append((inode, paths[0][0]))
+
+    scanning = ProgressBar(label, len(groups))
+    finished = len(groups) - len(pending)
+    if finished:
+        scanning.set(finished)
+
+    def worker(job: tuple[tuple[int, int], Path]) -> tuple[tuple[int, int], dict]:
+        inode, path = job
         if sniff_kind(path) is None:
-            continue
-        stat = path.stat()
-        records.append(
-            {
-                "path": str(path.resolve()),
-                "size": int(stat.st_size),
-                "mtime_ns": int(stat.st_mtime_ns),
-                "sha256": sha256_file(path),
-            }
-        )
+            return inode, {}
+        try:
+            return inode, perceptual_record(path)
+        except (OSError, ValueError) as error:
+            return inode, {"error": str(error)}
+
+    if pending:
+        with ThreadPoolExecutor(max_workers=_hash_workers(len(pending))) as pool:
+            futures = [pool.submit(worker, job) for job in pending]
+            for future in as_completed(futures):
+                inode, found = future.result()
+                known[inode] = found
+                finished += 1
+                scanning.set(finished)
     scanning.finish()
 
+    records: list[dict] = []
+    for inode, paths in groups.items():
+        found = known.get(inode) or {}
+        if not found:
+            continue
+        for resolved, stat in paths:
+            key = file_cache_key(str(resolved), int(stat.st_size), int(stat.st_mtime_ns))
+            if found.get("phash"):
+                by_file[key] = _cached_fields(found)
+                errors.pop(key, None)
+            elif found.get("error"):
+                errors[key] = found["error"]
+            records.append(
+                {
+                    "path": str(resolved),
+                    "size": int(stat.st_size),
+                    "mtime_ns": int(stat.st_mtime_ns),
+                    "phash": found.get("phash"),
+                    "width": found.get("width"),
+                    "height": found.get("height"),
+                }
+            )
+    return records
+
+
+def dedupe_records(records: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Keep one file for each displayed picture of the same size.
+
+    The same perceptual hash and the same size keeps the earliest path.
+    A different size stays, so aggregation can still choose the larger file.
+    """
     grouped: dict[str, list[dict]] = {}
     for record in records:
-        grouped.setdefault(record["sha256"], []).append(record)
-
+        identity = record.get("phash") or f"unhashed:{record['path']}"
+        grouped.setdefault(str(identity), []).append(record)
     survivors: list[dict] = []
     dropped: list[dict] = []
     for items in grouped.values():
-        items.sort(key=lambda item: (item["mtime_ns"], item["path"]))
-        keeper = items[0]
-        survivors.append(keeper)
-        for item in items[1:]:
-            dropped.append({**item, "kept": keeper["path"]})
+        by_size: dict[int, list[dict]] = {}
+        for item in items:
+            by_size.setdefault(int(item["size"]), []).append(item)
+        for sized in by_size.values():
+            sized.sort(key=lambda item: (item["mtime_ns"], item["path"]))
+            keeper = sized[0]
+            survivors.append(keeper)
+            for item in sized[1:]:
+                dropped.append({**item, "kept": keeper["path"]})
     survivors.sort(key=lambda item: item["path"])
+    return survivors, dropped
+
+
+def collect(directories: list[Path], work: Path, min_size_kb: int = 0) -> dict:
+    """Hash images under directories and keep the earliest identical picture."""
+    cache = empty_cache()
+    survivors, dropped = dedupe_records(scan_images(directories, min_bytes=_min_bytes(min_size_kb), cache=cache))
     payload = {"survivors": survivors, "dropped": dropped}
     _write_json(work / "unique.json", payload)
+    _write_json(work / "phash.json", cache)
     print(
-        f"collected {len(records)} images, kept {len(survivors)}, dropped {len(dropped)} exact copies",
+        f"collected {len(survivors) + len(dropped)} images, kept {len(survivors)}, dropped {len(dropped)} identical pictures",
         file=sys.stderr,
     )
     return payload
@@ -167,11 +291,21 @@ def hex_to_bits(text: str) -> np.ndarray:
 
 
 def perceptual_record(path: Path) -> dict:
-    """Hash the picture as displayed. EXIF orientation is applied first."""
+    """Hash the picture as displayed.
+
+    JPEG is decoded as a reduced preview. The stored width and height stay the
+    full displayed size. HEIC and the other formats are decoded in full, then
+    oriented the same way.
+    """
     with Image.open(path) as image:
+        width, height = image.size
+        orientation = int(image.getexif().get(274, 1) or 1)
+        if orientation in {5, 6, 7, 8}:
+            width, height = height, width
+        if image.format in {"JPEG", "MPO"}:
+            image.draft("RGB", (PREVIEW_EDGE, PREVIEW_EDGE))
         oriented = ImageOps.exif_transpose(image) or image
         rgb = oriented.convert("RGB")
-        width, height = oriented.size
         import imagehash
 
         digest = imagehash.phash(rgb, hash_size=16)
@@ -310,6 +444,105 @@ def _medoid_distances(block: np.ndarray) -> tuple[int, np.ndarray, int]:
     return medoid, distances[medoid], int(distances.max())
 
 
+def _member_record(item: dict, hamming: int = 0) -> dict:
+    return {
+        "path": item["path"],
+        "size": int(item["size"]),
+        "width": int(item.get("width") or 0),
+        "height": int(item.get("height") or 0),
+        "mtime_ns": int(item["mtime_ns"]),
+        "phash": item.get("phash"),
+        "hamming_to_medoid": int(hamming),
+    }
+
+
+def groups_from_records(records: list[dict], labels: np.ndarray) -> list[dict]:
+    """Turn labeled perceptual hashes into cluster groups."""
+    hashed = [record for record in records if record.get("phash")]
+    failed = [record for record in records if not record.get("phash")]
+    bit_rows = [hex_to_bits(str(record["phash"])) for record in hashed]
+    groups: list[dict] = []
+    if hashed:
+        order = np.argsort(labels, kind="mergesort")
+        labels = labels[order]
+        hashed = [hashed[int(index)] for index in order]
+        bit_rows = [bit_rows[int(index)] for index in order]
+        start = 0
+        while start < len(hashed):
+            stop = start + 1
+            while stop < len(hashed) and labels[stop] == labels[start]:
+                stop += 1
+            block = np.vstack(bit_rows[start:stop])
+            medoid, to_medoid, farthest = _medoid_distances(block)
+            members = [
+                _member_record(item, int(to_medoid[offset]))
+                for offset, item in enumerate(hashed[start:stop])
+            ]
+            members.sort(key=lambda item: (item["hamming_to_medoid"], item["path"]))
+            groups.append({"max_hamming": farthest, "members": members, "medoid": hashed[start + medoid]["path"]})
+            start = stop
+    for item in failed:
+        print(f"perceptual hash failed, kept as its own cluster: {item['path']}", file=sys.stderr)
+        groups.append({"max_hamming": 0, "medoid": item["path"], "members": [_member_record(item)]})
+    groups.sort(key=lambda group: group["members"][0]["path"])
+    return groups
+
+
+def _attach_cached_hashes(records: list[dict], cache: dict) -> list[dict]:
+    by_file: dict = cache.setdefault("by_file", {})
+    errors: dict = cache.setdefault("errors", {})
+    attached: list[dict] = []
+    pending: list[dict] = []
+    for record in records:
+        if record.get("phash"):
+            key = file_cache_key(str(record["path"]), int(record["size"]), int(record["mtime_ns"]))
+            by_file[key] = _cached_fields(record)
+            attached.append(record)
+            continue
+        key = file_cache_key(str(record["path"]), int(record["size"]), int(record["mtime_ns"]))
+        found = by_file.get(key)
+        if isinstance(found, dict) and found.get("phash"):
+            attached.append({**record, **_cached_fields(found)})
+        else:
+            pending.append(record)
+    if not pending:
+        return attached
+
+    def hash_record(record: dict) -> tuple[dict, dict | None, str | None]:
+        try:
+            return record, perceptual_record(Path(str(record["path"]))), None
+        except (OSError, ValueError) as error:
+            return record, None, str(error)
+
+    hashing = ProgressBar("perceptual hash", len(pending))
+    with ThreadPoolExecutor(max_workers=_hash_workers(len(pending))) as pool:
+        futures = [pool.submit(hash_record, record) for record in pending]
+        for done, future in enumerate(as_completed(futures), start=1):
+            record, found, error = future.result()
+            key = file_cache_key(str(record["path"]), int(record["size"]), int(record["mtime_ns"]))
+            if found is None:
+                errors[key] = error or "perceptual hash failed"
+                attached.append(record)
+            else:
+                by_file[key] = _cached_fields(found)
+                errors.pop(key, None)
+                attached.append({**record, **found})
+            hashing.set(done)
+    hashing.finish()
+    return attached
+
+
+def cluster_records(records: list[dict], **kwargs) -> list[dict]:
+    hashed = [record for record in records if record.get("phash")]
+    labels = cluster_bit_matrix(
+        np.vstack([hex_to_bits(str(record["phash"])) for record in hashed])
+        if hashed
+        else np.zeros((0, HASH_BITS), dtype=bool),
+        **kwargs,
+    )
+    return groups_from_records(records, labels if len(hashed) else np.array([], dtype=np.int64))
+
+
 def cluster(
     work: Path,
     min_cluster_size: int = 2,
@@ -329,111 +562,23 @@ def cluster(
         raise SystemExit("unique.json must contain a survivors list")
     survivors = unique["survivors"]
     register_heif()
-
-    cache_path = work / "phash.json"
-    cache = {"version": PHASH_CACHE_VERSION, "by_sha256": {}, "errors": {}}
-    if cache_path.is_file():
-        loaded = json.loads(cache_path.read_text(encoding="utf-8"))
-        if isinstance(loaded, dict) and loaded.get("version") == PHASH_CACHE_VERSION:
-            cache["by_sha256"] = dict(loaded.get("by_sha256") or {})
-            cache["errors"] = dict(loaded.get("errors") or {})
-        elif isinstance(loaded, dict) and loaded.get("by_sha256"):
-            print("perceptual-hash cache ignored; it was built without EXIF orientation", file=sys.stderr)
-
-    hashing = ProgressBar("perceptual hash", len(survivors))
-    for done, survivor in enumerate(survivors, start=1):
-        hashing.set(done)
-        digest = str(survivor["sha256"])
-        if digest in cache["by_sha256"]:
-            continue
-        try:
-            cache["by_sha256"][digest] = perceptual_record(Path(survivor["path"]))
-            cache["errors"].pop(digest, None)
-        except (OSError, ValueError) as error:
-            cache["errors"][digest] = str(error)
-        if done % 25 == 0:
-            _write_json(cache_path, cache)
-    hashing.finish()
-    _write_json(cache_path, cache)
-
-    hashed: list[dict] = []
-    failed: list[dict] = []
-    bit_rows: list[np.ndarray] = []
-    for survivor in survivors:
-        digest = str(survivor["sha256"])
-        found = cache["by_sha256"].get(digest)
-        if not found:
-            failed.append(survivor)
-            continue
-        hashed.append({**survivor, **found})
-        bit_rows.append(hex_to_bits(found["phash"]))
-
-    labels = cluster_bit_matrix(
-        np.vstack(bit_rows) if bit_rows else np.zeros((0, HASH_BITS), dtype=bool),
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        max_hamming=max_hamming,
-        algorithm=algorithm,
-        hdbscan_epsilon=hdbscan_epsilon,
-        hdbscan_method=hdbscan_method,
-        allow_single_cluster=allow_single_cluster,
-        optics_max_eps=optics_max_eps,
-        optics_cluster_method=optics_cluster_method,
-        optics_xi=optics_xi,
-        optics_eps=optics_eps,
-    )
-    groups: list[dict] = []
-    if len(hashed):
-        order = np.argsort(labels, kind="mergesort")
-        labels = labels[order]
-        hashed = [hashed[int(index)] for index in order]
-        bit_rows = [bit_rows[int(index)] for index in order]
-        start = 0
-        while start < len(hashed):
-            stop = start + 1
-            while stop < len(hashed) and labels[stop] == labels[start]:
-                stop += 1
-            block = np.vstack(bit_rows[start:stop])
-            medoid, to_medoid, farthest = _medoid_distances(block)
-            members = []
-            for offset, item in enumerate(hashed[start:stop]):
-                members.append(
-                    {
-                        "path": item["path"],
-                        "size": int(item["size"]),
-                        "width": int(item["width"]),
-                        "height": int(item["height"]),
-                        "mtime_ns": int(item["mtime_ns"]),
-                        "sha256": item["sha256"],
-                        "phash": item["phash"],
-                        "hamming_to_medoid": int(to_medoid[offset]),
-                    }
-                )
-            members.sort(key=lambda item: (item["hamming_to_medoid"], item["path"]))
-            groups.append({"max_hamming": farthest, "members": members, "medoid": hashed[start + medoid]["path"]})
-            start = stop
-
-    for item in failed:
-        print(f"perceptual hash failed, kept as its own cluster: {item['path']}", file=sys.stderr)
-        groups.append(
-            {
-                "max_hamming": 0,
-                "medoid": item["path"],
-                "members": [
-                    {
-                        "path": item["path"],
-                        "size": int(item["size"]),
-                        "width": 0,
-                        "height": 0,
-                        "mtime_ns": int(item["mtime_ns"]),
-                        "sha256": item["sha256"],
-                        "phash": None,
-                        "hamming_to_medoid": 0,
-                    }
-                ],
-            }
-        )
-    groups.sort(key=lambda group: group["members"][0]["path"])
+    cache = load_phash_cache(work / "phash.json")
+    survivors = _attach_cached_hashes(survivors, cache)
+    _write_json(work / "phash.json", cache)
+    options = {
+        "min_cluster_size": min_cluster_size,
+        "min_samples": min_samples,
+        "max_hamming": max_hamming,
+        "algorithm": algorithm,
+        "hdbscan_epsilon": hdbscan_epsilon,
+        "hdbscan_method": hdbscan_method,
+        "allow_single_cluster": allow_single_cluster,
+        "optics_max_eps": optics_max_eps,
+        "optics_cluster_method": optics_cluster_method,
+        "optics_xi": optics_xi,
+        "optics_eps": optics_eps,
+    }
+    groups = cluster_records(survivors, **options)
     _write_json(work / "clusters.json", groups)
     _write_json(
         work / "clustering.json",
@@ -459,6 +604,312 @@ def cluster(
         file=sys.stderr,
     )
     return groups
+
+
+def _library_members(clusters: list[dict]) -> tuple[np.ndarray, list[dict]]:
+    members: list[dict] = []
+    rows: list[np.ndarray] = []
+    for index, group in enumerate(clusters, start=1):
+        for member in group.get("members") or []:
+            if not member.get("phash"):
+                continue
+            rows.append(hex_to_bits(str(member["phash"])))
+            members.append(
+                {
+                    "group": index,
+                    "path": str(member["path"]),
+                    "size": int(member.get("size") or 0),
+                }
+            )
+    matrix = np.vstack(rows) if rows else np.zeros((0, HASH_BITS), dtype=bool)
+    return matrix, members
+
+
+def _group_from_component(component: list[dict]) -> dict:
+    hashed = [record for record in component if record.get("phash")]
+    if not hashed:
+        item = component[0]
+        return {"max_hamming": 0, "medoid": item["path"], "members": [_member_record(item)]}
+    block = np.vstack([hex_to_bits(str(record["phash"])) for record in hashed])
+    medoid, to_medoid, farthest = _medoid_distances(block)
+    members = [_member_record(item, int(to_medoid[offset])) for offset, item in enumerate(hashed)]
+    members.sort(key=lambda item: (item["hamming_to_medoid"], item["path"]))
+    return {"max_hamming": farthest, "members": members, "medoid": hashed[medoid]["path"]}
+
+
+def connected_within_hamming(records: list[dict], max_hamming: int) -> list[list[dict]]:
+    """Group incoming files that are within max_hamming of each other.
+
+    The link is transitive, so a chain of near-copies becomes one picture.
+    A file with no hash stays in its own group.
+    """
+    hashed = [record for record in records if record.get("phash")]
+    parent = list(range(len(hashed)))
+
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    if len(hashed) > 1:
+        bits = np.vstack([hex_to_bits(str(record["phash"])) for record in hashed])
+        for start in range(len(hashed) - 1):
+            distances = np.count_nonzero(bits[start] != bits[start + 1 :], axis=1)
+            for offset in np.flatnonzero(distances <= max_hamming):
+                union(start, start + 1 + int(offset))
+    grouped: dict[int, list[dict]] = {}
+    for index, record in enumerate(hashed):
+        grouped.setdefault(find(index), []).append(record)
+    components = list(grouped.values())
+    components.extend([record] for record in records if not record.get("phash"))
+    return components
+
+
+def _partition_incoming(
+    components: list[list[dict]],
+    matrix: np.ndarray,
+    members: list[dict],
+    max_hamming: int,
+) -> tuple[list[dict], list[dict], list[list[dict]]]:
+    """Split incoming pictures into present, library joins, and new pictures.
+
+    Exact copies of a library file are present. If any file in an incoming
+    picture is within max_hamming of the library, the rest of that picture
+    joins the same library group. A picture farther away stays together as one
+    new cluster.
+    """
+    present: list[dict] = []
+    matched: list[dict] = []
+    unmatched: list[list[dict]] = []
+    for component in components:
+        hashed = [record for record in component if record.get("phash")]
+        if not hashed or matrix.shape[0] == 0:
+            unmatched.append(component)
+            continue
+        measured: list[tuple[dict, np.ndarray, int]] = []
+        for record in hashed:
+            distances = np.count_nonzero(matrix != hex_to_bits(str(record["phash"])), axis=1)
+            measured.append((record, distances, int(distances.min())))
+        remaining: list[tuple[dict, np.ndarray, int]] = []
+        for record, distances, _closest in measured:
+            same_size = [
+                members[int(index)]
+                for index in np.flatnonzero(distances == 0)
+                if int(members[int(index)]["size"]) == int(record["size"])
+            ]
+            if not same_size:
+                remaining.append((record, distances, int(distances.min())))
+                continue
+            same_size.sort(key=lambda item: (int(item["group"]), item["path"]))
+            present.append(
+                {**record, "library_group": same_size[0]["group"], "reference": same_size[0]["path"]}
+            )
+        if not remaining:
+            continue
+        best = min(closest for _record, _distances, closest in measured)
+        if best > max_hamming:
+            unmatched.append([record for record, _distances, _closest in remaining])
+            continue
+        tied: list[dict] = []
+        for _record, distances, closest in measured:
+            if closest != best:
+                continue
+            tied.extend(members[int(index)] for index in np.flatnonzero(distances == closest))
+        tied.sort(key=lambda item: (int(item["group"]), item["path"]))
+        chosen = tied[0]
+        ambiguous = len({int(item["group"]) for item in tied}) > 1
+        group_indexes = [index for index, item in enumerate(members) if int(item["group"]) == int(chosen["group"])]
+        for record, distances, _closest in remaining:
+            distance = min(int(distances[index]) for index in group_indexes)
+            nearest = min(group_indexes, key=lambda index: (int(distances[index]), members[index]["path"]))
+            matched.append(
+                {
+                    **record,
+                    "library_group": chosen["group"],
+                    "matched_path": members[nearest]["path"],
+                    "distance": distance,
+                    "ambiguous": ambiguous,
+                }
+            )
+    return present, matched, unmatched
+
+
+def _classify_new_files(
+    library_work: Path,
+    directories: list[Path],
+    min_size_kb: int,
+    max_hamming: int,
+) -> dict:
+    """Hash new files once, dedupe them among themselves, then compare with the library."""
+    clusters = _read_json(library_work / "clusters.json")
+    if not isinstance(clusters, list):
+        raise SystemExit("library clusters.json must be a list")
+    matrix, members = _library_members(clusters)
+    if clusters and matrix.shape[0] == 0:
+        raise SystemExit("library clusters have no perceptual hashes")
+    cache = load_phash_cache(library_work / "phash.json")
+    records = scan_images(directories, min_bytes=_min_bytes(min_size_kb), cache=cache)
+    kept, dropped = dedupe_records(records)
+    components = connected_within_hamming(kept, max_hamming)
+    present, matched, unmatched = _partition_incoming(components, matrix, members, max_hamming)
+    return {
+        "clusters": clusters,
+        "cache": cache,
+        "dropped": dropped,
+        "present": present,
+        "matched": matched,
+        "unmatched": [record for component in unmatched for record in component],
+        "unmatched_components": unmatched,
+    }
+
+
+def _write_match_files(work: Path, classified: dict) -> dict:
+    payload = {
+        "survivors": classified["unmatched"],
+        "matched": classified["matched"],
+        "dropped": classified["dropped"],
+        "present": classified["present"],
+    }
+    _write_json(work / "unique.json", payload)
+    _write_json(work / "matched.json", classified["matched"])
+    _write_json(work / "phash.json", classified["cache"])
+    return payload
+
+
+def missing(library_work: Path, directories: list[Path], work: Path, min_size_kb: int = 0, max_hamming: int = DEFAULT_MAX_HAMMING) -> dict:
+    """List new pictures that are not already in a library work directory.
+
+    Distance 0 at the same size is present. Incoming files within max_hamming of
+    each other are one picture. If that picture meets the library, its files are
+    recorded in matched.json. Survivors are the pictures farther away, already
+    grouped among themselves.
+    """
+    classified = _classify_new_files(library_work, directories, min_size_kb, max_hamming)
+    payload = _write_match_files(work, classified)
+    print(
+        f"{len(payload['survivors'])} unmatched, {len(payload['matched'])} joined, "
+        f"{len(payload['present'])} already present, {len(payload['dropped'])} identical pictures dropped",
+        file=sys.stderr,
+    )
+    return payload
+
+
+def _mark_apply_actions(planned: list[dict], previous: dict[int, dict]) -> None:
+    assign_output_names(planned)
+    for plan in planned:
+        old = previous.get(int(plan["group"]))
+        if old is None:
+            plan["changed"] = True
+            plan["apply"] = "copy"
+            continue
+        name_changed = old.get("stored_name") != plan["stored_name"]
+        pixel_changed = old.get("pixel_source") != plan["pixel_source"]
+        plan["changed"] = bool(name_changed or pixel_changed)
+        if not plan["changed"]:
+            plan["apply"] = "skip"
+        elif name_changed:
+            plan["apply"] = "copy"
+        else:
+            plan["apply"] = "replace"
+
+
+def increment(
+    library_work: Path,
+    directories: list[Path],
+    work: Path,
+    exiftool: str,
+    min_size_kb: int = 0,
+    max_capture_disagreement: float = DEFAULT_MAX_CAPTURE_DISAGREEMENT,
+    min_cluster_size: int = 2,
+    min_samples: int = 2,
+    max_hamming: int = DEFAULT_MAX_HAMMING,
+    algorithm: str = "hdbscan",
+    hdbscan_epsilon: int = 0,
+    hdbscan_method: str = "eom",
+    allow_single_cluster: bool = False,
+    optics_max_eps: int = DEFAULT_OPTICS_MAX_EPS,
+    optics_cluster_method: str = "xi",
+    optics_xi: float = 0.05,
+    optics_eps: int = DEFAULT_OPTICS_EPS,
+) -> list[dict]:
+    """Add new photos to an existing library plan.
+
+    The library work directory is only read. Incoming photos within max_hamming
+    of each other are one picture. A picture that meets the library joins that
+    group. Any other picture is already one cluster and is aggregated as new.
+    """
+    classified = _classify_new_files(library_work, directories, min_size_kb, max_hamming)
+    _write_match_files(work, classified)
+    library_plans = _read_json(library_work / "plan.json")
+    if not isinstance(library_plans, list):
+        raise SystemExit("library plan.json must be a list")
+    merged = classified["clusters"]
+    touched: set[int] = set()
+    ambiguous: set[int] = set()
+    for item in classified["matched"]:
+        group_id = int(item["library_group"])
+        if group_id < 1 or group_id > len(merged):
+            raise SystemExit(f"library group {group_id} is not in clusters.json")
+        group = merged[group_id - 1]
+        group.setdefault("members", []).append(_member_record(item, int(item["distance"])))
+        group["max_hamming"] = max(int(group.get("max_hamming") or 0), int(item["distance"]))
+        touched.add(group_id)
+        if item.get("ambiguous"):
+            ambiguous.add(group_id)
+    options = {
+        "min_cluster_size": min_cluster_size,
+        "min_samples": min_samples,
+        "max_hamming": max_hamming,
+        "algorithm": algorithm,
+        "hdbscan_epsilon": hdbscan_epsilon,
+        "hdbscan_method": hdbscan_method,
+        "allow_single_cluster": allow_single_cluster,
+        "optics_max_eps": optics_max_eps,
+        "optics_cluster_method": optics_cluster_method,
+        "optics_xi": optics_xi,
+        "optics_eps": optics_eps,
+    }
+    library_count = len(classified["clusters"])
+    new_groups = [_group_from_component(component) for component in classified["unmatched_components"]]
+    merged.extend(new_groups)
+    _write_json(work / "clusters.json", merged)
+    _write_json(work / "clustering.json", {**options, "incoming": "max-hamming"})
+    selected = [(group_id, merged[group_id - 1]) for group_id in sorted(touched)]
+    selected.extend((library_count + offset, group) for offset, group in enumerate(new_groups, start=1))
+    recomputed = _plan_selected(selected, exiftool, max_capture_disagreement)
+    for plan in recomputed:
+        if int(plan["group"]) in ambiguous:
+            conflicts = list(plan.get("conflicts") or [])
+            if AMBIGUOUS_MATCH not in conflicts:
+                conflicts.append(AMBIGUOUS_MATCH)
+            plan["conflicts"] = conflicts
+    previous = {int(plan["group"]): plan for plan in library_plans}
+    by_group = {}
+    for plan in library_plans:
+        copied = dict(plan)
+        copied["apply"] = "skip"
+        copied["changed"] = False
+        by_group[int(plan["group"])] = copied
+    for plan in recomputed:
+        by_group[int(plan["group"])] = plan
+    planned = [by_group[group_id] for group_id in sorted(by_group)]
+    _mark_apply_actions(planned, previous)
+    _write_json(work / "plan.json", planned)
+    copying = sum(1 for plan in planned if plan.get("apply") == "copy")
+    replacing = sum(1 for plan in planned if plan.get("apply") == "replace")
+    print(
+        f"incremental plan: {copying} new, {replacing} replaced, "
+        f"{len(planned) - copying - replacing} unchanged",
+        file=sys.stderr,
+    )
+    return planned
 
 
 def _stable_exif_value(value: object) -> object:
@@ -626,17 +1077,33 @@ def aggregate(
             return previous
         selected = [(index, group) for index, group in selected if index in wanted]
         print(f"recomputing {len(selected)} conflict groups", file=sys.stderr)
+    planned = _plan_selected(selected, exiftool, max_capture_disagreement)
+    if previous is not None:
+        planned = replace_plans(previous, planned)
+    assign_output_names(planned)
+    _write_json(work / "plan.json", planned)
+    conflicts = sum(1 for plan in planned if plan.get("conflicts"))
+    print(f"planned {len(planned)} images, {conflicts} with conflicts", file=sys.stderr)
+    return planned
+
+
+def _plan_selected(
+    selected: list[tuple[int, dict]],
+    exiftool: str,
+    max_capture_disagreement: float,
+) -> list[dict]:
+    if not selected:
+        return []
     if shutil.which(exiftool) is None:
         raise SystemExit("exiftool not found")
     paths = [str(member["path"]) for _index, group in selected for member in group.get("members", [])]
     readable = [path for path in paths if Path(path).is_file()]
-    missing = len(paths) - len(readable)
-    if missing:
-        print(f"skipping {missing} missing files", file=sys.stderr)
+    missing_files = len(paths) - len(readable)
+    if missing_files:
+        print(f"skipping {missing_files} missing files", file=sys.stderr)
     reading = ProgressBar("reading metadata", len(dict.fromkeys(readable)))
     raw = read_metadata(exiftool, readable, reading)
     metadata = index_metadata(raw, paths)
-
     planned: list[dict] = []
     for index, group in selected:
         present = [member for member in group.get("members", []) if Path(str(member["path"])).is_file()]
@@ -647,12 +1114,6 @@ def aggregate(
         plan["group"] = index
         plan["max_hamming"] = int(group.get("max_hamming") or 0)
         planned.append(plan)
-    if previous is not None:
-        planned = replace_plans(previous, planned)
-    assign_output_names(planned)
-    _write_json(work / "plan.json", planned)
-    conflicts = sum(1 for plan in planned if plan.get("conflicts"))
-    print(f"planned {len(planned)} images, {conflicts} with conflicts", file=sys.stderr)
     return planned
 
 
@@ -660,53 +1121,81 @@ def apply_plan(work: Path, result: Path, exiftool: str, dry_run: bool, move: boo
     planned = _read_json(work / "plan.json")
     if not isinstance(planned, list):
         raise SystemExit("plan.json must be a list")
-    if shutil.which(exiftool) is None:
-        raise SystemExit("exiftool not found")
 
-    destinations: list[tuple[dict, Path]] = []
+    destinations: list[tuple[dict, Path, str]] = []
     seen_names: set[str] = set()
+    report: list[dict] = []
     for plan in planned:
         name = str(plan["stored_name"])
+        dest = result / name
+        action = str(plan.get("apply") or "copy")
+        if action == "skip":
+            report.append({"output": str(dest), "skipped": True, **plan})
+            continue
         if name in seen_names:
             raise SystemExit(f"duplicate result name: {name}")
         seen_names.add(name)
         source = Path(str(plan["pixel_source"]))
         if not source.is_file():
             raise SystemExit(f"missing pixel source: {source}")
-        dest = result / name
-        if dest.exists():
+        if dest.exists() and action != "replace":
             raise SystemExit(f"refusing to overwrite {dest}")
-        destinations.append((plan, dest))
+        destinations.append((plan, dest, action))
+    if destinations and shutil.which(exiftool) is None:
+        raise SystemExit("exiftool not found")
 
-    report: list[dict] = []
-    jobs: list[tuple[Path, dict]] = []
     verb = "move" if move else "copy"
     if dry_run:
-        for plan, dest in destinations:
-            print(f"would {verb} {plan['pixel_source']} -> {dest}", file=sys.stderr)
+        for plan, dest, action in destinations:
+            word = "replace" if action == "replace" else verb
+            print(f"would {word} {plan['pixel_source']} -> {dest}", file=sys.stderr)
             report.append({"output": str(dest), **plan})
-        print(f"dry-run: {len(report)} images would {verb} into {result}", file=sys.stderr)
+        print(
+            f"dry-run: {len(destinations)} images would {verb} into {result}, {len(report) - len(destinations)} skipped",
+            file=sys.stderr,
+        )
         return report
 
     result.mkdir(parents=True, exist_ok=True)
-    placing = ProgressBar("moving" if move else "copying", len(destinations))
-    transfer = shutil.move if move else shutil.copy2
-    for done, (plan, dest) in enumerate(destinations, start=1):
-        transfer(plan["pixel_source"], dest)
-        jobs.append((dest, plan))
-        report.append({"output": str(dest), **plan})
-        placing.set(done)
-    placing.finish()
-    write_copies(exiftool, jobs, ProgressBar("writing metadata", len(jobs)))
+    jobs: list[tuple[Path, dict]] = []
+    if destinations:
+        placing = ProgressBar("moving" if move else "copying", len(destinations))
+        transfer = shutil.move if move else shutil.copy2
+        for done, (plan, dest, action) in enumerate(destinations, start=1):
+            if action == "replace" and dest.exists():
+                dest.unlink()
+            transfer(plan["pixel_source"], dest)
+            jobs.append((dest, plan))
+            report.append({"output": str(dest), **plan})
+            placing.set(done)
+        placing.finish()
+        write_copies(exiftool, jobs, ProgressBar("writing metadata", len(jobs)))
     _write_json(result / "report.json", report)
-    print(f"{'moved' if move else 'copied'} {len(report)} images into {result}", file=sys.stderr)
+    written = len(destinations)
+    print(f"{'moved' if move else 'copied'} {written} images into {result}", file=sys.stderr)
     return report
+
+
+def _min_bytes(min_size_kb: int) -> int:
+    if min_size_kb < 0:
+        raise SystemExit("--min-size must be zero or greater")
+    return min_size_kb * 1024
 
 
 def _require_dirs(directories: list[Path] | None) -> list[Path]:
     if not directories:
         raise SystemExit("pass at least one --dir")
     return directories
+
+
+def _add_min_size(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--min-size",
+        type=int,
+        default=0,
+        metavar="KB",
+        help="ignore images smaller than this many kilobytes (default 0)",
+    )
 
 
 def _add_clustering_arguments(parser: argparse.ArgumentParser) -> None:
@@ -768,6 +1257,28 @@ def main(argv: list[str] | None = None) -> None:
     collect_parser = sub.add_parser("collect", help="hash images and keep the earliest exact copy")
     collect_parser.add_argument("--dir", dest="dirs", action="append", type=Path, required=True)
     collect_parser.add_argument("--work", type=Path, required=True)
+    _add_min_size(collect_parser)
+
+    missing_parser = sub.add_parser("missing", help="list pictures that are not already in a library")
+    missing_parser.add_argument("--library-work", type=Path, required=True)
+    missing_parser.add_argument("--dir", dest="dirs", action="append", type=Path, required=True)
+    missing_parser.add_argument("--work", type=Path, required=True)
+    missing_parser.add_argument("--max-hamming", type=int, default=DEFAULT_MAX_HAMMING)
+    _add_min_size(missing_parser)
+
+    increment_parser = sub.add_parser("increment", help="add new pictures to an existing library plan")
+    increment_parser.add_argument("--library-work", type=Path, required=True)
+    increment_parser.add_argument("--dir", dest="dirs", action="append", type=Path, required=True)
+    increment_parser.add_argument("--work", type=Path, required=True)
+    increment_parser.add_argument("--exiftool", default="exiftool")
+    increment_parser.add_argument(
+        "--max-capture-disagreement",
+        type=parse_duration,
+        default=DEFAULT_MAX_CAPTURE_DISAGREEMENT,
+        help="capture times on files with camera data farther apart than this are a conflict (default 1d)",
+    )
+    _add_min_size(increment_parser)
+    _add_clustering_arguments(increment_parser)
 
     cluster_parser = sub.add_parser("cluster", help="perceptual-hash survivors and cluster by Hamming distance")
     cluster_parser.add_argument("--work", type=Path, required=True)
@@ -799,6 +1310,7 @@ def main(argv: list[str] | None = None) -> None:
     all_parser.add_argument("--dir", dest="dirs", action="append", type=Path, required=True)
     all_parser.add_argument("--work", type=Path, required=True)
     all_parser.add_argument("--result", type=Path, required=True)
+    _add_min_size(all_parser)
     all_parser.add_argument("--exiftool", default="exiftool")
     all_parser.add_argument(
         "--max-capture-disagreement",
@@ -816,7 +1328,19 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.command == "collect":
-        collect(_require_dirs(args.dirs), args.work)
+        collect(_require_dirs(args.dirs), args.work, args.min_size)
+    elif args.command == "missing":
+        missing(args.library_work, _require_dirs(args.dirs), args.work, args.min_size, args.max_hamming)
+    elif args.command == "increment":
+        increment(
+            args.library_work,
+            _require_dirs(args.dirs),
+            args.work,
+            args.exiftool,
+            args.min_size,
+            args.max_capture_disagreement,
+            **_clustering_kwargs(args),
+        )
     elif args.command == "cluster":
         cluster(args.work, **_clustering_kwargs(args))
     elif args.command == "aggregate":
@@ -824,7 +1348,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "apply":
         apply_plan(args.work, args.result, args.exiftool, args.dry_run, args.move)
     elif args.command == "all":
-        collect(_require_dirs(args.dirs), args.work)
+        collect(_require_dirs(args.dirs), args.work, args.min_size)
         cluster(args.work, **_clustering_kwargs(args))
         aggregate(args.work, args.exiftool, args.max_capture_disagreement)
         apply_plan(args.work, args.result, args.exiftool, args.dry_run, args.move)
@@ -863,6 +1387,25 @@ def _self_test() -> int:
     assert optics_labels[0] != optics_labels[3]
 
     near = same.copy()
+    close = same.copy()
+    close[:8] = True
+    chained = same.copy()
+    chained[:16] = True
+    incoming = [
+        {"path": "/copy.jpg", "size": 10, "mtime_ns": 1, "width": 1, "height": 1, "phash": bits_to_hex(same)},
+        {"path": "/near.jpg", "size": 20, "mtime_ns": 2, "width": 1, "height": 1, "phash": bits_to_hex(close)},
+        {"path": "/chain.jpg", "size": 30, "mtime_ns": 3, "width": 1, "height": 1, "phash": bits_to_hex(chained)},
+        {"path": "/other.jpg", "size": 40, "mtime_ns": 4, "width": 1, "height": 1, "phash": bits_to_hex(other)},
+    ]
+    components = connected_within_hamming(incoming, 12)
+    assert sorted(len(component) for component in components) == [1, 3]
+    library_bits = np.vstack([same])
+    library_members = [{"group": 1, "path": "/library.jpg", "size": 10}]
+    present, matched, unmatched = _partition_incoming(components, library_bits, library_members, 12)
+    assert [item["path"] for item in present] == ["/copy.jpg"]
+    assert {item["path"] for item in matched} == {"/near.jpg", "/chain.jpg"}
+    assert all(item["library_group"] == 1 for item in matched)
+    assert [item["path"] for component in unmatched for item in component] == ["/other.jpg"]
     near[:40] = True
     forced = enforce_max_hamming(np.array([0, 0, 0]), np.vstack([same, same, near]), 32)
     assert forced[0] == forced[1]
@@ -1040,6 +1583,12 @@ def _self_test() -> int:
         assert payload["dropped"][0]["path"].endswith("newer.jpg")
         assert payload["dropped"][0]["kept"].endswith("kept.jpg")
         assert newer.is_file() and kept.is_file()
+        twice = collect([source, source], root / "work-twice")
+        assert [item["path"] for item in twice["survivors"]] == [item["path"] for item in payload["survivors"]]
+        assert len(twice["dropped"]) == len(payload["dropped"])
+        skipped = collect([source], root / "work-small", min_size_kb=100000)
+        assert skipped["survivors"] == []
+        assert skipped["dropped"] == []
         groups = cluster(work, 2, 2, 0)
         assert len(groups) == 2
         assert all(len(group["members"]) == 1 for group in groups)
@@ -1053,6 +1602,32 @@ def _self_test() -> int:
         assert kept.is_file()
         assert newer.is_file()
         assert (result / "report.json").is_file()
+
+        inbox = root / "inbox"
+        inbox.mkdir()
+        (inbox / "same.jpg").write_bytes(kept.read_bytes())
+        (inbox / "new.jpg").write_bytes(other.read_bytes())
+        extra = inbox / "new-later.jpg"
+        extra.write_bytes(other.read_bytes())
+        os.utime(inbox / "new.jpg", (1_000_000_000, 1_000_000_000))
+        os.utime(extra, (1_700_000_000, 1_700_000_000))
+        fresh = inbox / "fresh.jpg"
+        Image.fromarray(rng.integers(0, 256, size=(32, 32, 3), dtype=np.uint8)).save(fresh, format="JPEG")
+        found = missing(work, [inbox], root / "missing-work", max_hamming=12)
+        assert len(found["survivors"]) == 1
+        assert found["survivors"][0]["path"].endswith("fresh.jpg")
+        assert len(found["dropped"]) == 1
+        assert found["dropped"][0]["path"].endswith("new-later.jpg")
+        assert {Path(item["path"]).name for item in found["present"]} == {"same.jpg", "new.jpg"}
+        added = increment(work, [inbox], root / "increment-work", "exiftool", max_hamming=12)
+        assert sum(1 for plan in added if plan.get("apply") == "copy") == 1
+        assert sum(1 for plan in added if plan.get("apply") == "skip") == 2
+        copied_names = {Path(plan["pixel_source"]).name for plan in added if plan.get("apply") == "copy"}
+        assert copied_names == {"fresh.jpg"}
+        placed = apply_plan(root / "increment-work", result, "exiftool", False)
+        assert sum(1 for item in placed if not item.get("skipped")) == 1
+        assert (result / "fresh.jpg").is_file()
+
         moved_result = root / "moved"
         moved = apply_plan(work, moved_result, "exiftool", False, move=True)
         assert len(moved) == 2
