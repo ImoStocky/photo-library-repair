@@ -44,7 +44,7 @@ Reading and writing share that process. A bad file is reported and the next `-ex
 
 | Current work | Replacement |
 | --- | --- |
-| SHA-256 of every byte in `collect` and `missing` | Not run |
+| SHA-256 of every byte during collection | Not run |
 | Perceptual hash of those same files afterwards | The only image pass |
 | HDBSCAN over the library plus the new files | Distance check against stored library hashes |
 | Rewriting `phash.json` during the scan | One write at the end |
@@ -54,7 +54,7 @@ Reading and writing share that process. A bad file is reported and the next `-ex
 
 1. Stop using SHA-256 as the collection identity. Record path, size, modification time, and the perceptual hash.
 2. Decode JPEG through a reduced preview inside `perceptual_record`.
-3. Point `missing` and increment at the library `phash.json` and `clusters.json`. Distance 0 is already present. Distance within `--max-hamming` joins that group. The rest are clustered alone.
+3. Point increment at the library `phash.json` and `clusters.json`. Distance 0 is already present. Distance within `--max-hamming` joins that group. The rest are clustered alone.
 4. Write the hash cache once per run.
 5. Read and write metadata through one stay-open ExifTool process.
 

@@ -30,7 +30,6 @@ flowchart LR
 
 ```text
 python repair_library.py collect --dir PHOTO --dir MORE --work work --min-size 100
-python repair_library.py missing --library-work work --dir INBOX --dir MORE --work work-new
 python repair_library.py increment --library-work work --dir INBOX --work work-increment --max-hamming 12
 python repair_library.py cluster --work work --algorithm hdbscan --max-hamming 32
 python repair_library.py cluster --work work --algorithm optics --optics-max-eps 64
@@ -42,7 +41,7 @@ python repair_library.py all --dir PHOTO --work work --result repaired
 python repair_library.py --self-test
 ```
 
-`--dry-run` on `all` or `apply` prints each copy, or each move when `--move` is set, and does not perform it. Apply refuses to overwrite a file that is already in the result directory.
+`--dry-run` on `all` or `apply` prints each new file, rename, and update, and does not perform it. A new file refuses to overwrite a name that is already in the result directory. An update overwrites that file. A rename moves the existing library file to its new name.
 
 ## Collection
 
@@ -50,11 +49,20 @@ Each directory is walked recursively. A file is kept when its header is JPEG, PN
 
 The identity of a picture is its 256-bit perceptual hash after EXIF orientation. The same hash and the same file size keep the earliest path. A later copy stays on disk and is listed under `dropped` in `work/unique.json`. A different file size is kept, so aggregation can still choose the larger pixels. Dropped files are not passed to clustering and they are not a metadata conflict.
 
-## Missing from a reference library
+## Adding to an existing library
 
-`missing` compares new directories with a library that already has `clusters.json`. `--library-work` is that library and is only read. Each `--dir` is searched for images. Distance 0 at the same file size is already present. Distance 1 through `--max-hamming` is written to `matched.json` as a join to that library group. `survivors` are the pictures farther away. `--min-size` applies to the new directories.
+`increment` groups the incoming files among themselves, then compares each picture with the library. Two new files within `--max-hamming` of each other, or connected by a chain of such files, are one picture. Exact copies of a library file are already present. If any file in an incoming picture is within `--max-hamming` of a library group, the rest of that picture joins the same group and the group is aggregated again. A picture that does not meet the library becomes one new group.
 
-`increment` first groups the incoming files among themselves. Two new files within `--max-hamming` of each other, or connected by a chain of such files, are one picture. Exact copies of a library file are already present. If any file in an incoming picture is within `--max-hamming` of a library group, the rest of that picture joins the same group and the group is aggregated again. A picture that does not meet the library becomes one new group. Untouched library rows are marked `skip`, so a later apply copies only new result files and replaces a result file whose chosen pixels changed.
+Each plan row is one of:
+
+| Action | Meaning |
+| --- | --- |
+| `new` | The picture is not in the library. Apply copies it in. |
+| `renamed` | The picture is in the library and a better file name was found. Apply renames the library file. |
+| `updated` | The name stays, and the pixels or metadata change. Apply overwrites that file. |
+| `untouched` | Nothing to write. |
+
+If a new or renamed picture wants a file name that another library picture already has, its name is prefixed with its group number, such as `000522_IMG_0007.jpg`. The original file keeps its name. Apply then writes the updated plan, clusters, and hash cache back into `--library-work`, so the next increment sees the extended library.
 
 ```text
 python repair_library.py increment --library-work work --dir INBOX --work work-increment --max-hamming 12

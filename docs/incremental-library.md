@@ -73,10 +73,14 @@ Each new cluster gets a group id above the highest id in the library plan. A sin
 
 ## Step 5. Apply
 
-- Untouched rows are not copied again.
-- A new group is copied, or moved when `--move` is set.
-- A touched group whose chosen pixel file changed replaces that result file.
-- `present` and `dropped` are not written.
+| Action | What apply does |
+| --- | --- |
+| `new` | Copy the picture into the library. |
+| `renamed` | Rename the existing library file. New pixels replace it when the chosen file changed too. |
+| `updated` | Overwrite the library file. The name stays. |
+| `untouched` | Leave the library file where it is. |
+
+A new or renamed name that belongs to a different library picture is prefixed with the group number, and that prefixed name is what the index stores. Apply writes the finished plan and clusters back into the library work directory.
 
 ## Files
 

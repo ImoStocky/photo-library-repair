@@ -783,41 +783,77 @@ def _write_match_files(work: Path, classified: dict) -> dict:
     return payload
 
 
-def missing(library_work: Path, directories: list[Path], work: Path, min_size_kb: int = 0, max_hamming: int = DEFAULT_MAX_HAMMING) -> dict:
-    """List new pictures that are not already in a library work directory.
-
-    Distance 0 at the same size is present. Incoming files within max_hamming of
-    each other are one picture. If that picture meets the library, its files are
-    recorded in matched.json. Survivors are the pictures farther away, already
-    grouped among themselves.
-    """
-    classified = _classify_new_files(library_work, directories, min_size_kb, max_hamming)
-    payload = _write_match_files(work, classified)
-    print(
-        f"{len(payload['survivors'])} unmatched, {len(payload['matched'])} joined, "
-        f"{len(payload['present'])} already present, {len(payload['dropped'])} identical pictures dropped",
-        file=sys.stderr,
-    )
-    return payload
+_PLAN_META = ("capture_time", "capture_source", "gps_source", "camera_source")
 
 
-def _mark_apply_actions(planned: list[dict], previous: dict[int, dict]) -> None:
-    assign_output_names(planned)
+def _member_by_path(group: dict | None, path: str) -> dict | None:
+    if not group:
+        return None
+    for member in group.get("members") or []:
+        if str(member.get("path")) == path:
+            return member
+    return None
+
+
+def _pixels_changed(plan: dict, old: dict, group: dict | None) -> bool:
+    if plan.get("pixel_source") == old.get("pixel_source"):
+        return False
+    new_member = _member_by_path(group, str(plan.get("pixel_source")))
+    old_member = _member_by_path(group, str(old.get("pixel_source")))
+    if not new_member or not old_member:
+        return True
+    return new_member.get("phash") != old_member.get("phash") or int(new_member.get("size") or 0) != int(old_member.get("size") or 0)
+
+
+def _resolve_name_collisions(planned: list[dict], previous: dict[int, dict]) -> None:
+    """Keep each library file's name. Prefix a newcomer that wants the same name."""
+    owners: dict[str, int] = {}
     for plan in planned:
         old = previous.get(int(plan["group"]))
-        if old is None:
-            plan["changed"] = True
-            plan["apply"] = "copy"
+        if old and plan["stored_name"] == old.get("stored_name"):
+            owners[str(plan["stored_name"]).casefold()] = int(plan["group"])
+
+    def allocate(name: str, group: int) -> str:
+        if owners.get(name.casefold()) in (None, group):
+            owners[name.casefold()] = group
+            return name
+        number = group
+        while True:
+            candidate = f"{number:06d}_{name}"
+            if candidate.casefold() not in owners:
+                owners[candidate.casefold()] = group
+                return candidate
+            number += 1
+
+    for plan in sorted(planned, key=lambda item: int(item["group"])):
+        group = int(plan["group"])
+        old = previous.get(group)
+        if old and plan["stored_name"] == old.get("stored_name"):
             continue
+        plan["stored_name"] = allocate(str(plan["stored_name"]), group)
+
+
+def _mark_apply_actions(planned: list[dict], previous: dict[int, dict], clusters: list[dict]) -> None:
+    _resolve_name_collisions(planned, previous)
+    for plan in planned:
+        group = int(plan["group"])
+        old = previous.get(group)
+        cluster = clusters[group - 1] if 0 < group <= len(clusters) else None
+        if old is None:
+            plan["apply"] = "new"
+            plan["changed"] = True
+            plan.pop("previous_name", None)
+            continue
+        plan["previous_name"] = old.get("stored_name")
         name_changed = old.get("stored_name") != plan["stored_name"]
-        pixel_changed = old.get("pixel_source") != plan["pixel_source"]
-        plan["changed"] = bool(name_changed or pixel_changed)
-        if not plan["changed"]:
-            plan["apply"] = "skip"
-        elif name_changed:
-            plan["apply"] = "copy"
+        meta_changed = any(old.get(key) != plan.get(key) for key in _PLAN_META)
+        if name_changed:
+            plan["apply"] = "renamed"
+        elif _pixels_changed(plan, old, cluster) or meta_changed:
+            plan["apply"] = "updated"
         else:
-            plan["apply"] = "replace"
+            plan["apply"] = "untouched"
+        plan["changed"] = plan["apply"] != "untouched"
 
 
 def increment(
@@ -900,13 +936,13 @@ def increment(
     for plan in recomputed:
         by_group[int(plan["group"])] = plan
     planned = [by_group[group_id] for group_id in sorted(by_group)]
-    _mark_apply_actions(planned, previous)
+    _mark_apply_actions(planned, previous, merged)
     _write_json(work / "plan.json", planned)
-    copying = sum(1 for plan in planned if plan.get("apply") == "copy")
-    replacing = sum(1 for plan in planned if plan.get("apply") == "replace")
+    _write_json(work / "library.json", {"library_work": str(library_work.resolve())})
+    counts = {name: sum(1 for plan in planned if plan.get("apply") == name) for name in ("new", "renamed", "updated", "untouched")}
     print(
-        f"incremental plan: {copying} new, {replacing} replaced, "
-        f"{len(planned) - copying - replacing} unchanged",
+        f"incremental plan: {counts['new']} new, {counts['renamed']} renamed, "
+        f"{counts['updated']} updated, {counts['untouched']} untouched",
         file=sys.stderr,
     )
     return planned
@@ -1117,62 +1153,175 @@ def _plan_selected(
     return planned
 
 
+def _same_file(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve() or left.samefile(right)
+    except OSError:
+        return False
+
+
+def _transfer_file(source: Path, dest: Path, move: bool) -> None:
+    if dest.exists():
+        dest.unlink()
+    if move:
+        shutil.move(source, dest)
+    else:
+        shutil.copy2(source, dest)
+
+
+def _place_plan(plan: dict, result: Path, move: bool) -> Path | None:
+    action = str(plan.get("apply") or "new")
+    if action == "untouched":
+        return None
+    dest = result / str(plan["stored_name"])
+    source = Path(str(plan["pixel_source"]))
+    if not source.is_file():
+        raise SystemExit(f"missing pixel source: {source}")
+    previous = result / str(plan["previous_name"]) if plan.get("previous_name") else None
+    if action == "new":
+        if dest.exists():
+            raise SystemExit(f"refusing to overwrite {dest}")
+        _transfer_file(source, dest, move)
+        return dest
+    if action == "renamed":
+        if dest.exists() and (previous is None or not _same_file(dest, previous)):
+            raise SystemExit(f"refusing to overwrite {dest}")
+        if previous is not None and previous.is_file() and _same_file(source, previous):
+            if dest.exists() and not _same_file(dest, previous):
+                dest.unlink()
+            previous.rename(dest)
+        else:
+            _transfer_file(source, dest, move)
+            if previous is not None and previous.is_file() and not _same_file(previous, dest):
+                previous.unlink()
+        return dest
+    if action == "updated":
+        if not _same_file(source, dest):
+            _transfer_file(source, dest, move)
+        return dest
+    raise SystemExit(f"unknown apply action: {action}")
+
+
+def _sync_library_index(work: Path, result: Path, planned: list[dict]) -> None:
+    manifest_path = work / "library.json"
+    if not manifest_path.is_file():
+        return
+    manifest = _read_json(manifest_path)
+    library = Path(str(manifest.get("library_work") or ""))
+    if not library.is_dir():
+        return
+    clusters = _read_json(work / "clusters.json")
+    if not isinstance(clusters, list):
+        return
+    saved: list[dict] = []
+    for plan in planned:
+        group_id = int(plan["group"])
+        group = clusters[group_id - 1] if 0 < group_id <= len(clusters) else None
+        dest = (result / str(plan["stored_name"])).resolve()
+        action = str(plan.get("apply") or "new")
+        if group is not None and action == "renamed" and plan.get("previous_name"):
+            old = (result / str(plan["previous_name"])).resolve()
+            for member in group.get("members") or []:
+                try:
+                    if Path(str(member["path"])).resolve() == old:
+                        member["path"] = str(dest)
+                except OSError:
+                    continue
+        if group is not None and action == "updated":
+            source = _member_by_path(group, str(plan.get("pixel_source")))
+            for member in group.get("members") or []:
+                try:
+                    at_result = Path(str(member["path"])).resolve() == dest
+                except OSError:
+                    at_result = False
+                if at_result and source:
+                    member["phash"] = source.get("phash")
+                    member["size"] = source.get("size")
+                    member["width"] = source.get("width")
+                    member["height"] = source.get("height")
+        if group is not None and action == "new":
+            source = _member_by_path(group, str(plan.get("pixel_source")))
+            if source is not None:
+                group.setdefault("members", []).append({**source, "path": str(dest), "hamming_to_medoid": 0})
+        record = dict(plan)
+        if action in {"new", "renamed", "updated"}:
+            record["pixel_source"] = str(dest)
+        saved.append(record)
+    _write_json(library / "clusters.json", clusters)
+    _write_json(library / "plan.json", saved)
+    cache = work / "phash.json"
+    if cache.is_file():
+        shutil.copy2(cache, library / "phash.json")
+
+
 def apply_plan(work: Path, result: Path, exiftool: str, dry_run: bool, move: bool = False) -> list[dict]:
     planned = _read_json(work / "plan.json")
     if not isinstance(planned, list):
         raise SystemExit("plan.json must be a list")
 
-    destinations: list[tuple[dict, Path, str]] = []
     seen_names: set[str] = set()
     report: list[dict] = []
+    placing: list[dict] = []
     for plan in planned:
         name = str(plan["stored_name"])
+        if name.casefold() in seen_names:
+            raise SystemExit(f"duplicate result name: {name}")
+        seen_names.add(name.casefold())
+        action = str(plan.get("apply") or "new")
         dest = result / name
-        action = str(plan.get("apply") or "copy")
-        if action == "skip":
+        if action == "untouched":
             report.append({"output": str(dest), "skipped": True, **plan})
             continue
-        if name in seen_names:
-            raise SystemExit(f"duplicate result name: {name}")
-        seen_names.add(name)
         source = Path(str(plan["pixel_source"]))
-        if not source.is_file():
+        if not source.is_file() and action != "updated":
             raise SystemExit(f"missing pixel source: {source}")
-        if dest.exists() and action != "replace":
+        if action == "new" and dest.exists():
             raise SystemExit(f"refusing to overwrite {dest}")
-        destinations.append((plan, dest, action))
-    if destinations and shutil.which(exiftool) is None:
+        previous = result / str(plan["previous_name"]) if plan.get("previous_name") else None
+        if action == "renamed" and dest.exists() and (previous is None or not _same_file(dest, previous)):
+            raise SystemExit(f"refusing to overwrite {dest}")
+        placing.append(plan)
+    if placing and shutil.which(exiftool) is None:
         raise SystemExit("exiftool not found")
 
-    verb = "move" if move else "copy"
+    counts = {name: sum(1 for plan in planned if str(plan.get("apply") or "new") == name) for name in ("new", "renamed", "updated", "untouched")}
     if dry_run:
-        for plan, dest, action in destinations:
-            word = "replace" if action == "replace" else verb
-            print(f"would {word} {plan['pixel_source']} -> {dest}", file=sys.stderr)
+        for plan in placing:
+            action = str(plan.get("apply") or "new")
+            dest = result / str(plan["stored_name"])
+            if action == "renamed":
+                print(f"would rename {result / str(plan.get('previous_name'))} -> {dest}", file=sys.stderr)
+            elif action == "updated":
+                print(f"would update {dest}", file=sys.stderr)
+            else:
+                print(f"would {'move' if move else 'copy'} {plan['pixel_source']} -> {dest}", file=sys.stderr)
             report.append({"output": str(dest), **plan})
         print(
-            f"dry-run: {len(destinations)} images would {verb} into {result}, {len(report) - len(destinations)} skipped",
+            f"dry-run: {counts['new']} new, {counts['renamed']} renamed, "
+            f"{counts['updated']} updated, {counts['untouched']} untouched",
             file=sys.stderr,
         )
         return report
 
     result.mkdir(parents=True, exist_ok=True)
     jobs: list[tuple[Path, dict]] = []
-    if destinations:
-        placing = ProgressBar("moving" if move else "copying", len(destinations))
-        transfer = shutil.move if move else shutil.copy2
-        for done, (plan, dest, action) in enumerate(destinations, start=1):
-            if action == "replace" and dest.exists():
-                dest.unlink()
-            transfer(plan["pixel_source"], dest)
-            jobs.append((dest, plan))
-            report.append({"output": str(dest), **plan})
-            placing.set(done)
-        placing.finish()
+    if placing:
+        progress = ProgressBar("updating library", len(placing))
+        for done, plan in enumerate(placing, start=1):
+            dest = _place_plan(plan, result, move)
+            if dest is not None:
+                jobs.append((dest, plan))
+                report.append({"output": str(dest), **plan})
+            progress.set(done)
+        progress.finish()
         write_copies(exiftool, jobs, ProgressBar("writing metadata", len(jobs)))
     _write_json(result / "report.json", report)
-    written = len(destinations)
-    print(f"{'moved' if move else 'copied'} {written} images into {result}", file=sys.stderr)
+    _sync_library_index(work, result, planned)
+    print(
+        f"library {result}: {counts['new']} new, {counts['renamed']} renamed, "
+        f"{counts['updated']} updated, {counts['untouched']} untouched",
+        file=sys.stderr,
+    )
     return report
 
 
@@ -1259,13 +1408,6 @@ def main(argv: list[str] | None = None) -> None:
     collect_parser.add_argument("--work", type=Path, required=True)
     _add_min_size(collect_parser)
 
-    missing_parser = sub.add_parser("missing", help="list pictures that are not already in a library")
-    missing_parser.add_argument("--library-work", type=Path, required=True)
-    missing_parser.add_argument("--dir", dest="dirs", action="append", type=Path, required=True)
-    missing_parser.add_argument("--work", type=Path, required=True)
-    missing_parser.add_argument("--max-hamming", type=int, default=DEFAULT_MAX_HAMMING)
-    _add_min_size(missing_parser)
-
     increment_parser = sub.add_parser("increment", help="add new pictures to an existing library plan")
     increment_parser.add_argument("--library-work", type=Path, required=True)
     increment_parser.add_argument("--dir", dest="dirs", action="append", type=Path, required=True)
@@ -1329,8 +1471,6 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "collect":
         collect(_require_dirs(args.dirs), args.work, args.min_size)
-    elif args.command == "missing":
-        missing(args.library_work, _require_dirs(args.dirs), args.work, args.min_size, args.max_hamming)
     elif args.command == "increment":
         increment(
             args.library_work,
@@ -1535,6 +1675,32 @@ def _self_test() -> int:
     assert [plan["stored_name"] for plan in replaced] == ["keep.jpg", "new.jpg", "gps.jpg"]
     assert replaced[1]["conflicts"] == []
 
+    meta = {"capture_time": None, "capture_source": None, "gps_source": None, "camera_source": None}
+    library_plan = {1: {"group": 1, "stored_name": "IMG_0007.jpg", "pixel_source": "/lib/a.jpg", **meta}}
+    classified = [
+        {"group": 1, "stored_name": "IMG_0007.jpg", "pixel_source": "/lib/a.jpg", **meta},
+        {"group": 2, "stored_name": "IMG_0007.jpg", "pixel_source": "/new/b.jpg", **meta},
+    ]
+    classified_clusters = [
+        {"members": [{"path": "/lib/a.jpg", "phash": "aa", "size": 1}]},
+        {"members": [{"path": "/new/b.jpg", "phash": "bb", "size": 2}]},
+    ]
+    _mark_apply_actions(classified, library_plan, classified_clusters)
+    assert classified[0]["apply"] == "untouched"
+    assert classified[1]["apply"] == "new"
+    assert classified[1]["stored_name"] == "000002_IMG_0007.jpg"
+    renamed = [{"group": 1, "stored_name": "better.jpg", "pixel_source": "/lib/a.jpg", **meta}]
+    _mark_apply_actions(renamed, library_plan, classified_clusters)
+    assert renamed[0]["apply"] == "renamed"
+    assert renamed[0]["previous_name"] == "IMG_0007.jpg"
+    updated = [{"group": 1, "stored_name": "IMG_0007.jpg", "pixel_source": "/backup/big.jpg", **meta}]
+    updated_clusters = [{"members": [
+        {"path": "/lib/a.jpg", "phash": "aa", "size": 1},
+        {"path": "/backup/big.jpg", "phash": "cc", "size": 9},
+    ]}]
+    _mark_apply_actions(updated, library_plan, updated_clusters)
+    assert updated[0]["apply"] == "updated"
+
     alone = annotate_capture_conflict(
         plan_group([entries[0]], {"/a.jpg": metadata["/a.jpg"]}),
         [entries[0]],
@@ -1602,6 +1768,19 @@ def _self_test() -> int:
         assert kept.is_file()
         assert newer.is_file()
         assert (result / "report.json").is_file()
+        library_plan = _read_json(work / "plan.json")
+        old_name = library_plan[0]["stored_name"]
+        library_plan[0]["apply"] = "renamed"
+        library_plan[0]["previous_name"] = old_name
+        library_plan[0]["stored_name"] = "portrait.jpg"
+        library_plan[1]["apply"] = "untouched"
+        rename_work = root / "rename-work"
+        _write_json(rename_work / "plan.json", library_plan)
+        apply_plan(rename_work, result, "exiftool", False)
+        assert (result / "portrait.jpg").is_file()
+        assert not (result / old_name).is_file()
+        move_work = root / "move-work"
+        shutil.copytree(work, move_work)
 
         inbox = root / "inbox"
         inbox.mkdir()
@@ -1613,23 +1792,25 @@ def _self_test() -> int:
         os.utime(extra, (1_700_000_000, 1_700_000_000))
         fresh = inbox / "fresh.jpg"
         Image.fromarray(rng.integers(0, 256, size=(32, 32, 3), dtype=np.uint8)).save(fresh, format="JPEG")
-        found = missing(work, [inbox], root / "missing-work", max_hamming=12)
+        added = increment(work, [inbox], root / "increment-work", "exiftool", max_hamming=12)
+        found = _read_json(root / "increment-work" / "unique.json")
         assert len(found["survivors"]) == 1
         assert found["survivors"][0]["path"].endswith("fresh.jpg")
         assert len(found["dropped"]) == 1
         assert found["dropped"][0]["path"].endswith("new-later.jpg")
         assert {Path(item["path"]).name for item in found["present"]} == {"same.jpg", "new.jpg"}
-        added = increment(work, [inbox], root / "increment-work", "exiftool", max_hamming=12)
-        assert sum(1 for plan in added if plan.get("apply") == "copy") == 1
-        assert sum(1 for plan in added if plan.get("apply") == "skip") == 2
-        copied_names = {Path(plan["pixel_source"]).name for plan in added if plan.get("apply") == "copy"}
+        assert sum(1 for plan in added if plan.get("apply") == "new") == 1
+        assert sum(1 for plan in added if plan.get("apply") == "untouched") == 2
+        copied_names = {Path(plan["pixel_source"]).name for plan in added if plan.get("apply") == "new"}
         assert copied_names == {"fresh.jpg"}
         placed = apply_plan(root / "increment-work", result, "exiftool", False)
         assert sum(1 for item in placed if not item.get("skipped")) == 1
         assert (result / "fresh.jpg").is_file()
+        extended = _read_json(work / "plan.json")
+        assert any(plan.get("stored_name") == "fresh.jpg" for plan in extended)
 
         moved_result = root / "moved"
-        moved = apply_plan(work, moved_result, "exiftool", False, move=True)
+        moved = apply_plan(move_work, moved_result, "exiftool", False, move=True)
         assert len(moved) == 2
         assert not kept.is_file()
         assert newer.is_file()
