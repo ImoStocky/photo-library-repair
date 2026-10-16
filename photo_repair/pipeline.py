@@ -805,12 +805,18 @@ def _pixels_changed(plan: dict, old: dict, group: dict | None) -> bool:
     return new_member.get("phash") != old_member.get("phash") or int(new_member.get("size") or 0) != int(old_member.get("size") or 0)
 
 
+def _same_stored_name(left: object, right: object) -> bool:
+    """Mac volumes treat IMG.JPG and img.jpg as one file."""
+    return str(left or "").casefold() == str(right or "").casefold()
+
+
 def _resolve_name_collisions(planned: list[dict], previous: dict[int, dict]) -> None:
     """Keep each library file's name. Prefix a newcomer that wants the same name."""
     owners: dict[str, int] = {}
     for plan in planned:
         old = previous.get(int(plan["group"]))
-        if old and plan["stored_name"] == old.get("stored_name"):
+        if old and _same_stored_name(plan["stored_name"], old.get("stored_name")):
+            plan["stored_name"] = old["stored_name"]
             owners[str(plan["stored_name"]).casefold()] = int(plan["group"])
 
     def allocate(name: str, group: int) -> str:
@@ -828,7 +834,8 @@ def _resolve_name_collisions(planned: list[dict], previous: dict[int, dict]) -> 
     for plan in sorted(planned, key=lambda item: int(item["group"])):
         group = int(plan["group"])
         old = previous.get(group)
-        if old and plan["stored_name"] == old.get("stored_name"):
+        if old and _same_stored_name(plan["stored_name"], old.get("stored_name")):
+            plan["stored_name"] = old["stored_name"]
             continue
         plan["stored_name"] = allocate(str(plan["stored_name"]), group)
 
@@ -845,7 +852,7 @@ def _mark_apply_actions(planned: list[dict], previous: dict[int, dict], clusters
             plan.pop("previous_name", None)
             continue
         plan["previous_name"] = old.get("stored_name")
-        name_changed = old.get("stored_name") != plan["stored_name"]
+        name_changed = not _same_stored_name(old.get("stored_name"), plan["stored_name"])
         meta_changed = any(old.get(key) != plan.get(key) for key in _PLAN_META)
         if name_changed:
             plan["apply"] = "renamed"
@@ -1184,6 +1191,10 @@ def _place_plan(plan: dict, result: Path, move: bool) -> Path | None:
         _transfer_file(source, dest, move)
         return dest
     if action == "renamed":
+        if previous is not None and _same_stored_name(dest.name, previous.name):
+            if previous.is_file() and not _same_file(source, previous):
+                _transfer_file(source, previous, move)
+            return previous if previous.is_file() else dest
         if dest.exists() and (previous is None or not _same_file(dest, previous)):
             raise SystemExit(f"refusing to overwrite {dest}")
         if previous is not None and previous.is_file() and _same_file(source, previous):
@@ -1254,10 +1265,159 @@ def _sync_library_index(work: Path, result: Path, planned: list[dict]) -> None:
         shutil.copy2(cache, library / "phash.json")
 
 
+def _prefix_against_library_files(planned: list[dict], result: Path) -> int:
+    """Prefix a new or renamed file whose stem is already used by a different library file."""
+    if not result.is_dir():
+        return 0
+    stems: dict[str, set[str]] = {}
+    for path in result.iterdir():
+        if path.is_file() and path.name != "report.json":
+            stems.setdefault(path.stem.casefold(), set()).add(path.name.casefold())
+    for plan in planned:
+        if str(plan.get("apply")) == "renamed" and plan.get("previous_name"):
+            previous = Path(str(plan["previous_name"]))
+            bucket = stems.get(previous.stem.casefold())
+            if bucket:
+                bucket.discard(previous.name.casefold())
+    claimed = {
+        str(plan["stored_name"]).casefold()
+        for plan in planned
+        if str(plan.get("apply") or "new") in {"untouched", "updated"}
+    }
+    changed = 0
+    for plan in sorted(planned, key=lambda item: int(item["group"])):
+        action = str(plan.get("apply") or "new")
+        if action not in {"new", "renamed"}:
+            continue
+        previous = str(plan.get("previous_name") or "").casefold()
+
+        def blocked(candidate: str) -> bool:
+            if candidate.casefold() in claimed:
+                return True
+            others = stems.get(Path(candidate).stem.casefold(), set())
+            return any(name != previous for name in others)
+
+        name = str(plan["stored_name"])
+        if blocked(name):
+            number = int(plan["group"])
+            while True:
+                candidate = f"{number:06d}_{name}"
+                if not blocked(candidate):
+                    name = candidate
+                    break
+                number += 1
+            plan["stored_name"] = name
+            changed += 1
+        claimed.add(name.casefold())
+        stems.setdefault(Path(name).stem.casefold(), set()).add(name.casefold())
+    return changed
+
+
+def _destination_held_by(plan: dict, result: Path, leaving: dict[str, dict]) -> dict | None:
+    """The other plan that still occupies this destination, if it will move away."""
+    action = str(plan.get("apply") or "new")
+    if action == "updated":
+        return None
+    dest = result / str(plan["stored_name"])
+    if not dest.exists():
+        return None
+    previous = str(plan.get("previous_name") or "")
+    if previous and _same_stored_name(dest.name, previous):
+        return None
+    if previous:
+        old = result / previous
+        if old.exists() and _same_file(dest, old):
+            return None
+    holder = leaving.get(dest.name.casefold())
+    if holder is None or holder is plan:
+        return None
+    return holder
+
+
+def _prefix_one(plan: dict, result: Path, reserved: set[str]) -> None:
+    number = int(plan["group"])
+    original = str(plan["stored_name"])
+    while True:
+        candidate = f"{number:06d}_{original}"
+        if candidate.casefold() not in reserved and not (result / candidate).exists():
+            plan["stored_name"] = candidate
+            reserved.add(candidate.casefold())
+            return
+        number += 1
+
+
+def _park_file(plan: dict, result: Path, leaving: dict[str, dict]) -> None:
+    """Move a file aside so another picture can take its name."""
+    previous = str(plan["previous_name"])
+    source = result / previous
+    temp = result / f".{int(plan['group'])}.rename"
+    number = int(plan["group"])
+    while temp.exists():
+        number += 1
+        temp = result / f".{number}.rename"
+    source.rename(temp)
+    leaving.pop(previous.casefold(), None)
+    plan["previous_name"] = temp.name
+    if _same_stored_name(Path(str(plan["pixel_source"])).name, previous):
+        plan["pixel_source"] = str(temp)
+    leaving[temp.name.casefold()] = plan
+
+
+def _place_in_order(placing: list[dict], result: Path, move: bool) -> list[dict]:
+    """Place pictures whose destination is free before pictures that reuse a vacated name."""
+    remaining = list(placing)
+    leaving = {
+        str(plan.get("previous_name")).casefold(): plan
+        for plan in remaining
+        if str(plan.get("apply")) == "renamed" and plan.get("previous_name")
+    }
+    reserved = {str(plan["stored_name"]).casefold() for plan in remaining}
+    ordered: list[dict] = []
+    guard = 0
+    while remaining:
+        guard += 1
+        if guard > len(placing) * 4 + 8:
+            raise SystemExit("could not order library renames")
+        ready: list[dict] = []
+        blocked: list[tuple[dict, dict]] = []
+        for plan in remaining:
+            holder = _destination_held_by(plan, result, leaving)
+            if holder is None:
+                ready.append(plan)
+            else:
+                blocked.append((plan, holder))
+        if not ready:
+            plan, holder = blocked[0]
+            if holder in remaining:
+                _park_file(holder, result, leaving)
+            else:
+                _prefix_one(plan, result, reserved)
+            continue
+        for plan in ready:
+            dest = result / str(plan["stored_name"])
+            previous = str(plan.get("previous_name") or "")
+            occupied = dest.exists() and not (previous and _same_stored_name(dest.name, previous))
+            if occupied and previous:
+                old = result / previous
+                occupied = not (old.exists() and _same_file(dest, old))
+            if occupied and str(plan.get("apply")) != "updated":
+                _prefix_one(plan, result, reserved)
+                continue
+            _place_plan(plan, result, move)
+            if str(plan.get("apply")) == "renamed" and previous:
+                leaving.pop(previous.casefold(), None)
+            remaining.remove(plan)
+            ordered.append(plan)
+    return ordered
+
+
 def apply_plan(work: Path, result: Path, exiftool: str, dry_run: bool, move: bool = False) -> list[dict]:
     planned = _read_json(work / "plan.json")
     if not isinstance(planned, list):
         raise SystemExit("plan.json must be a list")
+    prefixed = _prefix_against_library_files(planned, result)
+    if prefixed and not dry_run:
+        _write_json(work / "plan.json", planned)
 
     seen_names: set[str] = set()
     report: list[dict] = []
@@ -1275,11 +1435,6 @@ def apply_plan(work: Path, result: Path, exiftool: str, dry_run: bool, move: boo
         source = Path(str(plan["pixel_source"]))
         if not source.is_file() and action != "updated":
             raise SystemExit(f"missing pixel source: {source}")
-        if action == "new" and dest.exists():
-            raise SystemExit(f"refusing to overwrite {dest}")
-        previous = result / str(plan["previous_name"]) if plan.get("previous_name") else None
-        if action == "renamed" and dest.exists() and (previous is None or not _same_file(dest, previous)):
-            raise SystemExit(f"refusing to overwrite {dest}")
         placing.append(plan)
     if placing and shutil.which(exiftool) is None:
         raise SystemExit("exiftool not found")
@@ -1307,11 +1462,12 @@ def apply_plan(work: Path, result: Path, exiftool: str, dry_run: bool, move: boo
     jobs: list[tuple[Path, dict]] = []
     if placing:
         progress = ProgressBar("updating library", len(placing))
-        for done, plan in enumerate(placing, start=1):
-            dest = _place_plan(plan, result, move)
-            if dest is not None:
-                jobs.append((dest, plan))
-                report.append({"output": str(dest), **plan})
+        done = 0
+        for plan in _place_in_order(placing, result, move):
+            done += 1
+            dest = result / str(plan["stored_name"])
+            jobs.append((dest, plan))
+            report.append({"output": str(dest), **plan})
             progress.set(done)
         progress.finish()
         write_copies(exiftool, jobs, ProgressBar("writing metadata", len(jobs)))
@@ -1700,6 +1856,46 @@ def _self_test() -> int:
     ]}]
     _mark_apply_actions(updated, library_plan, updated_clusters)
     assert updated[0]["apply"] == "updated"
+    same_case = [{"group": 1, "stored_name": "img.jpg", "pixel_source": "/lib/a.jpg", **meta}]
+    case_library = {1: {"group": 1, "stored_name": "IMG.JPG", "pixel_source": "/lib/a.jpg", **meta}}
+    _mark_apply_actions(same_case, case_library, classified_clusters)
+    assert same_case[0]["apply"] == "untouched"
+    assert same_case[0]["stored_name"] == "IMG.JPG"
+    with tempfile.TemporaryDirectory() as folder:
+        library = Path(folder)
+        (library / "IMG_0007.PNG").write_bytes(b"png")
+        (library / "001464_IMG_0007.jpeg").write_bytes(b"old")
+        colliding = [{
+            "group": 522,
+            "apply": "renamed",
+            "stored_name": "IMG_0007.jpg",
+            "previous_name": "001464_IMG_0007.jpeg",
+            "pixel_source": str(library / "001464_IMG_0007.jpeg"),
+        }]
+        assert _prefix_against_library_files(colliding, library) == 1
+        assert colliding[0]["stored_name"] == "000522_IMG_0007.jpg"
+        (library / "IMG_A.jpeg").write_bytes(b"aaa")
+        (library / "IMG_B.JPG").write_bytes(b"bbb")
+        swap = [
+            {
+                "group": 1,
+                "apply": "renamed",
+                "stored_name": "IMG_B.jpg",
+                "previous_name": "IMG_A.jpeg",
+                "pixel_source": str(library / "IMG_A.jpeg"),
+            },
+            {
+                "group": 2,
+                "apply": "renamed",
+                "stored_name": "OTHER.jpg",
+                "previous_name": "IMG_B.JPG",
+                "pixel_source": str(library / "IMG_B.JPG"),
+            },
+        ]
+        _place_in_order(swap, library, False)
+        assert (library / "IMG_B.jpg").read_bytes() == b"aaa"
+        assert (library / "OTHER.jpg").read_bytes() == b"bbb"
+        assert not (library / "IMG_A.jpeg").exists()
 
     alone = annotate_capture_conflict(
         plan_group([entries[0]], {"/a.jpg": metadata["/a.jpg"]}),
