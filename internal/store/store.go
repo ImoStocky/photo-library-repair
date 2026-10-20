@@ -108,6 +108,10 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open library %q: %w", path, err)
 	}
+	if path == ":memory:" {
+		// Each pooled connection would get its own private memory database.
+		db.SetMaxOpenConns(1)
+	}
 	if _, err := db.Exec(schema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
@@ -117,6 +121,9 @@ func Open(path string) (*Store, error) {
 
 // Close closes the library.
 func (s *Store) Close() error { return s.db.Close() }
+
+// Begin starts a transaction on the underlying database.
+func (s *Store) Begin() (*sql.Tx, error) { return s.db.Begin() }
 
 // NewID builds an image id from a timestamp (unix millis) and a sequence
 // number, per the library design.
