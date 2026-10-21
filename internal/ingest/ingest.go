@@ -210,12 +210,10 @@ func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time
 					continue
 				}
 				info := fingerprint.Info{Kind: j.kind}
-				if j.kind != "heic" { // no pure-Go HEIC decoder in this prototype
-					if info, err = hash(j.fullPath, j.kind); err != nil {
-						// Unhashable pictures are still collected; they end
-						// up as singleton groups.
-						info = fingerprint.Info{Kind: j.kind}
-					}
+				if info, err = hash(j.fullPath, j.kind); err != nil {
+					// Unhashable pictures are still collected; they end
+					// up as singleton groups.
+					info = fingerprint.Info{Kind: j.kind}
 				}
 				img := store.Image{
 					ID:          store.NewID(runStart, int(seq.Add(1))),
@@ -230,6 +228,9 @@ func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time
 					Height:      info.Height,
 					Kind:        j.kind,
 					Size:        j.size,
+					HasGPS:      info.HasGPS,
+					GPSLat:      info.GPSLat,
+					GPSLon:      info.GPSLon,
 				}
 				img.SourceID = j.sourceID
 				_, created, err := s.UpsertImage(img)

@@ -29,6 +29,9 @@ type Image struct {
 	Height      int
 	Kind        string // jpeg|png|gif|webp|tiff|heic
 	Size        int64
+	HasGPS      bool
+	GPSLat      float64
+	GPSLon      float64
 	GroupID     int64 // 0 until the group phase runs
 }
 
@@ -38,6 +41,7 @@ type Group struct {
 	Status          string // resolved|conflict|singleton
 	Reason          string
 	PixelImageID    string
+	PixelPhash      string // perceptual hash of the selected pixel file
 	CaptureImageID  string
 	CaptureTime     string
 	CaptureInstant  int64
@@ -74,6 +78,9 @@ CREATE TABLE IF NOT EXISTS images (
   height INTEGER NOT NULL DEFAULT 0,
   kind TEXT NOT NULL DEFAULT '',
   size INTEGER NOT NULL DEFAULT 0,
+  gps_lat REAL NOT NULL DEFAULT 0,
+  gps_lon REAL NOT NULL DEFAULT 0,
+  has_gps INTEGER NOT NULL DEFAULT 0,
   group_id INTEGER NOT NULL DEFAULT 0,
   UNIQUE (source_id, rel_path)
 );
@@ -86,6 +93,7 @@ CREATE TABLE IF NOT EXISTS groups (
   status TEXT NOT NULL,
   reason TEXT NOT NULL DEFAULT '',
   pixel_image_id TEXT NOT NULL DEFAULT '',
+  pixel_phash TEXT NOT NULL DEFAULT '',
   capture_image_id TEXT NOT NULL DEFAULT '',
   capture_time TEXT NOT NULL DEFAULT '',
   capture_instant INTEGER NOT NULL DEFAULT 0,
@@ -116,7 +124,57 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrate schema: %w", err)
+	}
 	return &Store{db: db}, nil
+}
+
+// migrate adds columns that libraries created before them lack. Fresh
+// databases already have every column and the check is a no-op.
+func migrate(db *sql.DB) error {
+	for _, add := range []struct {
+		table, col, def string
+	}{
+		{"images", "gps_lat", "REAL NOT NULL DEFAULT 0"},
+		{"images", "gps_lon", "REAL NOT NULL DEFAULT 0"},
+		{"images", "has_gps", "INTEGER NOT NULL DEFAULT 0"},
+		{"groups", "pixel_phash", "TEXT NOT NULL DEFAULT ''"},
+	} {
+		have, err := columnExists(db, add.table, add.col)
+		if err != nil {
+			return err
+		}
+		if !have {
+			if _, err := db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", add.table, add.col, add.def)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func columnExists(db *sql.DB, table, col string) (bool, error) {
+	rows, err := db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var (
+			cid, notnull, pk int
+			name, ctype      string
+			dflt             any
+		)
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return false, err
+		}
+		if name == col {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // Close closes the library.
@@ -189,11 +247,13 @@ func (s *Store) UpsertImage(img Image) (id string, created bool, err error) {
 			UPDATE images SET
 			  name = ?, sha256 = ?, phash = ?, created_at = ?,
 			  exif_capture = ?, exif_offset = ?,
-			  width = ?, height = ?, kind = ?, size = ?
+			  width = ?, height = ?, kind = ?, size = ?,
+			  gps_lat = ?, gps_lon = ?, has_gps = ?
 			WHERE id = ?`,
 			img.Name, img.SHA256, img.Phash, img.CreatedAt,
 			img.ExifCapture, img.ExifOffset,
-			img.Width, img.Height, img.Kind, img.Size, id)
+			img.Width, img.Height, img.Kind, img.Size,
+			img.GPSLat, img.GPSLon, boolInt(img.HasGPS), id)
 		return id, false, err
 	}
 	if err != sql.ErrNoRows {
@@ -201,10 +261,12 @@ func (s *Store) UpsertImage(img Image) (id string, created bool, err error) {
 	}
 	_, err = s.db.Exec(`
 		INSERT INTO images (id, source_id, rel_path, name, sha256, phash, created_at,
-		                      exif_capture, exif_offset, width, height, kind, size, group_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		                      exif_capture, exif_offset, width, height, kind, size,
+		                      gps_lat, gps_lon, has_gps, group_id)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		img.ID, img.SourceID, img.RelPath, img.Name, img.SHA256, img.Phash, img.CreatedAt,
-		img.ExifCapture, img.ExifOffset, img.Width, img.Height, img.Kind, img.Size, img.GroupID)
+		img.ExifCapture, img.ExifOffset, img.Width, img.Height, img.Kind, img.Size,
+		img.GPSLat, img.GPSLon, boolInt(img.HasGPS), img.GroupID)
 	return img.ID, true, err
 }
 
@@ -212,7 +274,8 @@ func (s *Store) UpsertImage(img Image) (id string, created bool, err error) {
 func (s *Store) AllImages() ([]Image, error) {
 	rows, err := s.db.Query(`
 		SELECT id, source_id, rel_path, name, sha256, phash, created_at,
-		       exif_capture, exif_offset, width, height, kind, size, group_id
+		       exif_capture, exif_offset, width, height, kind, size,
+		       gps_lat, gps_lon, has_gps, group_id
 		FROM images ORDER BY source_id, rel_path`)
 	if err != nil {
 		return nil, err
@@ -221,11 +284,14 @@ func (s *Store) AllImages() ([]Image, error) {
 	var out []Image
 	for rows.Next() {
 		var img Image
+		var hasGPS int
 		if err := rows.Scan(&img.ID, &img.SourceID, &img.RelPath, &img.Name, &img.SHA256,
 			&img.Phash, &img.CreatedAt, &img.ExifCapture, &img.ExifOffset,
-			&img.Width, &img.Height, &img.Kind, &img.Size, &img.GroupID); err != nil {
+			&img.Width, &img.Height, &img.Kind, &img.Size,
+			&img.GPSLat, &img.GPSLon, &hasGPS, &img.GroupID); err != nil {
 			return nil, err
 		}
+		img.HasGPS = hasGPS != 0
 		out = append(out, img)
 	}
 	return out, rows.Err()
@@ -258,14 +324,15 @@ func (s *Store) SetGroupAssignments(assign map[string]int64) error {
 // SaveGroup upserts the plan for one group.
 func (s *Store) SaveGroup(g Group) error {
 	_, err := s.db.Exec(`
-		INSERT INTO groups (id, status, reason, pixel_image_id, capture_image_id,
+		INSERT INTO groups (id, status, reason, pixel_image_id, pixel_phash, capture_image_id,
 		                     capture_time, capture_instant, capture_fallback,
 		                     gps_lat, gps_lon, has_gps, stored_name)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 		  status = excluded.status,
 		  reason = excluded.reason,
 		  pixel_image_id = excluded.pixel_image_id,
+		  pixel_phash = excluded.pixel_phash,
 		  capture_image_id = excluded.capture_image_id,
 		  capture_time = excluded.capture_time,
 		  capture_instant = excluded.capture_instant,
@@ -274,7 +341,7 @@ func (s *Store) SaveGroup(g Group) error {
 		  gps_lon = excluded.gps_lon,
 		  has_gps = excluded.has_gps,
 		  stored_name = excluded.stored_name`,
-		g.ID, g.Status, g.Reason, g.PixelImageID, g.CaptureImageID,
+		g.ID, g.Status, g.Reason, g.PixelImageID, g.PixelPhash, g.CaptureImageID,
 		g.CaptureTime, g.CaptureInstant, boolInt(g.CaptureFallback),
 		g.GPSLat, g.GPSLon, boolInt(g.HasGPS), g.StoredName)
 	return err
@@ -283,7 +350,7 @@ func (s *Store) SaveGroup(g Group) error {
 // AllGroups returns every stored plan.
 func (s *Store) AllGroups() ([]Group, error) {
 	rows, err := s.db.Query(`
-		SELECT id, status, reason, pixel_image_id, capture_image_id,
+		SELECT id, status, reason, pixel_image_id, pixel_phash, capture_image_id,
 		       capture_time, capture_instant, capture_fallback,
 		       gps_lat, gps_lon, has_gps, stored_name
 		FROM groups ORDER BY id`)
@@ -295,7 +362,7 @@ func (s *Store) AllGroups() ([]Group, error) {
 	for rows.Next() {
 		var g Group
 		var fallback, hasGPS int
-		if err := rows.Scan(&g.ID, &g.Status, &g.Reason, &g.PixelImageID, &g.CaptureImageID,
+		if err := rows.Scan(&g.ID, &g.Status, &g.Reason, &g.PixelImageID, &g.PixelPhash, &g.CaptureImageID,
 			&g.CaptureTime, &g.CaptureInstant, &fallback,
 			&g.GPSLat, &g.GPSLon, &hasGPS, &g.StoredName); err != nil {
 			return nil, err
