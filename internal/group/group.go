@@ -59,15 +59,20 @@ type Image struct {
 	Width       int
 	Height      int
 	Size        int64
+	Kind        string // jpeg|png|gif|webp|tiff|heic
 	HasGPS      bool
 	GPSLat      float64
 	GPSLon      float64
 }
 
+// Rules is the ResolvedBy value for plans settled by the automatic rules.
+const Rules = "rules"
+
 // Plan is the outcome of resolving one group.
 type Plan struct {
 	Status          string // StatusResolved | StatusConflict | StatusSingleton
 	Reason          string
+	ResolvedBy      string // Rules, or the name of the resolver that settled a conflict
 	PixelImageID    string
 	PixelPhash      string // the selected pixel file's own hash, kept as-is
 	CaptureImageID  string
@@ -93,10 +98,11 @@ type Decision struct {
 	StoredName     string
 }
 
-// Resolver settles a conflict the automatic rules cannot. Phase 5 ships
-// no implementation; passing nil to ResolveGroup leaves conflicts in
-// StatusConflict for later review.
+// Resolver settles a conflict the automatic rules cannot. Passing nil to
+// ResolveGroup leaves conflicts in StatusConflict for later review.
 type Resolver interface {
+	// Name identifies the resolver; it marks the groups it settles.
+	Name() string
 	Resolve(c Conflict) (Decision, error)
 }
 
@@ -191,6 +197,7 @@ func ResolveGroup(imgs []Image, res Resolver) Plan {
 		im := imgs[0]
 		return Plan{
 			Status:          StatusSingleton,
+			ResolvedBy:      Rules,
 			PixelImageID:    im.ID,
 			PixelPhash:      im.Phash,
 			CaptureImageID:  im.ID,
@@ -240,6 +247,7 @@ func ResolveGroup(imgs []Image, res Resolver) Plan {
 	plan := Plan{
 		Status:          StatusResolved,
 		Reason:          reason,
+		ResolvedBy:      Rules,
 		PixelImageID:    bestPixels(imgs).ID,
 		CaptureImageID:  imgs[captureIdx].ID,
 		CaptureFallback: fallback,
@@ -270,6 +278,7 @@ func ResolveGroup(imgs []Image, res Resolver) Plan {
 	}
 	plan.Status = StatusResolved
 	plan.Reason = "conflict settled by resolver: " + conflictReason
+	plan.ResolvedBy = res.Name()
 	plan.PixelImageID = d.PixelImageID
 	plan.CaptureImageID = d.CaptureImageID
 	plan.StoredName = d.StoredName

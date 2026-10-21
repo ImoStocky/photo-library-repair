@@ -40,6 +40,7 @@ type Group struct {
 	ID              int64
 	Status          string // resolved|conflict|singleton
 	Reason          string
+	ResolvedBy      string // "rules" or the resolver that settled the conflict
 	PixelImageID    string
 	PixelPhash      string // perceptual hash of the selected pixel file
 	CaptureImageID  string
@@ -92,6 +93,7 @@ CREATE TABLE IF NOT EXISTS groups (
   id INTEGER PRIMARY KEY,
   status TEXT NOT NULL,
   reason TEXT NOT NULL DEFAULT '',
+  resolved_by TEXT NOT NULL DEFAULT 'rules',
   pixel_image_id TEXT NOT NULL DEFAULT '',
   pixel_phash TEXT NOT NULL DEFAULT '',
   capture_image_id TEXT NOT NULL DEFAULT '',
@@ -141,6 +143,7 @@ func migrate(db *sql.DB) error {
 		{"images", "gps_lon", "REAL NOT NULL DEFAULT 0"},
 		{"images", "has_gps", "INTEGER NOT NULL DEFAULT 0"},
 		{"groups", "pixel_phash", "TEXT NOT NULL DEFAULT ''"},
+		{"groups", "resolved_by", "TEXT NOT NULL DEFAULT 'rules'"},
 	} {
 		have, err := columnExists(db, add.table, add.col)
 		if err != nil {
@@ -324,13 +327,14 @@ func (s *Store) SetGroupAssignments(assign map[string]int64) error {
 // SaveGroup upserts the plan for one group.
 func (s *Store) SaveGroup(g Group) error {
 	_, err := s.db.Exec(`
-		INSERT INTO groups (id, status, reason, pixel_image_id, pixel_phash, capture_image_id,
+		INSERT INTO groups (id, status, reason, resolved_by, pixel_image_id, pixel_phash, capture_image_id,
 		                     capture_time, capture_instant, capture_fallback,
 		                     gps_lat, gps_lon, has_gps, stored_name)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 		  status = excluded.status,
 		  reason = excluded.reason,
+		  resolved_by = excluded.resolved_by,
 		  pixel_image_id = excluded.pixel_image_id,
 		  pixel_phash = excluded.pixel_phash,
 		  capture_image_id = excluded.capture_image_id,
@@ -341,7 +345,7 @@ func (s *Store) SaveGroup(g Group) error {
 		  gps_lon = excluded.gps_lon,
 		  has_gps = excluded.has_gps,
 		  stored_name = excluded.stored_name`,
-		g.ID, g.Status, g.Reason, g.PixelImageID, g.PixelPhash, g.CaptureImageID,
+		g.ID, g.Status, g.Reason, g.ResolvedBy, g.PixelImageID, g.PixelPhash, g.CaptureImageID,
 		g.CaptureTime, g.CaptureInstant, boolInt(g.CaptureFallback),
 		g.GPSLat, g.GPSLon, boolInt(g.HasGPS), g.StoredName)
 	return err
@@ -350,7 +354,7 @@ func (s *Store) SaveGroup(g Group) error {
 // AllGroups returns every stored plan.
 func (s *Store) AllGroups() ([]Group, error) {
 	rows, err := s.db.Query(`
-		SELECT id, status, reason, pixel_image_id, pixel_phash, capture_image_id,
+		SELECT id, status, reason, resolved_by, pixel_image_id, pixel_phash, capture_image_id,
 		       capture_time, capture_instant, capture_fallback,
 		       gps_lat, gps_lon, has_gps, stored_name
 		FROM groups ORDER BY id`)
@@ -362,7 +366,7 @@ func (s *Store) AllGroups() ([]Group, error) {
 	for rows.Next() {
 		var g Group
 		var fallback, hasGPS int
-		if err := rows.Scan(&g.ID, &g.Status, &g.Reason, &g.PixelImageID, &g.PixelPhash, &g.CaptureImageID,
+		if err := rows.Scan(&g.ID, &g.Status, &g.Reason, &g.ResolvedBy, &g.PixelImageID, &g.PixelPhash, &g.CaptureImageID,
 			&g.CaptureTime, &g.CaptureInstant, &fallback,
 			&g.GPSLat, &g.GPSLon, &hasGPS, &g.StoredName); err != nil {
 			return nil, err

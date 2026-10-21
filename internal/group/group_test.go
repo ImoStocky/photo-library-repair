@@ -186,6 +186,8 @@ func TestResolveMultipleEXIFGPSDisagreementConflicts(t *testing.T) {
 
 type fakeResolver struct{ pick string }
 
+func (f fakeResolver) Name() string { return "fake-resolver" }
+
 func (f fakeResolver) Resolve(c Conflict) (Decision, error) {
 	return Decision{PixelImageID: f.pick, CaptureImageID: f.pick, StoredName: "chosen.jpg"}, nil
 }
@@ -198,7 +200,7 @@ func TestResolveConflictWithResolver(t *testing.T) {
 	if p.Status != StatusResolved {
 		t.Fatalf("resolver must settle the conflict: %+v", p)
 	}
-	if p.PixelImageID != "b" || p.StoredName != "chosen.jpg" {
+	if p.PixelImageID != "b" || p.StoredName != "chosen.jpg" || p.ResolvedBy != "fake-resolver" {
 		t.Fatalf("decision not applied: %+v", p)
 	}
 }
@@ -214,6 +216,8 @@ func TestResolveConflictResolverFailureKeepsConflict(t *testing.T) {
 }
 
 type failingResolver struct{}
+
+func (failingResolver) Name() string { return "failing-resolver" }
 
 func (failingResolver) Resolve(Conflict) (Decision, error) {
 	return Decision{}, errors.New("resolver exploded")

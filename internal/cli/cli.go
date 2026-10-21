@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"photo-library-repair/internal/fingerprint"
 	"photo-library-repair/internal/group"
 	"photo-library-repair/internal/ingest"
+	kronkai "photo-library-repair/internal/kronk"
 	"photo-library-repair/internal/store"
 )
 
@@ -51,7 +53,7 @@ const usageText = `plr - photo library repair
 Usage:
   plr scan     --dir DIR... [--force] [--db PATH] [--workers N] [--min-size-kb N]
   plr group    [--max-hamming N] [--db PATH]
-  plr plan     [--conflict-hamming N] [--db PATH]
+  plr plan     [--conflict-hamming N] [--ai] [--model SOURCE] [--db PATH]
   plr apply    --target DIR [--dry-run] [--no-exif] [--force-conflicts] [--db PATH]
   plr build    --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr report   [--db PATH]
@@ -67,8 +69,9 @@ Commands:
   plan      Resolve every group: earliest EXIF capture time (timezone
             aware; file creation time never overrides EXIF), best quality
             pixels, GPS. Groups with near-identical pictures and identical
-            capture times are marked as conflicts for later human/model
-            review.
+            capture times are marked as conflicts. With --ai the Kronk
+            decision model settles conflict groups and marks them
+            resolved_by the model id.
   apply     Copy the planned pixel files into --target and write the merged
             EXIF (capture time, offset, GPS) onto the copies. Conflict
             groups are skipped unless --force-conflicts is given.
@@ -164,6 +167,8 @@ func runGroup(args []string) int {
 func runPlan(args []string) int {
 	fs := flag.NewFlagSet("plan", flag.ExitOnError)
 	conflictHamming := fs.Int("conflict-hamming", 2, "perceptual hashes within this distance with identical capture times mark the group as a conflict")
+	ai := fs.Bool("ai", false, "settle conflict groups with the Kronk decision model")
+	modelSource := fs.String("model", kronkai.DefaultModel, "Kronk decision model source for --ai")
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -175,6 +180,17 @@ func runPlan(args []string) int {
 		return 1
 	}
 	defer s.Close()
+	var res group.Resolver
+	if *ai {
+		var close func()
+		res, close, err = kronkai.New(context.Background(), *modelSource)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "plr plan:", err)
+			return 1
+		}
+		defer close()
+		fmt.Printf("decision model %s loaded; settling conflicts\n", res.Name())
+	}
 	imgs, err := s.AllImages()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr plan:", err)
@@ -202,12 +218,17 @@ func runPlan(args []string) int {
 		ids = append(ids, id)
 	}
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	aiSettled := 0
 	for _, id := range ids {
-		p := group.ResolveGroup(byGroup[id], nil)
+		p := group.ResolveGroup(byGroup[id], res)
+		if p.ResolvedBy != group.Rules {
+			aiSettled++
+		}
 		g := store.Group{
 			ID:              id,
 			Status:          p.Status,
 			Reason:          p.Reason,
+			ResolvedBy:      p.ResolvedBy,
 			PixelImageID:    p.PixelImageID,
 			PixelPhash:      p.PixelPhash,
 			CaptureImageID:  p.CaptureImageID,
@@ -227,6 +248,9 @@ func runPlan(args []string) int {
 	}
 	fmt.Printf("%d groups: %d resolved, %d conflicts, %d singletons\n",
 		len(ids), counts[group.StatusResolved], counts[group.StatusConflict], counts[group.StatusSingleton])
+	if *ai {
+		fmt.Printf("%d conflict group(s) settled by %s\n", aiSettled, res.Name())
+	}
 	return 0
 }
 
@@ -322,6 +346,7 @@ func toGroupImage(im store.Image) group.Image {
 		Width:       im.Width,
 		Height:      im.Height,
 		Size:        im.Size,
+		Kind:        im.Kind,
 		HasGPS:      im.HasGPS,
 		GPSLat:      im.GPSLat,
 		GPSLon:      im.GPSLon,
