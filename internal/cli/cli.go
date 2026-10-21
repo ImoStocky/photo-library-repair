@@ -52,7 +52,7 @@ Usage:
   plr selftest
 
 Commands:
-  scan      Walk directories, record every image (sha256, 16-bit perceptual
+  scan      Walk directories, record every image (sha256, 16-byte perceptual
             hash, EXIF capture time) into the SQL library. Directories that
             were already scanned are skipped unless --force is given.
   group     Group images: exact sha256 matches share a group, and images

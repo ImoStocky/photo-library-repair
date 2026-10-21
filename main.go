@@ -1,6 +1,6 @@
 // Command plr is a photo library repair tool.
 //
-// It scans directories, fingerprints every image (sha256 + 16-bit
+// It scans directories, fingerprints every image (sha256 + 16-byte
 // perceptual hash + EXIF capture time), groups near-duplicate pictures,
 // resolves each group into a plan (earliest EXIF capture time paired with
 // the best quality pixels, GPS attached), and can apply the plan on demand
