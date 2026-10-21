@@ -21,7 +21,7 @@ type Image struct {
 	RelPath     string
 	Name        string
 	SHA256      string
-	Phash       string // 4 hex chars, "" when the picture could not be hashed
+	Phash       string // 32 hex chars (16-byte perceptual hash), "" when the picture could not be hashed
 	CreatedAt   int64  // unix seconds, file birth time (mtime fallback)
 	ExifCapture string // raw EXIF capture wall clock, e.g. "2020:05:01 12:30:00"
 	ExifOffset  string // EXIF timezone offset, e.g. "+05:30" or "Z"; "" when unknown

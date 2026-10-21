@@ -1,5 +1,5 @@
 // Package ingest walks source directories and records every image into the
-// library: identity (path, sha256), the 16-bit perceptual hash, file
+// library: identity (path, sha256), the 16-byte perceptual hash, file
 // creation time and the EXIF capture time.
 //
 // Directories that were already recorded as sources are skipped unless

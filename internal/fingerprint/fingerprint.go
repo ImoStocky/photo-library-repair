@@ -3,7 +3,7 @@ package fingerprint
 
 // Info is the computed fingerprint of one image file.
 type Info struct {
-	Phash       string // 4 hex chars (16-bit perceptual hash), "" when unhashable
+	Phash       string // 32 hex chars (16-byte perceptual hash), "" when unhashable
 	Width       int    // displayed width (after EXIF orientation)
 	Height      int    // displayed height
 	Kind        string // jpeg|png|gif|webp|tiff|heic
