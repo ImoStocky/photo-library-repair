@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 
+	"photo-library-repair/internal/apply"
 	"photo-library-repair/internal/fingerprint"
 	"photo-library-repair/internal/group"
 	"photo-library-repair/internal/ingest"
@@ -244,11 +245,49 @@ func runApply(args []string) int {
 		fmt.Fprintln(os.Stderr, "plr apply: --target is required")
 		return 2
 	}
-	_ = dryRun
-	_ = noEXIF
-	_ = forceConflicts
-	_ = db
-	return notImplemented("apply")
+	s, err := store.Open(*db)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr apply:", err)
+		return 1
+	}
+	defer s.Close()
+	rep, err := apply.Apply(s, apply.Options{
+		Target:         *target,
+		DryRun:         *dryRun,
+		NoEXIF:         *noEXIF,
+		ForceConflicts: *forceConflicts,
+	})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr apply:", err)
+		return 1
+	}
+	verb := "copied"
+	if rep.DryRun {
+		verb = "would copy"
+	}
+	for _, f := range rep.Files {
+		line := fmt.Sprintf("%s %s -> %s", verb, f.Source, f.Dest)
+		if f.EXIF {
+			line += " (EXIF)"
+		}
+		fmt.Println(line)
+	}
+	for _, e := range rep.Errors {
+		fmt.Fprintln(os.Stderr, "plr apply:", e)
+	}
+	fmt.Printf("%s: %d file(s)%s, %d conflict group(s) skipped\n",
+		verb, rep.Copied, renamedSuffix(rep.Renamed), rep.Skipped)
+	if len(rep.Errors) > 0 {
+		return 1
+	}
+	return 0
+}
+
+func renamedSuffix(n int) string {
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (%d renamed)", n)
 }
 
 func runBuild(args []string) int {
