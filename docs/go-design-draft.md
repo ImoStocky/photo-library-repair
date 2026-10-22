@@ -849,6 +849,9 @@ noise — the same transitive behavior the prototype's post-pass and its
 incremental matcher already have, so it is consistent, not a regression.
 *Open:* keep an optional density-based refinement later only if real data shows
 over-merging.
+*Library choice:* if that refinement ever happens, or a future embedding stage
+needs real vector clustering, use **gonum** (`gonum.org/v1/gonum/clust`) — pure
+Go, no cgo. The current phash engine stays dependency-free.
 
 **9.3 Metadata engine.** **Decision:** keep **ExifTool** as a long-lived
 `-stay_open` subprocess (batched reads/writes, mutex-guarded), exactly as the
