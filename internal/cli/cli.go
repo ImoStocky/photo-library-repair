@@ -213,12 +213,14 @@ func runPlanPhase(s *store.Store, res group.Resolver) int {
 		return 0
 	}
 	byGroup := map[int64][]group.Image{}
+	assign := make(map[string]int64, len(imgs))
 	for _, im := range imgs {
 		if im.GroupID == 0 {
 			fmt.Println("images without a group; run plr group first")
 			return 1
 		}
 		byGroup[im.GroupID] = append(byGroup[im.GroupID], toGroupImage(im))
+		assign[im.ID] = im.GroupID
 	}
 	if err := s.ClearGroups(); err != nil {
 		fmt.Fprintln(os.Stderr, "plr plan:", err)
@@ -257,6 +259,11 @@ func runPlanPhase(s *store.Store, res group.Resolver) int {
 			return 1
 		}
 		counts[p.Status]++
+	}
+	// Re-apply the assignments: ClearGroups above zeroes images.group_id.
+	if err := s.SetGroupAssignments(assign); err != nil {
+		fmt.Fprintln(os.Stderr, "plr plan:", err)
+		return 1
 	}
 	fmt.Printf("%d groups: %d resolved, %d conflicts, %d singletons\n",
 		len(ids), counts[group.StatusResolved], counts[group.StatusConflict], counts[group.StatusSingleton])
