@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"sort"
 
 	"photo-library-repair/internal/apply"
 	"photo-library-repair/internal/fingerprint"
 	"photo-library-repair/internal/group"
 	"photo-library-repair/internal/ingest"
+	"photo-library-repair/internal/selftest"
 	"photo-library-repair/internal/store"
 )
 
@@ -82,11 +84,6 @@ The library is a SQLite database (default: plr.db in the working directory).
 
 func usage(w io.Writer) { io.WriteString(w, usageText) }
 
-func notImplemented(cmd string) int {
-	fmt.Fprintf(os.Stderr, "plr: %s is not implemented yet\n", cmd)
-	return 1
-}
-
 func runScan(args []string) int {
 	fs := flag.NewFlagSet("scan", flag.ExitOnError)
 	dirs := multiFlag{}
@@ -108,11 +105,16 @@ func runScan(args []string) int {
 		return 1
 	}
 	defer s.Close()
+	return runScanPhase(s, dirs, *force, *workers, *minSizeKB)
+}
+
+// runScanPhase is the scan step, shared by "plr scan" and "plr build".
+func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB int) int {
 	rep, err := ingest.Scan(s, ingest.Options{
 		Dirs:    dirs,
-		Force:   *force,
-		Workers: *workers,
-		MinSize: int64(*minSizeKB) * 1024,
+		Force:   force,
+		Workers: workers,
+		MinSize: int64(minSizeKB) * 1024,
 	}, fingerprint.Compute)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr scan:", err)
@@ -137,6 +139,11 @@ func runGroup(args []string) int {
 		return 1
 	}
 	defer s.Close()
+	return runGroupPhase(s, *maxHamming)
+}
+
+// runGroupPhase is the group step, shared by "plr group" and "plr build".
+func runGroupPhase(s *store.Store, maxHamming int) int {
 	imgs, err := s.AllImages()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr group:", err)
@@ -146,8 +153,7 @@ func runGroup(args []string) int {
 		fmt.Println("no images recorded; run plr scan first")
 		return 0
 	}
-	gimgs := toGroupImages(imgs)
-	assign, groups := group.Aggregate(gimgs, *maxHamming)
+	assign, groups := group.Aggregate(toGroupImages(imgs), maxHamming)
 	if err := s.SetGroupAssignments(assign); err != nil {
 		fmt.Fprintln(os.Stderr, "plr group:", err)
 		return 1
@@ -169,13 +175,18 @@ func runPlan(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	_ = conflictHamming
+	_ = conflictHamming // no rule uses it yet; see docs/mvp-gaps.md
 	s, err := store.Open(*db)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr plan:", err)
 		return 1
 	}
 	defer s.Close()
+	return runPlanPhase(s)
+}
+
+// runPlanPhase is the plan step, shared by "plr plan" and "plr build".
+func runPlanPhase(s *store.Store) int {
 	imgs, err := s.AllImages()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr plan:", err)
@@ -202,7 +213,7 @@ func runPlan(args []string) int {
 	for id := range byGroup {
 		ids = append(ids, id)
 	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	slices.Sort(ids)
 	for _, id := range ids {
 		p := group.ResolveGroup(byGroup[id], nil)
 		g := store.Group{
@@ -251,12 +262,17 @@ func runApply(args []string) int {
 		return 1
 	}
 	defer s.Close()
-	rep, err := apply.Apply(s, apply.Options{
+	return runApplyPhase(s, apply.Options{
 		Target:         *target,
 		DryRun:         *dryRun,
 		NoEXIF:         *noEXIF,
 		ForceConflicts: *forceConflicts,
 	})
+}
+
+// runApplyPhase is the apply step, shared by "plr apply" and "plr build".
+func runApplyPhase(s *store.Store, opts apply.Options) int {
+	rep, err := apply.Apply(s, opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr apply:", err)
 		return 1
@@ -311,16 +327,37 @@ func runBuild(args []string) int {
 		fmt.Fprintln(os.Stderr, "plr build: --dir and --target are required")
 		return 2
 	}
-	_ = force
-	_ = maxHamming
-	_ = conflictHamming
-	_ = dryRun
-	_ = noEXIF
-	_ = forceConflicts
-	_ = db
-	_ = workers
-	_ = minSizeKB
-	return notImplemented("build")
+	_ = conflictHamming // no rule uses it yet; see docs/mvp-gaps.md
+	s, err := store.Open(*db)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr build:", err)
+		return 1
+	}
+	defer s.Close()
+	phases := []struct {
+		label string
+		fn    func() int
+	}{
+		{"scan", func() int { return runScanPhase(s, dirs, *force, *workers, *minSizeKB) }},
+		{"group", func() int { return runGroupPhase(s, *maxHamming) }},
+		{"plan", func() int { return runPlanPhase(s) }},
+		{"apply", func() int {
+			return runApplyPhase(s, apply.Options{
+				Target:         *target,
+				DryRun:         *dryRun,
+				NoEXIF:         *noEXIF,
+				ForceConflicts: *forceConflicts,
+			})
+		}},
+	}
+	for _, p := range phases {
+		fmt.Printf("== %s\n", p.label)
+		if code := p.fn(); code != 0 {
+			fmt.Fprintf(os.Stderr, "plr build: %s phase failed\n", p.label)
+			return code
+		}
+	}
+	return 0
 }
 
 func runReport(args []string) int {
@@ -329,8 +366,87 @@ func runReport(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	_ = db
-	return notImplemented("report")
+	s, err := store.Open(*db)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr report:", err)
+		return 1
+	}
+	defer s.Close()
+
+	sources, err := s.Sources()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr report:", err)
+		return 1
+	}
+	images, err := s.AllImages()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr report:", err)
+		return 1
+	}
+	groups, err := s.AllGroups()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr report:", err)
+		return 1
+	}
+	sort.Slice(groups, func(i, j int) bool { return groups[i].ID < groups[j].ID })
+	byID := make(map[string]store.Image, len(images))
+	for _, im := range images {
+		byID[im.ID] = im
+	}
+	counts := map[string]int{}
+	for _, g := range groups {
+		counts[g.Status]++
+	}
+
+	fmt.Printf("library %s\n", *db)
+	dirList := make([]string, 0, len(sources))
+	for _, d := range sources {
+		dirList = append(dirList, d)
+	}
+	sort.Strings(dirList)
+	fmt.Printf("  sources: %d\n", len(dirList))
+	for _, d := range dirList {
+		fmt.Printf("    - %s\n", d)
+	}
+	fmt.Printf("  images:  %d\n", len(images))
+	fmt.Printf("  groups:  %d (%d resolved, %d conflicts, %d singletons)\n",
+		len(groups), counts[group.StatusResolved], counts[group.StatusConflict], counts[group.StatusSingleton])
+	if len(groups) == 0 {
+		fmt.Println("no plans; run plr scan, plr group and plr plan first")
+		return 0
+	}
+
+	fmt.Println("\nplans:")
+	for _, g := range groups {
+		line := fmt.Sprintf("  #%d %-28s %-10s", g.ID, g.StoredName, g.Status)
+		if g.CaptureTime != "" {
+			line += "  capture " + g.CaptureTime
+			if g.CaptureFallback {
+				line += " (file time)"
+			}
+		}
+		if g.HasGPS {
+			line += fmt.Sprintf("  gps %.5f,%.5f", g.GPSLat, g.GPSLon)
+		}
+		if im, ok := byID[g.PixelImageID]; ok {
+			line += "  pixels " + im.Name
+		}
+		fmt.Println(line)
+	}
+
+	conflicts := make([]store.Group, 0)
+	for _, g := range groups {
+		if g.Status == group.StatusConflict {
+			conflicts = append(conflicts, g)
+		}
+	}
+	if len(conflicts) > 0 {
+		fmt.Println("\nconflicts:")
+		for _, g := range conflicts {
+			fmt.Printf("  #%d %s\n", g.ID, g.Reason)
+		}
+	}
+	return 0
 }
 
 func runSelftest(args []string) int {
@@ -338,7 +454,21 @@ func runSelftest(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	return notImplemented("selftest")
+	checks := selftest.Run()
+	failed := 0
+	for _, c := range checks {
+		if c.OK {
+			fmt.Printf("PASS %s\n", c.Name)
+		} else {
+			failed++
+			fmt.Printf("FAIL %s: %s\n", c.Name, c.Detail)
+		}
+	}
+	fmt.Printf("%d/%d checks passed\n", len(checks)-failed, len(checks))
+	if failed > 0 {
+		return 1
+	}
+	return 0
 }
 
 func toGroupImages(imgs []store.Image) []group.Image {

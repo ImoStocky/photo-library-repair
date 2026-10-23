@@ -104,10 +104,11 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 			}
 		}
 
-		jobs, seen, err := collect(abs, opts.MinSize, seenInodes)
+		jobs, seen, nonImage, err := collect(abs, opts.MinSize, seenInodes)
 		if err != nil {
 			return rep, fmt.Errorf("scan %q: %w", dir, err)
 		}
+		rep.NonImage += nonImage
 		for i := range jobs {
 			jobs[i].sourceID = sourceID
 		}
@@ -126,12 +127,14 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 	return rep, nil
 }
 
-// collect walks root and returns the image jobs plus the set of relative
-// paths that exist. Files whose (dev, inode) was already seen in this run
-// (nested sources, hard links) are skipped.
-func collect(root string, minSize int64, seenInodes map[uint64]bool) ([]job, map[string]bool, error) {
+// collect walks root and returns the image jobs, the set of relative paths
+// that exist, and how many files with an image extension failed the magic
+// sniff. Files whose (dev, inode) was already seen in this run (nested
+// sources, hard links) are skipped.
+func collect(root string, minSize int64, seenInodes map[uint64]bool) ([]job, map[string]bool, int, error) {
 	var jobs []job
 	seen := map[string]bool{}
+	nonImage := 0
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -161,6 +164,7 @@ func collect(root string, minSize int64, seenInodes map[uint64]bool) ([]job, map
 
 		kind, err := sniffKind(path)
 		if err != nil || kind == "" {
+			nonImage++
 			return nil
 		}
 		rel, err := filepath.Rel(root, path)
@@ -182,7 +186,7 @@ func collect(root string, minSize int64, seenInodes map[uint64]bool) ([]job, map
 		seen[rel] = true
 		return nil
 	})
-	return jobs, seen, err
+	return jobs, seen, nonImage, err
 }
 
 // hashAll runs sha256 + fingerprint over the jobs with a worker pool and
@@ -194,9 +198,7 @@ func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time
 	firstErr := error(nil)
 
 	for range workers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for j := range jobsCh {
 				rep.FilesSeen++
 				sum, err := sha256File(j.fullPath)
@@ -247,7 +249,7 @@ func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time
 				}
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 
 	for _, j := range jobs {

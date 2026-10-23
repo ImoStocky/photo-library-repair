@@ -1,0 +1,535 @@
+// Package selftest runs built-in parity checks over the full pipeline
+// (scan -> group -> plan -> apply) on synthetic images, so a fresh checkout
+// can be verified without real photos or external tools.
+package selftest
+
+import (
+	"bytes"
+	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
+	"math"
+	"os"
+	"path/filepath"
+	"slices"
+
+	"photo-library-repair/internal/apply"
+	"photo-library-repair/internal/fingerprint"
+	"photo-library-repair/internal/group"
+	"photo-library-repair/internal/ingest"
+	"photo-library-repair/internal/meta"
+	"photo-library-repair/internal/store"
+	"photo-library-repair/internal/testimg"
+)
+
+// maxHamming is the grouping radius the checks use. It is wider than the CLI
+// default (6) so quality re-encodings of the same picture always chain,
+// which is what the checks want to exercise.
+const maxHamming = 16
+
+// Check is the outcome of one built-in check.
+type Check struct {
+	Name   string
+	OK     bool
+	Detail string
+}
+
+// Run executes every built-in check and returns their outcomes.
+func Run() []Check {
+	return []Check{
+		checkScanAndGroup(),
+		checkCaptureRules(),
+		checkConflicts(),
+		checkApply(),
+		checkStoreUpsert(),
+	}
+}
+
+// env is one self-contained pipeline instance: a temp source directory and
+// a throwaway in-memory library. The scan registers the source itself.
+type env struct {
+	dir string
+	s   *store.Store
+}
+
+func newEnv() (*env, error) {
+	dir, err := os.MkdirTemp("", "plr-selftest-")
+	if err != nil {
+		return nil, err
+	}
+	s, err := store.Open(":memory:")
+	if err != nil {
+		os.RemoveAll(dir)
+		return nil, err
+	}
+	return &env{dir: dir, s: s}, nil
+}
+
+func (e *env) close() {
+	e.s.Close()
+	os.RemoveAll(e.dir)
+}
+
+func (e *env) write(rel string, data []byte) error {
+	return os.WriteFile(filepath.Join(e.dir, rel), data, 0o644)
+}
+
+// scan runs the ingest phase over the temp directory.
+func (e *env) scan() (ingest.Report, error) {
+	rep, err := ingest.Scan(e.s, ingest.Options{Dirs: []string{e.dir}, Workers: 2}, fingerprint.Compute)
+	if err != nil {
+		return ingest.Report{}, err
+	}
+	return *rep, nil
+}
+
+// groupPlan runs the group and plan phases. It returns the stored plans and
+// the member file names per plan id. (The store's group_id column is
+// transient: the plan phase's ClearGroups resets it, so membership must be
+// tracked from the assignment.)
+func (e *env) groupPlan() (plans []store.Group, members map[int64][]string, err error) {
+	imgs, err := e.s.AllImages()
+	if err != nil {
+		return nil, nil, err
+	}
+	gimgs := make([]group.Image, len(imgs))
+	for i, im := range imgs {
+		gimgs[i] = group.Image{
+			ID:          im.ID,
+			Name:        im.Name,
+			SHA256:      im.SHA256,
+			Phash:       im.Phash,
+			CreatedAt:   im.CreatedAt,
+			ExifCapture: im.ExifCapture,
+			ExifOffset:  im.ExifOffset,
+			Width:       im.Width,
+			Height:      im.Height,
+			Size:        im.Size,
+			HasGPS:      im.HasGPS,
+			GPSLat:      im.GPSLat,
+			GPSLon:      im.GPSLon,
+		}
+	}
+	assign, _ := group.Aggregate(gimgs, maxHamming)
+	if err := e.s.SetGroupAssignments(assign); err != nil {
+		return nil, nil, err
+	}
+	if err := e.s.ClearGroups(); err != nil {
+		return nil, nil, err
+	}
+	members = map[int64][]string{}
+	for _, im := range gimgs {
+		members[assign[im.ID]] = append(members[assign[im.ID]], im.Name)
+	}
+	for id := range members {
+		planMembers := make([]group.Image, 0)
+		for _, im := range gimgs {
+			if assign[im.ID] == id {
+				planMembers = append(planMembers, im)
+			}
+		}
+		p := group.ResolveGroup(planMembers, nil)
+		g := store.Group{
+			ID:              id,
+			Status:          p.Status,
+			Reason:          p.Reason,
+			PixelImageID:    p.PixelImageID,
+			PixelPhash:      p.PixelPhash,
+			CaptureImageID:  p.CaptureImageID,
+			CaptureTime:     p.CaptureTime,
+			CaptureInstant:  p.CaptureInstant,
+			CaptureFallback: p.CaptureFallback,
+			HasGPS:          p.HasGPS,
+			GPSLat:          p.GPSLat,
+			GPSLon:          p.GPSLon,
+			StoredName:      p.StoredName,
+		}
+		if err := e.s.SaveGroup(g); err != nil {
+			return nil, nil, err
+		}
+		plans = append(plans, g)
+	}
+	return plans, members, nil
+}
+
+// planFor returns the plan whose member list contains a file named name.
+func planFor(plans []store.Group, members map[int64][]string, name string) (store.Group, bool) {
+	for _, p := range plans {
+		if slices.Contains(members[p.ID], name) {
+			return p, true
+		}
+	}
+	return store.Group{}, false
+}
+
+// exifJPEG builds one member of a near-duplicate pair: the same 400x300
+// picture at quality 95 (hi) or 90 (lo). Same-seed pairs stay within 12
+// phash bits, far under maxHamming, while different seeds in one env are at
+// least 26 bits apart and the inverted picture is over 100 bits away, so
+// unrelated pictures never chain.
+func exifJPEG(seed, quality int, capture, offset string, gps bool) []byte {
+	ex := testimg.EXIF{
+		DateTimeOriginal:   capture,
+		OffsetTimeOriginal: offset,
+		GPS:                gps,
+	}
+	return testimg.MakeEXIFJPEG(testimg.Textured(400, 300, seed), quality, ex)
+}
+
+func plainJPEG(seed, quality int) []byte {
+	return testimg.JPEG(testimg.Textured(400, 300, seed), quality)
+}
+
+// inverted returns a JPEG of the negative of the picture in data.
+func inverted(data []byte) []byte {
+	img, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		panic(err) // never happens for selftest input
+	}
+	bounds := img.Bounds()
+	out := image.NewRGBA(bounds)
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			r, g, b, a := img.At(x, y).RGBA()
+			out.SetRGBA(x, y, color.RGBA{
+				R: uint8(255 - uint16(r)>>8),
+				G: uint8(255 - uint16(g)>>8),
+				B: uint8(255 - uint16(b)>>8),
+				A: uint8(a >> 8),
+			})
+		}
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, out, &jpeg.Options{Quality: 95}); err != nil {
+		panic(err) // never happens for in-memory images
+	}
+	return buf.Bytes()
+}
+
+// checkScanAndGroup verifies that the scan records real images, counts a
+// file that only pretends to be a JPEG as non-image, and that the group
+// phase chains the exact copy and the quality re-encoding into one group
+// while an unrelated picture stays apart.
+func checkScanAndGroup() Check {
+	const name = "scan: records images, counts fakes, groups exact and near copies"
+	e, err := newEnv()
+	if err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	defer e.close()
+
+	base := exifJPEG(1, 95, "2024:05:01 12:30:00", "+02:00", true)
+	files := map[string][]byte{
+		"IMG_0001.jpg":       base,
+		"copy.jpg":           base, // byte-identical duplicate under a different name
+		"IMG_0001_reenc.jpg": exifJPEG(1, 90, "2024:05:01 12:30:00", "+02:00", true),
+		"other.jpg":          inverted(base),
+		"fake.jpg":           []byte("this is not a JPEG"),
+	}
+	for rel, data := range files {
+		if err := e.write(rel, data); err != nil {
+			return Check{Name: name, Detail: fmt.Sprintf("write %s: %v", rel, err)}
+		}
+	}
+
+	rep, err := e.scan()
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("scan: %v", err)}
+	}
+	if rep.FilesSeen != 4 || rep.ImagesAdded != 4 || rep.NonImage != 1 || rep.Errors != 0 {
+		return Check{Name: name, Detail: fmt.Sprintf(
+			"scan report: seen=%d added=%d non-image=%d errors=%d (want 4/4/1/0)",
+			rep.FilesSeen, rep.ImagesAdded, rep.NonImage, rep.Errors)}
+	}
+
+	plans, members, err := e.groupPlan()
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("group/plan: %v", err)}
+	}
+	if len(plans) != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("%d groups (want 2)", len(plans))}
+	}
+	bigPlan, ok := planFor(plans, members, "IMG_0001.jpg")
+	if !ok {
+		return Check{Name: name, Detail: "no plan for IMG_0001.jpg"}
+	}
+	smallPlan, ok := planFor(plans, members, "other.jpg")
+	if !ok {
+		return Check{Name: name, Detail: "no plan for other.jpg"}
+	}
+	if len(members[bigPlan.ID]) != 3 {
+		return Check{Name: name, Detail: fmt.Sprintf("IMG_0001.jpg group has %d members (want 3)", len(members[bigPlan.ID]))}
+	}
+	if len(members[smallPlan.ID]) != 1 {
+		return Check{Name: name, Detail: fmt.Sprintf("other.jpg group has %d members (want 1)", len(members[smallPlan.ID]))}
+	}
+	if smallPlan.Status != group.StatusSingleton {
+		return Check{Name: name, Detail: fmt.Sprintf("other.jpg plan status %q (want %q)", smallPlan.Status, group.StatusSingleton)}
+	}
+	return Check{Name: name, OK: true}
+}
+
+// checkCaptureRules verifies that a group with agreeing EXIF keeps the
+// earliest capture time and the GPS position, and that a group without EXIF
+// falls back to the earliest file creation time.
+func checkCaptureRules() Check {
+	const name = "plan: keeps earliest EXIF capture and GPS, falls back without EXIF"
+	e, err := newEnv()
+	if err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	defer e.close()
+
+	files := map[string][]byte{
+		"IMG_E1.jpg": exifJPEG(4, 95, "2024:05:01 12:30:00", "+02:00", true),
+		"IMG_E2.jpg": exifJPEG(4, 90, "2024:05:01 12:35:00", "+02:00", true),
+		"IMG_F1.jpg": plainJPEG(5, 95),
+		"IMG_F2.jpg": plainJPEG(5, 90),
+	}
+	for rel, data := range files {
+		if err := e.write(rel, data); err != nil {
+			return Check{Name: name, Detail: fmt.Sprintf("write %s: %v", rel, err)}
+		}
+	}
+	if _, err := e.scan(); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("scan: %v", err)}
+	}
+	plans, members, err := e.groupPlan()
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("group/plan: %v", err)}
+	}
+	if len(plans) != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("%d groups (want 2)", len(plans))}
+	}
+
+	exifPlan, ok := planFor(plans, members, "IMG_E1.jpg")
+	if !ok {
+		return Check{Name: name, Detail: "no plan for IMG_E1.jpg"}
+	}
+	if exifPlan.Status != group.StatusResolved {
+		return Check{Name: name, Detail: fmt.Sprintf("EXIF group status %q (want %q): %s", exifPlan.Status, group.StatusResolved, exifPlan.Reason)}
+	}
+	if exifPlan.CaptureTime != "2024:05:01 12:30:00" {
+		return Check{Name: name, Detail: fmt.Sprintf("kept capture %q (want 2024:05:01 12:30:00)", exifPlan.CaptureTime)}
+	}
+	if exifPlan.CaptureFallback {
+		return Check{Name: name, Detail: "EXIF group marked as fallback (want false)"}
+	}
+	if !exifPlan.HasGPS || math.Abs(exifPlan.GPSLat-52.5204) > 1e-3 || math.Abs(exifPlan.GPSLon-13.4055) > 1e-3 {
+		return Check{Name: name, Detail: fmt.Sprintf("GPS %v %v,%v (want 52.5204, 13.4055)", exifPlan.HasGPS, exifPlan.GPSLat, exifPlan.GPSLon)}
+	}
+
+	fallbackPlan, ok := planFor(plans, members, "IMG_F1.jpg")
+	if !ok {
+		return Check{Name: name, Detail: "no plan for IMG_F1.jpg"}
+	}
+	if fallbackPlan.Status != group.StatusResolved || !fallbackPlan.CaptureFallback {
+		return Check{Name: name, Detail: fmt.Sprintf("no-EXIF group status %q fallback %v (want resolved/true)", fallbackPlan.Status, fallbackPlan.CaptureFallback)}
+	}
+	if fallbackPlan.CaptureInstant <= 0 {
+		return Check{Name: name, Detail: "fallback capture instant is zero"}
+	}
+	return Check{Name: name, OK: true}
+}
+
+// checkConflicts verifies that EXIF disagreements the automatic rules cannot
+// settle (differing timezone offsets, one member with GPS and one without)
+// are surfaced as conflicts with a reason.
+func checkConflicts() Check {
+	const name = "plan: flags offset and GPS disagreement as conflicts"
+	e, err := newEnv()
+	if err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	defer e.close()
+
+	files := map[string][]byte{
+		"IMG_C1.jpg": exifJPEG(4, 95, "2024:05:01 12:30:00", "+02:00", false),
+		"IMG_C2.jpg": exifJPEG(4, 90, "2024:05:01 12:30:00", "+05:00", false),
+		"IMG_D1.jpg": exifJPEG(5, 95, "2024:05:01 12:30:00", "+02:00", true),
+		"IMG_D2.jpg": exifJPEG(5, 90, "2024:05:01 12:30:00", "+02:00", false),
+	}
+	for rel, data := range files {
+		if err := e.write(rel, data); err != nil {
+			return Check{Name: name, Detail: fmt.Sprintf("write %s: %v", rel, err)}
+		}
+	}
+	if _, err := e.scan(); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("scan: %v", err)}
+	}
+	plans, members, err := e.groupPlan()
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("group/plan: %v", err)}
+	}
+	if len(plans) != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("%d groups (want 2)", len(plans))}
+	}
+
+	offPlan, ok := planFor(plans, members, "IMG_C1.jpg")
+	if !ok || offPlan.Status != group.StatusConflict {
+		return Check{Name: name, Detail: fmt.Sprintf("offset group: status %q reason %q (want conflict)", offPlan.Status, offPlan.Reason)}
+	}
+	if offPlan.Reason == "" {
+		return Check{Name: name, Detail: "offset conflict has no reason"}
+	}
+	gpsPlan, ok := planFor(plans, members, "IMG_D1.jpg")
+	if !ok || gpsPlan.Status != group.StatusConflict {
+		return Check{Name: name, Detail: fmt.Sprintf("GPS group: status %q reason %q (want conflict)", gpsPlan.Status, gpsPlan.Reason)}
+	}
+	return Check{Name: name, OK: true}
+}
+
+// checkApply verifies that the write-out phase copies the chosen pixels with
+// merged EXIF, leaves conflict groups alone, honors --dry-run, applies
+// conflicts when forced, and renames stored names that already exist.
+func checkApply() Check {
+	const name = "apply: writes merged EXIF, skips conflicts, honors dry-run, renames collisions"
+	e, err := newEnv()
+	if err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	defer e.close()
+
+	files := map[string][]byte{
+		"IMG_A1.jpg": exifJPEG(4, 95, "2024:05:01 12:30:00", "+02:00", true),
+		"IMG_A2.jpg": exifJPEG(4, 90, "2024:05:01 12:35:00", "+02:00", true),
+		"IMG_B1.jpg": exifJPEG(5, 95, "2024:05:01 12:30:00", "+02:00", false),
+		"IMG_B2.jpg": exifJPEG(5, 90, "2024:05:01 12:30:00", "+05:00", false),
+	}
+	for rel, data := range files {
+		if err := e.write(rel, data); err != nil {
+			return Check{Name: name, Detail: fmt.Sprintf("write %s: %v", rel, err)}
+		}
+	}
+	if _, err := e.scan(); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("scan: %v", err)}
+	}
+	plans, members, err := e.groupPlan()
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("group/plan: %v", err)}
+	}
+	resolved, ok := planFor(plans, members, "IMG_A1.jpg")
+	if !ok || resolved.Status != group.StatusResolved {
+		return Check{Name: name, Detail: fmt.Sprintf("setup: resolved group missing (status %q)", resolved.Status)}
+	}
+
+	target, err := os.MkdirTemp("", "plr-selftest-target-")
+	if err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	defer os.RemoveAll(target)
+
+	rep, err := apply.Apply(e.s, apply.Options{Target: target})
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("apply: %v", err)}
+	}
+	if len(rep.Errors) != 0 {
+		return Check{Name: name, Detail: fmt.Sprintf("apply errors: %v", rep.Errors)}
+	}
+	if rep.Copied != 1 || rep.Skipped != 1 {
+		return Check{Name: name, Detail: fmt.Sprintf("copied=%d skipped=%d (want 1/1)", rep.Copied, rep.Skipped)}
+	}
+	out := filepath.Join(target, resolved.StoredName)
+	facts, err := meta.FromJPEG(mustRead(out))
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("read output %s: %v", out, err)}
+	}
+	if facts.Capture != "2024:05:01 12:30:00" || facts.Offset != "+02:00" || !facts.HasGPS {
+		return Check{Name: name, Detail: fmt.Sprintf("merged EXIF %q %q gps=%v (want 2024:05:01 12:30:00 +02:00 gps)",
+			facts.Capture, facts.Offset, facts.HasGPS)}
+	}
+
+	dryTarget := filepath.Join(target, "dry") // must not be created
+	rep, err = apply.Apply(e.s, apply.Options{Target: dryTarget, DryRun: true})
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("dry-run: %v", err)}
+	}
+	if _, err := os.Stat(dryTarget); !os.IsNotExist(err) {
+		return Check{Name: name, Detail: fmt.Sprintf("dry-run created target directory %s", dryTarget)}
+	}
+	if rep.Copied != 1 || rep.Skipped != 1 {
+		return Check{Name: name, Detail: fmt.Sprintf("dry-run copied=%d skipped=%d (want 1/1)", rep.Copied, rep.Skipped)}
+	}
+
+	forceTarget := filepath.Join(target, "forced")
+	rep, err = apply.Apply(e.s, apply.Options{Target: forceTarget, ForceConflicts: true})
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("force: %v", err)}
+	}
+	if len(rep.Errors) != 0 {
+		return Check{Name: name, Detail: fmt.Sprintf("force errors: %v", rep.Errors)}
+	}
+	if rep.Copied != 2 || rep.Skipped != 0 {
+		return Check{Name: name, Detail: fmt.Sprintf("force copied=%d skipped=%d (want 2/0)", rep.Copied, rep.Skipped)}
+	}
+
+	collideTarget := filepath.Join(target, "collide")
+	if err := os.MkdirAll(collideTarget, 0o755); err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	if err := os.WriteFile(filepath.Join(collideTarget, resolved.StoredName), []byte("occupied"), 0o644); err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	rep, err = apply.Apply(e.s, apply.Options{Target: collideTarget})
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("collision: %v", err)}
+	}
+	want := fmt.Sprintf("%06d_%s", resolved.ID, resolved.StoredName)
+	if rep.Renamed != 1 {
+		return Check{Name: name, Detail: fmt.Sprintf("renamed=%d (want 1)", rep.Renamed)}
+	}
+	if _, err := os.Stat(filepath.Join(collideTarget, want)); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("renamed output missing: %v", err)}
+	}
+	return Check{Name: name, OK: true}
+}
+
+func mustRead(path string) []byte {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		panic(err) // the file was created moments before
+	}
+	return data
+}
+
+// checkStoreUpsert verifies that re-scanning the same file keeps the image
+// id and does not duplicate the row.
+func checkStoreUpsert() Check {
+	const name = "store: upsert keeps id, group assignment and row count"
+	e, err := newEnv()
+	if err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	defer e.close()
+
+	if err := e.write("a.jpg", plainJPEG(11, 95)); err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	if _, err := e.scan(); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("scan: %v", err)}
+	}
+	images, err := e.s.AllImages()
+	if err != nil || len(images) != 1 {
+		return Check{Name: name, Detail: fmt.Sprintf("first scan: %d images, err %v (want 1)", len(images), err)}
+	}
+	orig := images[0]
+
+	if _, err := e.scan(); err != nil { // non-forced re-scan skips the directory
+		return Check{Name: name, Detail: fmt.Sprintf("re-scan: %v", err)}
+	}
+	if _, _, err := e.s.UpsertImage(orig); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("upsert: %v", err)}
+	}
+	images, err = e.s.AllImages()
+	if err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	if len(images) != 1 {
+		return Check{Name: name, Detail: fmt.Sprintf("row count %d (want 1)", len(images))}
+	}
+	if images[0].ID != orig.ID {
+		return Check{Name: name, Detail: fmt.Sprintf("id changed from %s to %s", orig.ID, images[0].ID)}
+	}
+	return Check{Name: name, OK: true}
+}
