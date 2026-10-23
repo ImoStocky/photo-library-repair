@@ -6,9 +6,9 @@ import "math"
 // transform lengths k = 0..size-1.
 func cosTable(size int) [][]float64 {
 	t := make([][]float64, size)
-	for k := 0; k < size; k++ {
+	for k := range size {
 		t[k] = make([]float64, size)
-		for n := 0; n < size; n++ {
+		for n := range size {
 			t[k][n] = math.Cos(math.Pi * float64(k) * float64(2*n+1) / (2 * float64(size)))
 		}
 	}
@@ -30,11 +30,11 @@ func dct2d(m [][]float64) [][]float64 {
 
 	// DCT over each row.
 	tmp := make([][]float64, rows)
-	for i := 0; i < rows; i++ {
+	for i := range rows {
 		tmp[i] = make([]float64, cols)
-		for k := 0; k < cols; k++ {
+		for k := range cols {
 			s := 0.0
-			for x := 0; x < cols; x++ {
+			for x := range cols {
 				s += m[i][x] * cosCols[k][x]
 			}
 			tmp[i][k] = s
@@ -46,10 +46,10 @@ func dct2d(m [][]float64) [][]float64 {
 	for i := range out {
 		out[i] = make([]float64, cols)
 	}
-	for k := 0; k < cols; k++ {
-		for i := 0; i < rows; i++ {
+	for k := range cols {
+		for i := range rows {
 			s := 0.0
-			for y := 0; y < rows; y++ {
+			for y := range rows {
 				s += tmp[y][k] * cosRows[i][y]
 			}
 			out[i][k] = s

@@ -7,12 +7,14 @@ import (
 	"image/jpeg"
 	"math"
 	"testing"
+
+	"photo-library-repair/internal/testimg"
 )
 
 func gradient(w, h int) *image.Gray {
 	img := image.NewGray(image.Rect(0, 0, w, h))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
+	for y := range h {
+		for x := range w {
 			img.SetGray(x, y, color.Gray{uint8(255 * (x + y) / (w + h - 2))})
 		}
 	}
@@ -23,8 +25,8 @@ func gradient(w, h int) *image.Gray {
 // frequencies, closer to real photographs than a pure ramp.
 func photoLike(w, h int, noise float64) *image.Gray {
 	img := image.NewGray(image.Rect(0, 0, w, h))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
+	for y := range h {
+		for x := range w {
 			fx, fy := float64(x), float64(y)
 			v := 128.0 +
 				40.0*math.Sin(fx*0.05) +
@@ -48,8 +50,8 @@ func photoLike(w, h int, noise float64) *image.Gray {
 
 func constantImg(w, h int) *image.Gray {
 	img := image.NewGray(image.Rect(0, 0, w, h))
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
+	for y := range h {
+		for x := range w {
 			img.SetGray(x, y, color.Gray{128})
 		}
 	}
@@ -128,8 +130,8 @@ func TestJpegRoundTripSimilar(t *testing.T) {
 func TestDifferentImagesDiffer(t *testing.T) {
 	stripes := photoLike(400, 300, 0)
 	inv := image.NewGray(stripes.Bounds())
-	for y := 0; y < 300; y++ {
-		for x := 0; x < 400; x++ {
+	for y := range 300 {
+		for x := range 400 {
 			g := stripes.GrayAt(x, y)
 			inv.SetGray(x, y, color.Gray{uint8(255 - g.Y)})
 		}
@@ -198,8 +200,8 @@ func TestDctDCOnly(t *testing.T) {
 		t.Fatalf("DC coefficient = %f, want 256", out[0][0])
 	}
 	maxAC := 0.0
-	for i := 0; i < 16; i++ {
-		for j := 0; j < 16; j++ {
+	for i := range 16 {
+		for j := range 16 {
 			if i == 0 && j == 0 {
 				continue
 			}
@@ -232,8 +234,8 @@ func TestDctRectangular(t *testing.T) {
 	if out[0][0] < 31.99 || out[0][0] > 32.01 {
 		t.Fatalf("DC coefficient = %f, want 32", out[0][0])
 	}
-	for i := 0; i < 4; i++ {
-		for j := 0; j < 8; j++ {
+	for i := range 4 {
+		for j := range 8 {
 			if i == 0 && j == 0 {
 				continue
 			}
@@ -248,15 +250,67 @@ func TestDctRectangular(t *testing.T) {
 	}
 }
 
-func TestLanczosConstant(t *testing.T) {
-	src := make([]float64, 10*10)
-	for i := range src {
-		src[i] = 42.5
+func TestLanczosGridConstant(t *testing.T) {
+	// A constant picture rescales to the same constant through the
+	// streaming resize, at any source size relative to the grid.
+	img := image.NewGray(image.Rect(0, 0, 10, 10))
+	for i := range img.Pix {
+		img.Pix[i] = 43
 	}
-	out := lanczos3(src, 10, 10, 4, 4)
+	out := lanczosGrid(img, img.Bounds())
+	if len(out) != gridW*gridH {
+		t.Fatalf("grid length = %d, want %d", len(out), gridW*gridH)
+	}
 	for i, v := range out {
-		if v < 42.49 || v > 42.51 {
-			t.Fatalf("out[%d] = %f, want ~42.5", i, v)
+		if v < 42.99 || v > 43.01 {
+			t.Fatalf("out[%d] = %f, want ~43", i, v)
 		}
+	}
+}
+
+// TestComputeAnySize proves Compute never fails on arbitrary source sizes:
+// sub-pixel, grid-size (identity), extreme aspect ratios, and photo scale.
+func TestComputeAnySize(t *testing.T) {
+	sizes := []struct {
+		w, h int
+	}{
+		{1, 1}, {2, 1}, {1, 2}, {8, 8}, {16, 9}, {32, 16},
+		{64, 48}, {100, 1}, {1, 100}, {400, 300}, {1000, 300}, {2000, 1500},
+	}
+	for _, s := range sizes {
+		h, err := Compute(photoLike(s.w, s.h, 0))
+		if err != nil {
+			t.Fatalf("Compute(%dx%d) failed: %v", s.w, s.h, err)
+		}
+		if h == (Hash{}) {
+			t.Fatalf("Compute(%dx%d) produced an all-zero hash", s.w, s.h)
+		}
+	}
+}
+
+// TestComputeGolden pins the hash of a fixed file across pipeline
+// restructures: the streaming LANCZOS3 resize must produce bit-identical
+// hashes to the previous full-buffer implementation.
+func TestComputeGolden(t *testing.T) {
+	data := testimg.MakeEXIFJPEG(
+		testimg.Textured(400, 300, 1),
+		95,
+		testimg.EXIF{
+			DateTimeOriginal:   "2024:05:01 12:30:00",
+			OffsetTimeOriginal: "+02:00",
+			GPS:                true,
+		},
+	)
+	img, err := jpeg.Decode(bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := Compute(img)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "7700f8ffadaa07506c750741ec550775"
+	if h.Hex() != want {
+		t.Fatalf("golden hash = %s, want %s", h.Hex(), want)
 	}
 }

@@ -7,7 +7,6 @@
 //  1. convert the picture to 8-bit luma,
 //  2. resize to twice the hash region (32x16) with LANCZOS3, quantizing the
 //     result back to 8-bit,
-//  3. compute the unnormalized type-II 2D DCT,
 //  4. keep only the low-frequency top-left quadrant of the DCT (16x8 =
 //     128 coefficients),
 //  5. threshold each coefficient against the median of the quadrant: bit i
@@ -15,6 +14,11 @@
 //
 // Bits are packed least-significant-bit first, like img_hash's default.
 // Hamming distance over the 128 bits measures similarity.
+//
+// Compute works for any image size: the LANCZOS3 resize is streamed row by
+// row, so working memory is bounded by the 32 x source-height grid
+// intermediate no matter how large the picture is, and the filter
+// degenerates to the identity when the source already is the 32x16 grid.
 package phash
 
 import (
@@ -47,20 +51,12 @@ func Compute(img image.Image) (Hash, error) {
 	if b.Empty() {
 		return Hash{}, fmt.Errorf("empty image")
 	}
-	w, h := b.Dx(), b.Dy()
 
-	// Full-resolution luma (ITU-R 601), scaled to 0..255.
-	luma := make([]float64, w*h)
-	for y := 0; y < h; y++ {
-		for x := 0; x < w; x++ {
-			r, g, bl, _ := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
-			luma[y*w+x] = 0.299*float64(r>>8) + 0.587*float64(g>>8) + 0.114*float64(bl>>8)
-		}
-	}
-
-	// Resize to the DCT grid and quantize to 8-bit, matching the img_hash
-	// pipeline (the resize output is 8-bit luma before the DCT).
-	resized := lanczos3(luma, w, h, gridW, gridH)
+	// Resize to the DCT grid with LANCZOS3, streamed row by row so the
+	// source is never fully materialized; quantize the result back to
+	// 8-bit, matching the img_hash pipeline (the resize output is 8-bit
+	// luma before the DCT).
+	resized := lanczosGrid(img, b)
 	grid := make([][]float64, gridH)
 	for i := range grid {
 		grid[i] = make([]float64, gridW)
@@ -134,7 +130,7 @@ func HashFromHex(s string) (Hash, error) {
 // row-major order (img_hash crop_2d).
 func quadrant(dct [][]float64) []float64 {
 	vals := make([]float64, 0, Bits)
-	for i := 0; i < hashH; i++ {
+	for i := range hashH {
 		vals = append(vals, dct[i][:hashW]...)
 	}
 	return vals
