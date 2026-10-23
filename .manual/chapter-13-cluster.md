@@ -49,4 +49,4 @@ func Cluster(recs []Member, maxHamming int) []Picture {
 
 ## CLI
 
-`plr group [--max-hamming N]` — MVP default **6**, design default **32**.
+`plr group [--max-hamming N]` — MVP default **12**, design default **32**.

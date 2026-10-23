@@ -8,14 +8,14 @@
 
 ## Responsibility
 
-Orient + DCT phash (256-bit), Hamming distance, banding candidate index.
+Orient + DCT phash (16-byte), Hamming distance, banding candidate index.
 Pure.
 
 ## Spec summary
 
-- 256-bit DCT phash after EXIF orientation (`hash_size=16`).
+- 16-byte DCT phash after EXIF orientation (`hash_size=16`).
 - JPEG may use ~64 px edge preview for speed; store full oriented dims.
-- Default radius for clustering/merge: **32** bits (MVP CLI default is 6).
+- Default radius for clustering/merge: **12** bits (MVP CLI default is 12).
 - Cache key `(path, size, mtime_ns)`.
 
 ## Target package
@@ -39,12 +39,12 @@ pairs.
 
 ```go
 func Phash(img image.Image) Hash {
-    g := toGray(img)              // ITU-R 601-2 luma
-    r := resizeLanczos(g, 64, 64) // 16*4
+    g := toGray(img)               // ITU-R 601-2 luma
+    r := resizeLanczos(g, 32, 16)  // twice the 16x8 hash region
     d := dct2(r)
-    low := /* 16x16 low-frequency block */
+    low := /* top-left 16x8 low-frequency quadrant */
     med := median(low)
-    // bit i set iff low[i] > med
+    // bit i set iff low[i] >= med  -> 128 bits = 16 bytes
 }
 
 func Hamming(a, b Hash) int { /* popcount(a xor b) */ }

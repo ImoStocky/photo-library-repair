@@ -41,6 +41,7 @@ internal/
   exifwrite/             // pure-Go JPEG EXIF write
   store/                 // SQLite sources/images/groups
   apply/                 // copy + write EXIF
+  kronk/                 // Kronk decision-model resolver (plan --ai)
   selftest/              // built-in parity checks
   testimg/               // synthetic JPEG helpers for tests
 ```

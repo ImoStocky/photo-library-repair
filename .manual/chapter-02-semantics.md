@@ -12,12 +12,15 @@ When changing rules: update this chapter, the owning S-chapter, and tests
 
 ## 2.1 Identity
 
-- Picture identity = **256-bit perceptual hash** (DCT phash, `hash_size=16`
-  → 16×16 = 256 bits), after **EXIF orientation**.
+- Picture identity = **16-byte perceptual hash** (DCT phash, `hash_size=16`
+  → 128 bits, czkawka-style), after **EXIF orientation**.
 - Distance = **Hamming** distance on those hashes.
-- Default merge radius: **`max_hamming = 32`** bits.
-- JPEG may be decoded as a reduced preview (edge ≈ 64 px) for hashing;
-  stored width/height remain full displayed (orientation-aware) size.
+- Default merge radius: **`max_hamming = 12`** bits; adjustable via
+  `--max-hamming`.
+- JPEG may be decoded as a reduced preview (edge ≈ 64 px) for hashing speed;
+  a hash hit alone never settles identity — de-dupe also requires equal file
+  size (§2.2). Stored width/height remain full displayed (orientation-aware)
+  size.
 - Hash cache key: **`(path, size, mtime_ns)`**.
 
 Owner: [chapter 12 — Hash](chapter-12-hash.md).

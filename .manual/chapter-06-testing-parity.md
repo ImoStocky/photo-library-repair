@@ -35,10 +35,10 @@ go test ./internal/...
 
 `internal/selftest` exercises deterministic conflict kinds (offset / GPS
 disagreement). Birth-time-vs-capture is filesystem-dependent and lightly
-covered. Grouping radius in selftest is **16** bits (CLI default **6**).
+covered. Grouping radius in selftest is **16** bits (CLI default **12**).
 
 Package tests exist for: `phash`, `fingerprint`, `ingest`, `group`, `meta`,
-`exifwrite`, `apply`, `store`.
+`exifwrite`, `apply`, `store`, `kronk` (pure build/apply parts).
 
 ## When changing semantics
 

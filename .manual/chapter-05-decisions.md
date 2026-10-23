@@ -3,11 +3,15 @@
 ## 9.1 Perceptual hash in Go
 
 Prototype: `imagehash.phash` (gray → 64×64 LANCZOS → 2D DCT → 16×16
-low-freq → median threshold).
+low-freq → median threshold, 256 bits) — history only.
 
-**Decision:** implement the same parameters in Go (`internal/phash` today;
-design name `internal/hash`). Not bit-identical to `imagehash` — acceptable
-because Go re-hashes the seed and only compares Go hashes to Go hashes.
+**Decision:** follow the czkawka / img_hash pipeline in Go
+(`internal/phash` today; design name `internal/hash`): gray → 32×16
+LANCZOS3 → 2D DCT → top-left 16×8 low-frequency quadrant → median
+threshold = **16 bytes (128 bits)**. czkawka offers 8/16/32/64-byte
+hash sizes; 16 gave the best results on our data, so it is fixed.
+Not bit-identical to `imagehash` — acceptable because Go re-hashes the
+seed and only compares Go hashes to Go hashes.
 
 *Open:* bit-identical DCT/resize only if we must reuse a Python `phash.json`
 cache.

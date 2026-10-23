@@ -19,7 +19,8 @@ helpers. Imports only hash types + plain data.
 ## Current package
 
 `internal/group.ResolveGroup` (+ helpers). Combined with clustering in the
-same package. Conflicts surface via optional `Resolver` (unused in MVP).
+same package. Conflicts surface via optional `Resolver` (used by
+`plr plan --ai`; rules remain the default).
 
 ### MVP vs §2.3 (do not treat as equivalent)
 
@@ -37,7 +38,7 @@ same package. Conflicts surface via optional `Resolver` (unused in MVP).
 ## Domain types (target)
 
 ```go
-type Hash [32]byte // 256 bits
+type Hash [16]byte // 128 bits
 
 type Member struct {
     Path, Kind, Source string

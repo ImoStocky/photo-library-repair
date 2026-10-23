@@ -4,8 +4,10 @@ Read this first when picking up the project.
 
 The **product heading** is the simpler Go tool from the OpenCode
 “Library fix tool in go” brief — not the archived client/server draft.
-[Chapter 02+](chapter-02-semantics.md) still hold useful detail from the
-old draft; treat them as reference, not as the current target.
+[Chapters 02–06](chapter-02-semantics.md) retain the draft's semantics and
+decisions — chapter 02 is the authoritative rule spec and the S-chapters
+track each package. The draft's *architecture* (client/server, commit
+model) is not the current target.
 
 ## Goals (current heading)
 
@@ -59,7 +61,7 @@ SQLite `plr.db`: `sources` / `images` / `groups`. Local CLI only.
 | Amalgamate / apply | `internal/apply` | Done — copy + JPEG EXIF; no `--move` |
 | One-shot | `plr build` | Done |
 | Incremental growth | re-`scan` + re-`group`/`plan`/`apply` | Works as bypass; no dedicated `increment` |
-| Kronk conflict resolve | — | Planned, not in main path |
+| Kronk conflict resolve | `internal/kronk` | Done — opt-in `plr plan --ai` (Kronk decision model); rules remain the default |
 
 ## Related
 

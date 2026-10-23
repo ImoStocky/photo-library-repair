@@ -14,7 +14,7 @@ Committed library index + commit log. I/O via `database/sql`.
 ```text
 Source        { id, label, kind: seed|backup|inbox, path, added_at }
 File          { id, source_id, path, size, mtime_ns, width, height,
-                hash [32]byte, kind }
+                hash [16]byte, kind }
 Picture       { id, stored_name, pixel_file_id, name_src,
                 capture_time, capture_file_id,
                 gps_lat, gps_lon, gps_file_id, camera_file_id,
@@ -62,7 +62,7 @@ images(id TEXT PK, source_id, rel_path, name, sha256, phash,
        created_at, exif_capture, exif_offset, width, height, kind, size,
        gps_*, has_gps, group_id)
 groups(id, status, reason, pixel_image_id, pixel_phash,
-       capture_*, gps_*, stored_name)
+       capture_*, gps_*, stored_name, resolved_by)
 ```
 
 No `commits`, `picture_members`, `phash_cache`, source `kind`/`label`.
