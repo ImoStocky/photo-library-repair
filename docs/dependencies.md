@@ -28,13 +28,17 @@ fully decoded for its phash).
 
 ## Considered, deferred
 
-| Library | CGO | Why not (yet) |
-| --- | --- | --- |
-| `strukturag/libheif` Go bindings | yes | Battle-tested (libde265) but CGO + build-toolchain burden; the fallback if `vegidio/heif-go` proves too slow or format-limited. |
-| `f0reth/go-heic` | no (purego) | CGO-free, but loads `libheif`/`libde265` shared libraries at runtime — pushes the dependency onto the user's machine. |
-| `jdeng/goheif` | yes | libde265-based; older, less maintained. |
-| `go4.org/media/heif` | no | Container/metadata only — no pixel decode, useless for phash. |
-| `mschilli/go-exif`, `imclaren/go-exif`, `krak3n/go-exif` | no | Forks of the dsoprea line; no reason to prefer a fork. |
+| Area | Library | CGO | Why not (yet) |
+| --- | --- | --- | --- |
+| EXIF | `rwcarlsen/goexif` | no | The classic, most widely used Go EXIF library — but **read-only** and effectively unmaintained (the ecosystem keeps circling back to it; no writer to cover `exifwrite`). |
+| EXIF | `mschilli/go-exif`, `imclaren/go-exif`, `krak3n/go-exif` | no | Forks of the dsoprea line; no reason to prefer a fork. |
+| HEIC | `strukturag/libheif` Go bindings | yes | Battle-tested (libde265) but CGO + build-toolchain burden; the fallback if `vegidio/heif-go` proves too slow or format-limited. |
+| HEIC | `klippa-app/go-libheif` | yes | `go get`-table libheif wrapper (HEIC/HEIF/AVIF); same CGO trade-off, less proven than the upstream bindings. |
+| HEIC | `xo/heif` | yes | Go wrapper around libheif, encode + decode for any libheif-supported format; same CGO trade-off. |
+| HEIC | `f0reth/go-heic` | no (purego) | CGO-free, but loads `libheif`/`libde265` shared libraries at runtime — pushes the dependency onto the user's machine. |
+| HEIC | `gen2brain/heic` | no (wazero) | CGO-free: Rust heic decoder compiled to WASM, run under wazero; tries a local `libheif` via purego first, falls back to the embedded WASM. Interesting middle ground, but the WASM decode is the slow path and the library is young. |
+| HEIC | `jdeng/goheif` (+ forks `rpajarola/goheif`, `adrium/goheif`) | yes | libde265-based; older, less maintained. |
+| HEIC | `go4.org/media/heif` | no | Container/metadata only — no pixel decode, useless for phash. |
 
 Related: [chapter 14 — Meta](../.manual/chapter-14-meta.md) (EXIF read/write
 responsibilities), [chapter 05 §9.1](../.manual/chapter-05-decisions.md)
