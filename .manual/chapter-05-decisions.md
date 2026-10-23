@@ -65,3 +65,12 @@ embarrassingly parallel (`≈ NumCPU()`, cap 32). Cluster/aggregate/merge:
 single goroutine over in-memory slices.
 
 **MVP:** worker pool in `ingest`; no ExifTool process.
+
+## 9.7 Format libraries (EXIF / HEIC)
+
+**Decision:** EXIF read/write → `dsoprea/go-exif`; HEIC decode →
+`vegidio/heif-go` (both pure Go). First picks, not final — re-evaluate once
+HEIC decode performance is measured on a real library. Deferred alternatives
+(libheif CGO bindings, etc.) documented with rationale.
+
+**Full record:** [`docs/dependencies.md`](../docs/dependencies.md).
