@@ -1,35 +1,48 @@
 # AGENTS.md
 
-Your name is Dave and developers will use your name when interacting with you.
+Guidance for coding agents working in **photo-library-repair** (`plr`).
 
-The manual has been split into separate chapter files in the `.manual/` directory. Read only the chapters relevant to your task. Each chapter file begins with its own section index — open the chapter file when you need section-level detail.
+## Product heading
 
-You will want to look at `Chapter 20: Developer Guide` for detailed information about the project structure, code, and workflows.
+Local Go CLI: scan → group → plan → apply/amalgamate, SQLite library,
+incremental re-scan. Read [`.manual/chapter-01-goals-and-status.md`](.manual/chapter-01-goals-and-status.md)
+first. Chapter index: [`.manual/INDEX.md`](.manual/INDEX.md).
 
-## Basic Rules
+- **apply ≡ amalgamate** — same step; CLI stays `plr apply` until an
+  explicit rename. Do not rename while other agents may be mid-flight.
+- The archived client/server draft
+  ([`.manual/_archive/go-design-draft.md`](.manual/_archive/go-design-draft.md))
+  is **not** the current target.
+- [`.manual/chapter-20-developer-guide.md`](.manual/chapter-20-developer-guide.md)
+  is Kronk SDK notes, not this repo’s architecture.
 
-- After modifying any `.go` file, always run `go vet` and `gofmt -s -w` on the changed files.
-- After modifying any `.go` file, always run `staticcheck` and `go fix` on the changed package.
-- You need these env vars to run test
-  - export RUN_IN_PARALLEL=yes
-  - export GITHUB_WORKSPACE=<Root Location Of Photo Lib repair>
+## Basic rules
 
-## MCP Services
+After modifying any `.go` file:
 
-Kronk has an MCP service and these are settings:
+1. `gofmt -s -w` on the changed files
+2. `go vet` on the changed package
+3. `staticcheck` and `go fix` on the changed package
+4. Prefer focused tests: `go test ./internal/<pkg>/...`
 
+## Layout
+
+```text
+main.go                 # plr entry
+internal/cli/           # commands
+internal/ingest/        # scan
+internal/phash/         # 16-byte DCT perceptual hash
+internal/fingerprint/   # decode + hash + EXIF facts
+internal/group/         # Aggregate + ResolveGroup (plan/conflicts)
+internal/meta/          # JPEG EXIF read
+internal/exifwrite/     # JPEG EXIF write
+internal/store/         # SQLite sources/images/groups
+internal/apply/         # amalgamate (copy + write EXIF)
+internal/selftest/      # plr selftest
 ```
-"mcp": {
-    "Kronk": {
-        "type": "remote",
-        "url": "http://localhost:9000/mcp",
-        "type": "streamableHttp",
-        "apis": [
-            {
-                "api": "web_search",
-                "desc": "Performs a web search for the given query. Returns a list of relevant web pages with titles, URLs, and descriptions. Use this for general information gathering, research, and finding specific web resources."
-            }
-        ],
-    }
-}
-```
+
+## Do not
+
+- Reintroduce the Python prototype or treat README Python history as current
+- Wire gRPC / commit-log / ExifTool as required for the MVP heading
+- Rename `apply` → `amalgamate` without an explicit user request
