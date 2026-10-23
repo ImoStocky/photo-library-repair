@@ -24,7 +24,7 @@ import (
 )
 
 // maxHamming is the grouping radius the checks use. It is wider than the CLI
-// default (6) so quality re-encodings of the same picture always chain,
+// default (12) so quality re-encodings of the same picture always chain,
 // which is what the checks want to exercise.
 const maxHamming = 16
 

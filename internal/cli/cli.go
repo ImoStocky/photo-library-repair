@@ -131,7 +131,7 @@ func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB 
 
 func runGroup(args []string) int {
 	fs := flag.NewFlagSet("group", flag.ExitOnError)
-	maxHamming := fs.Int("max-hamming", 6, "maximum perceptual-hash hamming distance to chain images into one group")
+	maxHamming := fs.Int("max-hamming", 12, "maximum perceptual-hash hamming distance to chain images into one group")
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -342,7 +342,7 @@ func runBuild(args []string) int {
 	dirs := multiFlag{}
 	target := fs.String("target", "", "directory that receives the final images (required)")
 	force := fs.Bool("force", false, "re-scan directories that were already scanned")
-	maxHamming := fs.Int("max-hamming", 6, "maximum perceptual-hash hamming distance to chain images into one group")
+	maxHamming := fs.Int("max-hamming", 12, "maximum perceptual-hash hamming distance to chain images into one group")
 	conflictHamming := fs.Int("conflict-hamming", 2, "perceptual hashes within this distance with identical capture times mark the group as a conflict")
 	dryRun := fs.Bool("dry-run", false, "report what would be copied without touching the target")
 	noEXIF := fs.Bool("no-exif", false, "copy files without writing merged EXIF")

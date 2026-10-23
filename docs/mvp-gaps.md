@@ -30,6 +30,6 @@ pipeline (scan → group → plan → apply/amalgamate).
   filesystem-dependent (birth time vs. mtime fallback), so the selftest suite
   exercises only the deterministic conflict kinds (offset disagreement, GPS
   disagreement).
-- Selftest groups with a phash radius of 16 bits (the CLI default is 6) so
+- Selftest groups with a phash radius of 16 bits (the CLI default is 12) so
   quality re-encodings of the same picture always chain; the checks verify
   the resolution rules, not the default radius.

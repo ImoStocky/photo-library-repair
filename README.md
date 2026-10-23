@@ -18,7 +18,7 @@ go build -o plr .
 
 ```text
 plr scan  --dir PHOTO [--dir MORE] [--force] [--db plr.db]
-plr group [--max-hamming 6] [--db plr.db]
+plr group [--max-hamming 12] [--db plr.db]
 plr plan  [--db plr.db]
 plr apply --target RESULT [--dry-run] [--force-conflicts] [--db plr.db]
 
