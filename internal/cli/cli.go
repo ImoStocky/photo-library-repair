@@ -40,6 +40,8 @@ func Run(args []string) int {
 		return runApply(rest)
 	case "build":
 		return runBuild(rest)
+	case "increment":
+		return runIncrement(rest)
 	case "report":
 		return runReport(rest)
 	case "selftest":
@@ -59,6 +61,7 @@ Usage:
   plr plan     [--conflict-hamming N] [--ai] [--model SOURCE] [--db PATH]
   plr apply    --target DIR [--dry-run] [--no-exif] [--force-conflicts] [--db PATH]
   plr build    --dir DIR... --target DIR [scan, group, plan and apply flags]
+  plr increment --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr report   [--db PATH]
   plr selftest
 
@@ -79,6 +82,10 @@ Commands:
             EXIF (capture time, offset, GPS) onto the copies. Conflict
             groups are skipped unless --force-conflicts is given.
   build     scan + group + plan + apply in one go.
+  increment Merge new photos into an existing library: scan the new dirs
+            into the same DB, then re-group (new near-duplicates chain into
+            existing groups under the same --max-hamming radius), re-plan
+            and re-apply. On a fresh DB it degrades to build.
   report    Print a summary of the library, groups and plans.
   selftest  Run built-in parity checks and print PASS/FAIL.
 
@@ -337,8 +344,17 @@ func renamedSuffix(n int) string {
 	return fmt.Sprintf(" (%d renamed)", n)
 }
 
-func runBuild(args []string) int {
-	fs := flag.NewFlagSet("build", flag.ExitOnError)
+func runBuild(args []string) int { return runPipeline("build", args) }
+
+// runIncrement merges new photos into an existing library: scan the new
+// directories into the same DB (upserts keep existing ids), then re-group
+// (new near-duplicates chain into existing groups under the same
+// --max-hamming radius), re-plan and re-apply. On a fresh DB it degrades
+// to build.
+func runIncrement(args []string) int { return runPipeline("increment", args) }
+
+func runPipeline(cmd string, args []string) int {
+	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	dirs := multiFlag{}
 	target := fs.String("target", "", "directory that receives the final images (required)")
 	force := fs.Bool("force", false, "re-scan directories that were already scanned")
@@ -355,13 +371,13 @@ func runBuild(args []string) int {
 		return 2
 	}
 	if len(dirs) == 0 || *target == "" {
-		fmt.Fprintln(os.Stderr, "plr build: --dir and --target are required")
+		fmt.Fprintf(os.Stderr, "plr %s: --dir and --target are required\n", cmd)
 		return 2
 	}
 	_ = conflictHamming // no rule uses it yet; see docs/mvp-gaps.md
 	s, err := store.Open(*db)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "plr build:", err)
+		fmt.Fprintln(os.Stderr, "plr "+cmd+":", err)
 		return 1
 	}
 	defer s.Close()
@@ -384,7 +400,7 @@ func runBuild(args []string) int {
 	for _, p := range phases {
 		fmt.Printf("== %s\n", p.label)
 		if code := p.fn(); code != 0 {
-			fmt.Fprintf(os.Stderr, "plr build: %s phase failed\n", p.label)
+			fmt.Fprintf(os.Stderr, "plr %s: %s phase failed\n", cmd, p.label)
 			return code
 		}
 	}

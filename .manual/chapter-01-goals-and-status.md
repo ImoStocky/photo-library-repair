@@ -19,9 +19,10 @@ model) is not the current target.
 4. **Amalgamate on demand** — copy planned images into a target dir and
    write merged EXIF onto the copies. Sources and the DB stay put.
 5. **Grow the library incrementally** — scan more dirs into the same DB,
-   re-group / re-plan, amalgamate again.
+   re-group / re-plan, amalgamate again (`increment`).
 
 One-shot: `build` = scan → group → plan → amalgamate.
+Incremental: `increment` = the same pipeline into an existing library.
 
 ## Naming: `apply` and `amalgamate`
 
@@ -45,7 +46,7 @@ explicit rename pass.
 ## What exists today (MVP)
 
 ```text
-plr scan | group | plan | apply | build | report | selftest
+plr scan | group | plan | apply | build | increment | report | selftest
 ```
 
 (`apply` ≡ amalgamate; see above.)
@@ -60,7 +61,7 @@ SQLite `plr.db`: `sources` / `images` / `groups`. Local CLI only.
 | Plan / conflicts | `internal/group.ResolveGroup` | Done — rules per phase-5 brief; `Resolver` stub for Kronk |
 | Amalgamate / apply | `internal/apply` | Done — copy + JPEG EXIF; no `--move` |
 | One-shot | `plr build` | Done |
-| Incremental growth | re-`scan` + re-`group`/`plan`/`apply` | Works as bypass; no dedicated `increment` |
+| Incremental growth | `plr increment` | Done — scan + group + plan + apply into the existing DB; S6 partition actions (present/matched/new) remain out of scope |
 | Kronk conflict resolve | `internal/kronk` | Done — opt-in `plr plan --ai` (Kronk decision model); rules remain the default |
 
 ## Related

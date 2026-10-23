@@ -24,6 +24,10 @@ plr apply --target RESULT [--dry-run] [--force-conflicts] [--db plr.db]
 
 # one-shot (scan → group → plan → apply/amalgamate)
 plr build --dir PHOTO --target RESULT
+
+# grow an existing library (scan new dirs into the same DB, then the same pipeline)
+plr increment --dir NEW_PHOTOS --target RESULT --db plr.db
+# ...and --force when new photos land in an already-registered directory
 ```
 
 | Command | Role |
@@ -33,6 +37,7 @@ plr build --dir PHOTO --target RESULT
 | `plan` | Per group: best pixels, earliest capture, GPS; mark conflicts |
 | `apply` | **Amalgamate:** copy planned files to `--target`, write merged EXIF |
 | `build` | Full pipeline in one go |
+| `increment` | Grow an existing library: scan new dirs into the same DB, then re-group / re-plan / re-apply |
 | `report` | Summarize library / groups / plans |
 | `selftest` | Built-in parity checks |
 

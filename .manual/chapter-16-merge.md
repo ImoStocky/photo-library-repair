@@ -17,9 +17,9 @@ Partition incoming connected components against library members:
 
 ## Current state
 
-No `plr increment`. Bypass (lossy): scan new dir into same DB → regroup →
-replan → apply. That does **not** emit present/matched/new actions, name
-collision prefixes, or ambiguity conflicts.
+`plr increment` is the former bypass as a command: scan new dir into same
+DB → regroup → replan → apply. It does **not** emit present/matched/new
+actions, name collision prefixes, or ambiguity conflicts.
 
 ## Match table (distance to any library member)
 

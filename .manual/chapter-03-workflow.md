@@ -13,6 +13,7 @@ plr plan                             # collision resolution → groups plan
 plr apply --target RESULT            # amalgamate: copy + write EXIF
 # or one-shot:
 plr build --dir PHOTOS --target RESULT
+plr increment --dir NEW_PHOTOS --target RESULT   # grow an existing library
 ```
 
 `apply` and **amalgamate** mean the same step (CLI name stays `apply`).
@@ -63,9 +64,10 @@ resolution wins pixels; capture/GPS/camera rules pick time/position/tags;
 other tags fill gaps. Exact copies dropped at ingest; near-copies join an
 existing picture.
 
-**MVP today:** no `increment`. Bypass: `plr scan --dir NEW` into same DB,
-then `group` / `plan` / `apply` (loses present/matched/new actions and
-true library-vs-inbox partition).
+**MVP today:** `plr increment` is the bypass as a command: `plr scan --dir NEW`
+into same DB, then `group` / `plan` / `apply` in one go (loses
+present/matched/new actions and true library-vs-inbox partition). New
+photos that land in an already-registered directory need `--force`.
 
 ## Rebuild-from-backups
 

@@ -12,7 +12,7 @@ pipeline (scan → group → plan → apply/amalgamate).
 
 | # | Missing feature | Status | Bypass |
 |---|-----------------|--------|--------|
-| 1 | `increment` command (merge new photos into an existing library) | Not implemented | Scan the new directory into the same `--db`: `plr scan --dir NEW --db plr.db` (upserts keep existing ids and group assignments), then re-run `plr group`, `plr plan`, `plr apply`. New near-duplicates chain into existing groups through the same phash radius. |
+| 1 | S6 partition in `increment` (present/matched/new actions, name-collision prefixes, ambiguity conflicts) | Not implemented | `plr increment` (scan → group → plan → apply into the same DB) is the command form of the old bypass: new near-duplicates chain into existing groups through the same phash radius. The lossy part is exactly the missing S6 partition, specified in [chapter 16](../.manual/chapter-16-merge.md). |
 | 2 | Commit model: atomic snapshot, commit log, rollback | Not implemented | Copy the database before a risky phase: `cp plr.db plr.db.bak`. Plans live in the `groups` table; dropping the backup and re-running `plr plan` recovers. |
 | 3 | `--move` for apply | Not implemented | Copy is the safe default. If a move is wanted, delete the source file manually after applying; the plan records which source file provided each stored image (`plr report`). |
 | 4 | `report.json` written into the result directory | Not implemented | `plr report` prints the equivalent summary (sources, images, per-group plans, conflicts). |
