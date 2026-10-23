@@ -59,15 +59,20 @@ type Image struct {
 	Width       int
 	Height      int
 	Size        int64
+	Kind        string // jpeg|png|gif|webp|tiff|heic
 	HasGPS      bool
 	GPSLat      float64
 	GPSLon      float64
 }
 
+// Rules is the ResolvedBy value for plans settled by the automatic rules.
+const Rules = "rules"
+
 // Plan is the outcome of resolving one group.
 type Plan struct {
 	Status          string // StatusResolved | StatusConflict | StatusSingleton
 	Reason          string
+	ResolvedBy      string // Rules, or the name of the resolver that settled a conflict
 	PixelImageID    string
 	PixelPhash      string // the selected pixel file's own hash, kept as-is
 	CaptureImageID  string
@@ -93,10 +98,11 @@ type Decision struct {
 	StoredName     string
 }
 
-// Resolver settles a conflict the automatic rules cannot. Phase 5 ships
-// no implementation; passing nil to ResolveGroup leaves conflicts in
-// StatusConflict for later review.
+// Resolver settles a conflict the automatic rules cannot. Passing nil to
+// ResolveGroup leaves conflicts in StatusConflict for later review.
 type Resolver interface {
+	// Name identifies the resolver; it marks the groups it settles.
+	Name() string
 	Resolve(c Conflict) (Decision, error)
 }
 
@@ -111,8 +117,7 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 	for i := range parent {
 		parent[i] = i
 	}
-	var find func(int) int
-	find = func(x int) int {
+	find := func(x int) int {
 		for parent[x] != x {
 			parent[x] = parent[parent[x]]
 			x = parent[x]
@@ -131,7 +136,7 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 		h, _ := phash.HashFromHex(im.Phash) // "" fails; hash stays zero
 		hashes = append(hashes, h)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		for j := i + 1; j < n; j++ {
 			if imgs[i].SHA256 != "" && imgs[i].SHA256 == imgs[j].SHA256 {
 				union(i, j)
@@ -149,7 +154,7 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 	}
 
 	firstSeen := map[int]int{} // root -> index of first member
-	for i := 0; i < n; i++ {
+	for i := range n {
 		r := find(i)
 		if _, ok := firstSeen[r]; !ok {
 			firstSeen[r] = i
@@ -170,7 +175,7 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 	groups := make([][]Image, 0, len(roots))
 	for gid, r := range roots {
 		members := []Image{}
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if find(i) == r {
 				members = append(members, imgs[i])
 				assign[imgs[i].ID] = int64(gid + 1)
@@ -191,6 +196,7 @@ func ResolveGroup(imgs []Image, res Resolver) Plan {
 		im := imgs[0]
 		return Plan{
 			Status:          StatusSingleton,
+			ResolvedBy:      Rules,
 			PixelImageID:    im.ID,
 			PixelPhash:      im.Phash,
 			CaptureImageID:  im.ID,
@@ -240,6 +246,7 @@ func ResolveGroup(imgs []Image, res Resolver) Plan {
 	plan := Plan{
 		Status:          StatusResolved,
 		Reason:          reason,
+		ResolvedBy:      Rules,
 		PixelImageID:    bestPixels(imgs).ID,
 		CaptureImageID:  imgs[captureIdx].ID,
 		CaptureFallback: fallback,
@@ -270,6 +277,7 @@ func ResolveGroup(imgs []Image, res Resolver) Plan {
 	}
 	plan.Status = StatusResolved
 	plan.Reason = "conflict settled by resolver: " + conflictReason
+	plan.ResolvedBy = res.Name()
 	plan.PixelImageID = d.PixelImageID
 	plan.CaptureImageID = d.CaptureImageID
 	plan.StoredName = d.StoredName

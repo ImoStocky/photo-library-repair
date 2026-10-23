@@ -2,6 +2,7 @@
 package cli
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"photo-library-repair/internal/fingerprint"
 	"photo-library-repair/internal/group"
 	"photo-library-repair/internal/ingest"
+	kronkai "photo-library-repair/internal/kronk"
 	"photo-library-repair/internal/selftest"
 	"photo-library-repair/internal/store"
 )
@@ -54,7 +56,7 @@ const usageText = `plr - photo library repair
 Usage:
   plr scan     --dir DIR... [--force] [--db PATH] [--workers N] [--min-size-kb N]
   plr group    [--max-hamming N] [--db PATH]
-  plr plan     [--conflict-hamming N] [--db PATH]
+  plr plan     [--conflict-hamming N] [--ai] [--model SOURCE] [--db PATH]
   plr apply    --target DIR [--dry-run] [--no-exif] [--force-conflicts] [--db PATH]
   plr build    --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr report   [--db PATH]
@@ -70,8 +72,9 @@ Commands:
   plan      Resolve every group: earliest EXIF capture time (timezone
             aware; file creation time never overrides EXIF), best quality
             pixels, GPS. Groups with near-identical pictures and identical
-            capture times are marked as conflicts for later human/model
-            review.
+            capture times are marked as conflicts. With --ai the Kronk
+            decision model settles conflict groups and marks them
+            resolved_by the model id.
   apply     Copy the planned pixel files into --target and write the merged
             EXIF (capture time, offset, GPS) onto the copies. Conflict
             groups are skipped unless --force-conflicts is given.
@@ -171,6 +174,8 @@ func runGroupPhase(s *store.Store, maxHamming int) int {
 func runPlan(args []string) int {
 	fs := flag.NewFlagSet("plan", flag.ExitOnError)
 	conflictHamming := fs.Int("conflict-hamming", 2, "perceptual hashes within this distance with identical capture times mark the group as a conflict")
+	ai := fs.Bool("ai", false, "settle conflict groups with the Kronk decision model")
+	modelSource := fs.String("model", kronkai.DefaultModel, "Kronk decision model source for --ai")
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -182,11 +187,22 @@ func runPlan(args []string) int {
 		return 1
 	}
 	defer s.Close()
-	return runPlanPhase(s)
+	var res group.Resolver
+	if *ai {
+		var close func()
+		res, close, err = kronkai.New(context.Background(), *modelSource)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "plr plan:", err)
+			return 1
+		}
+		defer close()
+		fmt.Printf("decision model %s loaded; settling conflicts\n", res.Name())
+	}
+	return runPlanPhase(s, res)
 }
 
 // runPlanPhase is the plan step, shared by "plr plan" and "plr build".
-func runPlanPhase(s *store.Store) int {
+func runPlanPhase(s *store.Store, res group.Resolver) int {
 	imgs, err := s.AllImages()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr plan:", err)
@@ -214,12 +230,17 @@ func runPlanPhase(s *store.Store) int {
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
+	aiSettled := 0
 	for _, id := range ids {
-		p := group.ResolveGroup(byGroup[id], nil)
+		p := group.ResolveGroup(byGroup[id], res)
+		if p.ResolvedBy != group.Rules {
+			aiSettled++
+		}
 		g := store.Group{
 			ID:              id,
 			Status:          p.Status,
 			Reason:          p.Reason,
+			ResolvedBy:      p.ResolvedBy,
 			PixelImageID:    p.PixelImageID,
 			PixelPhash:      p.PixelPhash,
 			CaptureImageID:  p.CaptureImageID,
@@ -239,6 +260,9 @@ func runPlanPhase(s *store.Store) int {
 	}
 	fmt.Printf("%d groups: %d resolved, %d conflicts, %d singletons\n",
 		len(ids), counts[group.StatusResolved], counts[group.StatusConflict], counts[group.StatusSingleton])
+	if res != nil {
+		fmt.Printf("%d conflict group(s) settled by %s\n", aiSettled, res.Name())
+	}
 	return 0
 }
 
@@ -340,7 +364,7 @@ func runBuild(args []string) int {
 	}{
 		{"scan", func() int { return runScanPhase(s, dirs, *force, *workers, *minSizeKB) }},
 		{"group", func() int { return runGroupPhase(s, *maxHamming) }},
-		{"plan", func() int { return runPlanPhase(s) }},
+		{"plan", func() int { return runPlanPhase(s, nil) }},
 		{"apply", func() int {
 			return runApplyPhase(s, apply.Options{
 				Target:         *target,
@@ -491,6 +515,7 @@ func toGroupImage(im store.Image) group.Image {
 		Width:       im.Width,
 		Height:      im.Height,
 		Size:        im.Size,
+		Kind:        im.Kind,
 		HasGPS:      im.HasGPS,
 		GPSLat:      im.GPSLat,
 		GPSLon:      im.GPSLon,
