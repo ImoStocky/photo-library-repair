@@ -107,6 +107,40 @@ CREATE TABLE IF NOT EXISTS groups (
   has_gps INTEGER NOT NULL DEFAULT 0,
   stored_name TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS commits (
+  id INTEGER PRIMARY KEY,
+  at INTEGER NOT NULL,
+  summary TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS commit_groups (
+  commit_id INTEGER NOT NULL REFERENCES commits(id),
+  group_id INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  resolved_by TEXT NOT NULL DEFAULT 'rules',
+  pixel_image_id TEXT NOT NULL DEFAULT '',
+  pixel_phash TEXT NOT NULL DEFAULT '',
+  capture_image_id TEXT NOT NULL DEFAULT '',
+  capture_time TEXT NOT NULL DEFAULT '',
+  capture_instant INTEGER NOT NULL DEFAULT 0,
+  capture_fallback INTEGER NOT NULL DEFAULT 0,
+  gps_lat REAL NOT NULL DEFAULT 0,
+  gps_lon REAL NOT NULL DEFAULT 0,
+  has_gps INTEGER NOT NULL DEFAULT 0,
+  stored_name TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (commit_id, group_id)
+);
+
+CREATE TABLE IF NOT EXISTS commit_actions (
+  commit_id INTEGER NOT NULL REFERENCES commits(id),
+  group_id INTEGER NOT NULL,
+  action TEXT NOT NULL,
+  prev_stored_name TEXT NOT NULL DEFAULT '',
+  new_stored_name TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_commit_actions_commit ON commit_actions(commit_id);
 `
 
 // Open opens (creating if needed) the SQLite library at path.

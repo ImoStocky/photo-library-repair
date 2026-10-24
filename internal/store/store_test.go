@@ -130,3 +130,130 @@ func TestImageUpsertAndGroups(t *testing.T) {
 		t.Fatalf("after ClearGroups: group_id=%d groups=%d", images[0].GroupID, len(groups))
 	}
 }
+
+func TestCommitAndRollback(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	id, err := s.AddSource("/photos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := Image{ID: "1-000001", SourceID: id, RelPath: "a.jpg", Name: "a.jpg", SHA256: "aa"}
+	b := Image{ID: "1-000002", SourceID: id, RelPath: "b.jpg", Name: "b.jpg", SHA256: "bb"}
+	for _, img := range []Image{a, b} {
+		if _, _, err := s.UpsertImage(img); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	g1 := Group{ID: 1, Status: "resolved", PixelImageID: a.ID, StoredName: "a.jpg"}
+	g2 := Group{ID: 2, Status: "conflict", Reason: "offset", StoredName: "b.jpg"}
+	for _, g := range []Group{g1, g2} {
+		if err := s.SaveGroup(g); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// First commit: both groups are new.
+	res, err := s.Commit("baseline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Commit.ID != 1 || len(res.Actions) != 2 {
+		t.Fatalf("first commit = %+v actions %+v", res.Commit, res.Actions)
+	}
+	if res.Actions[0].Action != ActionNew || res.Actions[1].Action != ActionNew {
+		t.Fatalf("actions = %+v, want both new", res.Actions)
+	}
+
+	// Renaming g2's plan shows up as one updated action.
+	g2.StoredName = "b2.jpg"
+	if err := s.SaveGroup(g2); err != nil {
+		t.Fatal(err)
+	}
+	res, err = s.Commit("rename")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Commit.ID != 2 || len(res.Actions) != 1 ||
+		res.Actions[0].Action != ActionUpdated ||
+		res.Actions[0].GroupID != 2 ||
+		res.Actions[0].PrevName != "b.jpg" || res.Actions[0].NewName != "b2.jpg" {
+		t.Fatalf("second commit = %+v actions %+v", res.Commit, res.Actions)
+	}
+
+	// Dropping g2 (a re-plan that no longer produces it) shows a removal.
+	if err := s.ClearGroups(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveGroup(g1); err != nil {
+		t.Fatal(err)
+	}
+	res, err = s.Commit("shrink")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Actions) != 1 || res.Actions[0].Action != ActionRemoved || res.Actions[0].GroupID != 2 {
+		t.Fatalf("third commit actions = %+v, want g2 removed", res.Actions)
+	}
+
+	// Dangling assignments: a -> 1 (survives the baseline), b -> 9 (does
+	// not). Rolling back to commit 1 restores g2, keeps a's assignment and
+	// zeros b's.
+	if err := s.SetGroupAssignments(map[string]int64{a.ID: 1, b.ID: 9}); err != nil {
+		t.Fatal(err)
+	}
+	res, err = s.Rollback(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Commit.ID != 4 || res.Commit.Summary != "rollback to commit 1" {
+		t.Fatalf("rollback commit = %+v", res.Commit)
+	}
+	if len(res.Actions) != 1 || res.Actions[0].Action != ActionNew || res.Actions[0].GroupID != 2 {
+		t.Fatalf("rollback actions = %+v, want g2 new", res.Actions)
+	}
+	groups, err := s.AllGroups()
+	if err != nil || len(groups) != 2 {
+		t.Fatalf("AllGroups = (%+v, %v), want the two baseline groups", groups, err)
+	}
+	byID := map[int64]Group{}
+	for _, g := range groups {
+		byID[g.ID] = g
+	}
+	if byID[2].Status != "conflict" || byID[2].StoredName != "b.jpg" {
+		t.Fatalf("restored g2 = %+v", byID[2])
+	}
+	images, err := s.AllImages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, img := range images {
+		switch img.ID {
+		case a.ID:
+			if img.GroupID != 1 {
+				t.Fatalf("a.group_id = %d, want 1 (group 1 survives)", img.GroupID)
+			}
+		case b.ID:
+			if img.GroupID != 0 {
+				t.Fatalf("b.group_id = %d, want 0 (group 9 does not survive)", img.GroupID)
+			}
+		}
+	}
+
+	if _, err := s.Rollback(99); err == nil {
+		t.Fatal("Rollback(99) must fail for a missing commit")
+	}
+	actions, err := s.CommitActions(2)
+	if err != nil || len(actions) != 1 || actions[0].Action != ActionUpdated {
+		t.Fatalf("CommitActions(2) = (%+v, %v)", actions, err)
+	}
+	commits, err := s.Commits()
+	if err != nil || len(commits) != 4 {
+		t.Fatalf("Commits = (%+v, %v), want 4 entries", commits, err)
+	}
+}

@@ -3,7 +3,7 @@
 **Read when:** changing SQLite schema, commit/rollback, or library entities.
 
 **Design sections:** entities, commit model, schema (draft §5).
-**Status:** Partial — index exists; commit model missing.
+**Status:** Current schema fully implemented, including the commit model (commit log + rollback).
 
 ## Responsibility
 
@@ -60,15 +60,30 @@ CREATE TABLE phash_cache    (path, size, mtime_ns, hash, width, height,
 sources(id, path UNIQUE, added_at)
 images(id TEXT PK, source_id, rel_path, name, sha256, phash,
        created_at, exif_capture, exif_offset, width, height, kind, size,
-       gps_*, has_gps, group_id)
+       mtime, gps_*, has_gps, group_id)
 groups(id, status, reason, pixel_image_id, pixel_phash,
        capture_*, gps_*, stored_name, resolved_by)
+commits(id, at, summary)
+commit_groups(commit_id, group_id, ...full groups row...,
+              PRIMARY KEY(commit_id, group_id))
+commit_actions(commit_id, group_id, action, prev_stored_name,
+               new_stored_name)
 ```
 
-No `commits`, `picture_members`, `phash_cache`, source `kind`/`label`.
-Plan fields live on `groups`. IDs are time-based strings (`NewID`).
+No `picture_members`, no source `kind`/`label`; the phash cache is the
+`images` columns (`mtime` plus the stored fingerprint). Plan fields live on
+`groups`. IDs are time-based strings (`NewID`).
 
-**MVP workaround:** `cp plr.db plr.db.bak` before risky phases.
+**Commit model (current schema, `internal/store/commit.go`):**
+`Commit(summary)` snapshots the whole `groups` table into `commit_groups`,
+records the commit row and the per-group diff (`new|updated|removed` versus
+the previous commit) in `commit_actions`, all in one transaction.
+`Rollback(id)` restores the `groups` rows of that snapshot, zeroes image
+group assignments that point at groups the restore drops, and records the
+restore itself as a new commit (`rollback to commit N`) so the log stays
+append-only. `build` and `increment` commit automatically after the plan
+phase; `plr commit` and `plr rollback` are the manual commands. Scanned
+images are never touched.
 
 ## Pseudocode (target Commit)
 

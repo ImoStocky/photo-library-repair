@@ -51,6 +51,7 @@ func Run() []Check {
 		checkApply(),
 		checkStoreUpsert(),
 		checkEXIFEngine(),
+		checkCommitRollback(),
 	}
 }
 
@@ -636,6 +637,100 @@ func mustRead(path string) []byte {
 		panic(err) // the file was created moments before
 	}
 	return data
+}
+
+// checkCommitRollback verifies the commit model: each commit snapshots the
+// plan table together with a per-group diff, and a rollback restores an
+// earlier snapshot (recorded as a new commit) while scanned images stay
+// untouched.
+func checkCommitRollback() Check {
+	const name = "store: commit log records plan diffs, rollback restores an earlier commit"
+	e, err := newEnv()
+	if err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	defer e.close()
+
+	files := map[string][]byte{
+		"IMG_A1.jpg": exifJPEG(4, 95, "2024:05:01 12:30:00", "+02:00", true),
+		"IMG_A2.jpg": exifJPEG(4, 90, "2024:05:01 12:35:00", "+02:00", true),
+		"IMG_B1.jpg": exifJPEG(5, 95, "2024:05:01 12:30:00", "+02:00", false),
+		"IMG_B2.jpg": exifJPEG(5, 90, "2024:05:01 12:30:00", "+05:00", false),
+	}
+	for rel, data := range files {
+		if err := e.write(rel, data); err != nil {
+			return Check{Name: name, Detail: fmt.Sprintf("write %s: %v", rel, err)}
+		}
+	}
+	if _, err := e.scan(); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("scan: %v", err)}
+	}
+	plans, _, err := e.groupPlan()
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("group/plan: %v", err)}
+	}
+	if len(plans) != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("%d groups (want 2)", len(plans))}
+	}
+	baseline := map[int64]store.Group{}
+	for _, p := range plans {
+		baseline[p.ID] = p
+	}
+
+	// First commit: both groups are new.
+	res, err := e.s.Commit("baseline")
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("commit: %v", err)}
+	}
+	if res.Commit.ID != 1 || len(res.Actions) != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("first commit = %+v (%d actions, want 2 new)", res.Commit, len(res.Actions))}
+	}
+
+	// Mutate the conflict group and commit: exactly one updated action.
+	for _, p := range plans {
+		if p.Status == group.StatusConflict {
+			p.Status = group.StatusResolved
+			if err := e.s.SaveGroup(p); err != nil {
+				return Check{Name: name, Detail: err.Error()}
+			}
+		}
+	}
+	res, err = e.s.Commit("settle")
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("commit: %v", err)}
+	}
+	if res.Commit.ID != 2 || len(res.Actions) != 1 || res.Actions[0].Action != store.ActionUpdated {
+		return Check{Name: name, Detail: fmt.Sprintf("second commit = %+v actions %+v (want one updated)", res.Commit, res.Actions)}
+	}
+
+	// Roll back to the baseline: the restore is recorded as commit 3 and the
+	// plans are back to the baseline rows.
+	res, err = e.s.Rollback(1)
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("rollback: %v", err)}
+	}
+	if res.Commit.ID != 3 || res.Commit.Summary != "rollback to commit 1" {
+		return Check{Name: name, Detail: fmt.Sprintf("rollback commit = %+v", res.Commit)}
+	}
+	groups, err := e.s.AllGroups()
+	if err != nil || len(groups) != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("groups after rollback = (%d, %v), want the 2 baseline plans", len(groups), err)}
+	}
+	for _, g := range groups {
+		if want, ok := baseline[g.ID]; !ok || g != want {
+			return Check{Name: name, Detail: fmt.Sprintf("group %d after rollback = %+v (want %+v)", g.ID, g, want)}
+		}
+	}
+	// Scanned images are untouched by the rollback.
+	images, err := e.s.AllImages()
+	if err != nil || len(images) != 4 {
+		return Check{Name: name, Detail: fmt.Sprintf("images after rollback = (%d, %v), want 4", len(images), err)}
+	}
+	commits, err := e.s.Commits()
+	if err != nil || len(commits) != 3 {
+		return Check{Name: name, Detail: fmt.Sprintf("commits = (%d, %v), want 3", len(commits), err)}
+	}
+	return Check{Name: name, OK: true}
 }
 
 // checkStoreUpsert verifies that re-scanning the same file keeps the image

@@ -9,6 +9,7 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"time"
 
 	"photo-library-repair/internal/apply"
 	"photo-library-repair/internal/exif"
@@ -43,6 +44,10 @@ func Run(args []string) int {
 		return runBuild(rest)
 	case "increment":
 		return runIncrement(rest)
+	case "commit":
+		return runCommit(rest)
+	case "rollback":
+		return runRollback(rest)
 	case "report":
 		return runReport(rest)
 	case "selftest":
@@ -63,6 +68,8 @@ Usage:
   plr apply    --target DIR [--dry-run] [--no-exif] [--move] [--force-conflicts] [--db PATH]
   plr build    --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr increment --dir DIR... --target DIR [scan, group, plan and apply flags]
+  plr commit   [--message TEXT] [--db PATH]
+  plr rollback [--to COMMIT_ID] [--db PATH]
   plr report   [--db PATH]
   plr selftest
 
@@ -89,7 +96,15 @@ Commands:
             into the same DB, then re-group (new near-duplicates chain into
             existing groups under the same --max-hamming radius), re-plan
             and re-apply. On a fresh DB it degrades to build.
-  report    Print a summary of the library, groups and plans.
+  commit    Snapshot the current plan table into the commit log with a
+            summary and print the per-group diff (new, updated, removed)
+            versus the previous commit. build and increment run this
+            automatically after the plan phase.
+  rollback  Restore the plan table to an earlier commit (default: the
+            latest) and record the restore as a new commit. Scanned images
+            are untouched; image group assignments that point at groups the
+            restore drops are zeroed.
+  report    Print a summary of the library, groups, plans and commit log.
   selftest  Run built-in parity checks and print PASS/FAIL.
 
 The library is a SQLite database (default: plr.db in the working directory).
@@ -428,6 +443,7 @@ func runPipeline(cmd string, args []string) int {
 		{"scan", func() int { return runScanPhase(s, dirs, *force, *workers, *minSizeKB, tool) }},
 		{"group", func() int { return runGroupPhase(s, *maxHamming) }},
 		{"plan", func() int { return runPlanPhase(s, nil, *conflictHamming) }},
+		{"commit", func() int { return runCommitPhase(s, cmd) }},
 		{"apply", func() int {
 			return runApplyPhase(s, apply.Options{
 				Target:         *target,
@@ -447,6 +463,90 @@ func runPipeline(cmd string, args []string) int {
 		}
 	}
 	return 0
+}
+
+func runCommit(args []string) int {
+	fs := flag.NewFlagSet("commit", flag.ExitOnError)
+	message := fs.String("message", "plan", "commit summary")
+	db := fs.String("db", "plr.db", "path to the SQLite library")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	s, err := store.Open(*db)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr commit:", err)
+		return 1
+	}
+	defer s.Close()
+	return runCommitPhase(s, *message)
+}
+
+// runCommitPhase snapshots the current plans as a commit and prints the
+// diff; build and increment use it after the plan phase.
+func runCommitPhase(s *store.Store, message string) int {
+	res, err := s.Commit(message)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr commit:", err)
+		return 1
+	}
+	printCommit(res)
+	return 0
+}
+
+func runRollback(args []string) int {
+	fs := flag.NewFlagSet("rollback", flag.ExitOnError)
+	to := fs.Int64("to", 0, "commit id to restore (default: the latest commit)")
+	db := fs.String("db", "plr.db", "path to the SQLite library")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	s, err := store.Open(*db)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr rollback:", err)
+		return 1
+	}
+	defer s.Close()
+	target := *to
+	if target == 0 {
+		commits, err := s.Commits()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "plr rollback:", err)
+			return 1
+		}
+		if len(commits) == 0 {
+			fmt.Fprintln(os.Stderr, "plr rollback: the commit log is empty; nothing to roll back to")
+			return 1
+		}
+		target = commits[len(commits)-1].ID
+	}
+	res, err := s.Rollback(target)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr rollback:", err)
+		return 1
+	}
+	printCommit(res)
+	return 0
+}
+
+// printCommit prints a commit id, summary, and one line per group action.
+func printCommit(res store.CommitResult) {
+	counts := map[string]int{}
+	for _, a := range res.Actions {
+		counts[a.Action]++
+	}
+	fmt.Printf("commit %d %q: %d new, %d updated, %d removed\n",
+		res.Commit.ID, res.Commit.Summary,
+		counts[store.ActionNew], counts[store.ActionUpdated], counts[store.ActionRemoved])
+	for _, a := range res.Actions {
+		switch a.Action {
+		case store.ActionNew:
+			fmt.Printf("  group %d: new %q\n", a.GroupID, a.NewName)
+		case store.ActionRemoved:
+			fmt.Printf("  group %d: removed %q\n", a.GroupID, a.PrevName)
+		default:
+			fmt.Printf("  group %d: updated %q -> %q\n", a.GroupID, a.PrevName, a.NewName)
+		}
+	}
 }
 
 func runReport(args []string) int {
@@ -533,6 +633,33 @@ func runReport(args []string) int {
 		fmt.Println("\nconflicts:")
 		for _, g := range conflicts {
 			fmt.Printf("  #%d %s\n", g.ID, g.Reason)
+		}
+	}
+
+	commits, err := s.Commits()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr report:", err)
+		return 1
+	}
+	if len(commits) > 0 {
+		start := max(len(commits)-5, 0)
+		fmt.Println("\ncommits:")
+		for _, c := range commits[start:] {
+			actions, err := s.CommitActions(c.ID)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "plr report:", err)
+				return 1
+			}
+			actionCounts := map[string]int{}
+			for _, a := range actions {
+				actionCounts[a.Action]++
+			}
+			fmt.Printf("  #%d %s %q (%d new, %d updated, %d removed)\n",
+				c.ID, time.Unix(c.At, 0).Format("2006-01-02 15:04:05"), c.Summary,
+				actionCounts[store.ActionNew], actionCounts[store.ActionUpdated], actionCounts[store.ActionRemoved])
+		}
+		if start > 0 {
+			fmt.Printf("  ... %d older commit(s)\n", start)
 		}
 	}
 	return 0

@@ -33,15 +33,19 @@ Apply/amalgamate()      -> materialize into RESULT/
 ```
 
 **MVP today:** `plr build` or `scan` → `group` → `plan` → `apply`. No
-RegisterSource kinds, no Commit barrier.
+RegisterSource kinds. `build` and `increment` commit the plan automatically
+after the plan phase; `plr commit` / `plr rollback` are the manual commands.
 
 ## Phase 2 — Commit
 
 Commit is the barrier between “planned” and “library”. Nothing in `RESULT/`
 changes until apply/amalgamate, which only realizes a **committed** plan.
 
-**MVP today:** plan rows live in `groups`; no commit table. Workaround:
-`cp plr.db plr.db.bak` before risky phases.
+**MVP today:** plan rows live in `groups`; `plr commit` (and the automatic
+commit after the plan phase in `build`/`increment`) snapshots them into
+`commits` / `commit_groups` / `commit_actions` in one transaction, and
+`plr rollback [--to N]` restores an earlier snapshot, recorded as a new
+commit. Apply runs against the current plan rows in `groups`.
 
 ## Phase 3 — Merge external / backup directories
 
