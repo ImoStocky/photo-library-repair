@@ -1,6 +1,6 @@
-// Package apply copies the planned pixel files of every group into a target
-// directory and writes the merged EXIF (capture time, offset, GPS) onto the
-// JPEG copies.
+// Package apply copies (or moves, with Options.Move) the planned pixel
+// files of every group into a target directory and writes the merged EXIF
+// (capture time, offset, GPS) onto the copies.
 //
 // It is the write-out half of the pipeline: scan/group/plan decide what the
 // repaired library looks like, apply materializes it. Conflict groups are
@@ -29,6 +29,7 @@ type Options struct {
 	DryRun         bool       // report what would be done without touching the target
 	NoEXIF         bool       // copy files without writing merged EXIF
 	ForceConflicts bool       // apply conflict groups using their best-effort plan
+	Move           bool       // delete the source file once its copy is in place
 	EXIF           *exif.Tool // full-data engine; nil uses the built-in writer
 }
 
@@ -38,6 +39,7 @@ type FileResult struct {
 	Dest    string // destination path in the target
 	Renamed bool   // the stored name collided and was adjusted
 	EXIF    bool   // merged EXIF will be (was) written
+	Moved   bool   // move mode: the source file was deleted
 }
 
 // Report summarizes an apply run.
@@ -45,15 +47,17 @@ type Report struct {
 	DryRun  bool
 	Files   []FileResult
 	Copied  int
+	Moved   int // move mode: files whose source was deleted
 	Renamed int
 	Skipped int // conflict groups left alone because not forced
 	Errors  []string
 }
 
 // Apply materializes the library's plans into opts.Target. It reads the
-// store only; the database is not modified. A non-nil error is returned for
-// fatal setup problems (unreadable library, uncreatable target); per-file
-// problems are accumulated in Report.Errors.
+// store only; the database is not modified. In move mode the pixel file of
+// each successfully placed group is deleted from the source directory. A
+// non-nil error is returned for fatal setup problems (unreadable library,
+// uncreatable target); per-file problems are accumulated in Report.Errors.
 func Apply(s *store.Store, opts Options) (Report, error) {
 	var rep Report
 	rep.DryRun = opts.DryRun
@@ -148,7 +152,19 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 			rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: %v", g.ID, err))
 			continue
 		}
-		rep.Files = append(rep.Files, FileResult{Source: srcPath, Dest: destPath, Renamed: name != g.StoredName, EXIF: writeEXIF})
+		fr := FileResult{Source: srcPath, Dest: destPath, Renamed: name != g.StoredName, EXIF: writeEXIF}
+		// Move mode: the destination is fully in place, so the source can
+		// go. If the removal fails, both files remain — the data is safe
+		// and the error is reported.
+		if opts.Move && !sameFile(srcPath, destPath) {
+			if err := os.Remove(srcPath); err != nil {
+				rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: remove source after move: %v", g.ID, err))
+			} else {
+				fr.Moved = true
+				rep.Moved++
+			}
+		}
+		rep.Files = append(rep.Files, fr)
 		rep.Copied++
 		if name != g.StoredName {
 			rep.Renamed++
@@ -200,6 +216,22 @@ func place(src, dest string, writeEXIF bool, facts exifwrite.Facts, tool *exif.T
 		return err
 	}
 	return nil
+}
+
+// sameFile reports whether a and b refer to the same file (symlinks
+// resolved). Move mode uses it as a safety net: a true dest == src must
+// never be followed by a source deletion. Today the name-collision logic
+// already renames in that case, so the guard is defensive.
+func sameFile(a, b string) bool {
+	fi, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	fj, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(fi, fj)
 }
 
 func copyFile(src, dest string) error {

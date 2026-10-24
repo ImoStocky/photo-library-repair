@@ -386,7 +386,7 @@ func checkConflicts() Check {
 // merged EXIF, leaves conflict groups alone, honors --dry-run, applies
 // conflicts when forced, and renames stored names that already exist.
 func checkApply() Check {
-	const name = "apply: writes merged EXIF, skips conflicts, honors dry-run, renames collisions"
+	const name = "apply: writes merged EXIF, skips conflicts, honors dry-run, moves sources, renames collisions"
 	e, err := newEnv()
 	if err != nil {
 		return Check{Name: name, Detail: err.Error()}
@@ -483,6 +483,82 @@ func checkApply() Check {
 	}
 	if _, err := os.Stat(filepath.Join(collideTarget, want)); err != nil {
 		return Check{Name: name, Detail: fmt.Sprintf("renamed output missing: %v", err)}
+	}
+
+	moveTarget := filepath.Join(target, "moved")
+	rep, err = apply.Apply(e.s, apply.Options{Target: moveTarget, Move: true})
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("move: %v", err)}
+	}
+	if len(rep.Errors) != 0 {
+		return Check{Name: name, Detail: fmt.Sprintf("move errors: %v", rep.Errors)}
+	}
+	if rep.Copied != 1 || rep.Moved != 1 {
+		return Check{Name: name, Detail: fmt.Sprintf("move copied=%d moved=%d (want 1/1)", rep.Copied, rep.Moved)}
+	}
+	if _, err := os.Stat(filepath.Join(moveTarget, resolved.StoredName)); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("moved output missing: %v", err)}
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, "IMG_A1.jpg")); !os.IsNotExist(err) {
+		return Check{Name: name, Detail: "move mode kept the source file"}
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, "IMG_B1.jpg")); err != nil {
+		return Check{Name: name, Detail: "move mode touched a skipped conflict group"}
+	}
+
+	moveDryTarget := filepath.Join(target, "moved-dry")
+	rep, err = apply.Apply(e.s, apply.Options{Target: moveDryTarget, DryRun: true, Move: true})
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("dry-run move: %v", err)}
+	}
+	if rep.Copied != 1 || rep.Moved != 0 {
+		return Check{Name: name, Detail: fmt.Sprintf("dry-run move copied=%d moved=%d (want 1/0)", rep.Copied, rep.Moved)}
+	}
+	if _, err := os.Stat(moveDryTarget); !os.IsNotExist(err) {
+		return Check{Name: name, Detail: "dry-run move created the target directory"}
+	}
+	if _, err := os.Stat(filepath.Join(e.dir, "IMG_A2.jpg")); err != nil {
+		return Check{Name: name, Detail: "dry-run move deleted a source file"}
+	}
+
+	// Moving into the source directory: the existing file occupies its own
+	// name, so the copy is renamed in place and the original removed — no
+	// data loss. (The sameFile guard keeps a true dest == src rewrite safe
+	// should the collision logic ever change.)
+	same, err := newEnv()
+	if err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	defer same.close()
+	if err := same.write("solo.jpg", exifJPEG(6, 95, "2024:05:01 12:30:00", "+02:00", true)); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("write solo: %v", err)}
+	}
+	if _, err := same.scan(); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("same scan: %v", err)}
+	}
+	samePlans, _, err := same.groupPlan()
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("same group/plan: %v", err)}
+	}
+	if len(samePlans) != 1 {
+		return Check{Name: name, Detail: fmt.Sprintf("want 1 group, got %d", len(samePlans))}
+	}
+	rep, err = apply.Apply(same.s, apply.Options{Target: same.dir, Move: true})
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("same-file move: %v", err)}
+	}
+	if len(rep.Errors) != 0 {
+		return Check{Name: name, Detail: fmt.Sprintf("same-file move errors: %v", rep.Errors)}
+	}
+	if rep.Copied != 1 || rep.Moved != 1 {
+		return Check{Name: name, Detail: fmt.Sprintf("same-file move copied=%d moved=%d (want 1/1)", rep.Copied, rep.Moved)}
+	}
+	wantSame := fmt.Sprintf("%06d_solo.jpg", samePlans[0].ID)
+	if _, err := os.Stat(filepath.Join(same.dir, wantSame)); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("in-place renamed copy missing: %v", err)}
+	}
+	if _, err := os.Stat(filepath.Join(same.dir, "solo.jpg")); !os.IsNotExist(err) {
+		return Check{Name: name, Detail: "original source not removed in same-dir move"}
 	}
 	return Check{Name: name, OK: true}
 }

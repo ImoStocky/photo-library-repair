@@ -8,12 +8,12 @@ on demand). **apply** is the current CLI command and Go package for that
 same step. Keep both names in docs; **do not rename the CLI while other
 agents are working**. Sources and the SQLite library are not consumed.
 
-**Status:** Partial — copy + EXIF write; no move / rename-vacate /
+**Status:** Partial — copy + `--move` + EXIF write; no rename-vacate /
 `report.json`. Old-draft rename/commit actions are optional later.
 
 ## Responsibility
 
-Materialize the plan: copy (or later move) pixel files into the target
+Materialize the plan: copy (or move) pixel files into the target
 directory, write chosen metadata onto the copies, emit report. I/O.
 
 ## Spec summary
@@ -35,11 +35,15 @@ directory, write chosen metadata onto the copies, emit report. I/O.
 
 `internal/apply.Apply(store, Options)`:
 
-- Options: target dir, dry-run, no-exif, force-conflicts.
+- Options: target dir, dry-run, no-exif, force-conflicts, move, EXIF engine.
 - Copies planned pixel images; unique-name helper on collision.
-- Writes JPEG EXIF via `exifwrite` when enabled.
+- Writes EXIF via the full-data engine (built-in writer as fallback).
+- `Move` deletes the source file once its copy is fully in place. Duplicates
+  inside a group and skipped conflict groups stay; a failed removal is
+  reported (both files remain); a true dest == src is never followed by a
+  deletion (same-file guard).
 - Skips `StatusConflict` groups unless forced.
-- No `--move`; no rename-vacate graph; no `report.json` (use `plr report`).
+- No rename-vacate graph; no `report.json` (use `plr report`).
 
 ## Pseudocode (target)
 
@@ -63,7 +67,7 @@ func Apply(ctx context.Context, s *Store, resultDir string, move, dryRun bool) e
 ## CLI
 
 ```text
-plr apply --target DIR [--dry-run] [--no-exif] [--force-conflicts] [--db PATH]
+plr apply --target DIR [--dry-run] [--no-exif] [--move] [--force-conflicts] [--db PATH]
 ```
 
 Documented alias name: **amalgamate** (same behavior; not wired as a

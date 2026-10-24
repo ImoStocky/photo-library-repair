@@ -20,7 +20,7 @@ go build -o plr .
 plr scan  --dir PHOTO [--dir MORE] [--force] [--db plr.db]
 plr group [--max-hamming 12] [--db plr.db]
 plr plan  [--db plr.db]
-plr apply --target RESULT [--dry-run] [--force-conflicts] [--db plr.db]
+plr apply --target RESULT [--dry-run] [--no-exif] [--move] [--force-conflicts] [--db plr.db]
 
 # one-shot (scan → group → plan → apply/amalgamate)
 plr build --dir PHOTO --target RESULT
@@ -35,7 +35,7 @@ plr increment --dir NEW_PHOTOS --target RESULT --db plr.db
 | `scan` | Walk dirs; record sha256, 16-byte perceptual hash, EXIF into SQLite. Skips already-scanned dirs unless `--force`. |
 | `group` | Exact sha256 + Hamming-near phash → groups |
 | `plan` | Per group: best pixels, earliest capture, GPS; mark conflicts |
-| `apply` | **Amalgamate:** copy planned files to `--target`, write merged EXIF |
+| `apply` | **Amalgamate:** copy (or `--move`) planned files to `--target`, write merged EXIF |
 | `build` | Full pipeline in one go |
 | `increment` | Grow an existing library: scan new dirs into the same DB, then re-group / re-plan / re-apply |
 | `report` | Summarize library / groups / plans |

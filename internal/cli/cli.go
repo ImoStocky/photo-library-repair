@@ -60,7 +60,7 @@ Usage:
   plr scan     --dir DIR... [--force] [--db PATH] [--workers N] [--min-size-kb N]
   plr group    [--max-hamming N] [--db PATH]
   plr plan     [--conflict-hamming N] [--ai] [--model SOURCE] [--db PATH]
-  plr apply    --target DIR [--dry-run] [--no-exif] [--force-conflicts] [--db PATH]
+  plr apply    --target DIR [--dry-run] [--no-exif] [--move] [--force-conflicts] [--db PATH]
   plr build    --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr increment --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr report   [--db PATH]
@@ -80,7 +80,8 @@ Commands:
             decision model settles conflict groups and marks them
             resolved_by the model id.
   apply     Copy the planned pixel files into --target and write the merged
-            EXIF (capture time, offset, GPS) onto the copies. Conflict
+            EXIF (capture time, offset, GPS) onto the copies. With --move the
+            source file is deleted once its copy is in place. Conflict
             groups are skipped unless --force-conflicts is given.
   build     scan + group + plan + apply in one go.
   increment Merge new photos into an existing library: scan the new dirs
@@ -294,6 +295,7 @@ func runApply(args []string) int {
 	target := fs.String("target", "", "directory that receives the final images (required)")
 	dryRun := fs.Bool("dry-run", false, "report what would be copied without touching the target")
 	noEXIF := fs.Bool("no-exif", false, "copy files without writing merged EXIF")
+	move := fs.Bool("move", false, "delete each source file once its copy is in place in --target")
 	forceConflicts := fs.Bool("force-conflicts", false, "apply conflict groups using the best-effort plan")
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	if err := fs.Parse(args); err != nil {
@@ -317,6 +319,7 @@ func runApply(args []string) int {
 		Target:         *target,
 		DryRun:         *dryRun,
 		NoEXIF:         *noEXIF,
+		Move:           *move,
 		ForceConflicts: *forceConflicts,
 		EXIF:           tool,
 	})
@@ -330,7 +333,12 @@ func runApplyPhase(s *store.Store, opts apply.Options) int {
 		return 1
 	}
 	verb := "copied"
-	if rep.DryRun {
+	switch {
+	case opts.Move && !opts.DryRun:
+		verb = "moved"
+	case opts.Move:
+		verb = "would move"
+	case opts.DryRun:
 		verb = "would copy"
 	}
 	for _, f := range rep.Files {
@@ -390,6 +398,7 @@ func runPipeline(cmd string, args []string) int {
 	conflictHamming := fs.Int("conflict-hamming", 2, "perceptual hashes within this distance with identical capture times mark the group as a conflict")
 	dryRun := fs.Bool("dry-run", false, "report what would be copied without touching the target")
 	noEXIF := fs.Bool("no-exif", false, "copy files without writing merged EXIF")
+	move := fs.Bool("move", false, "delete each source file once its copy is in place in --target")
 	forceConflicts := fs.Bool("force-conflicts", false, "apply conflict groups using the best-effort plan")
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	workers := fs.Int("workers", 4, "number of hash workers")
@@ -425,6 +434,7 @@ func runPipeline(cmd string, args []string) int {
 				Target:         *target,
 				DryRun:         *dryRun,
 				NoEXIF:         *noEXIF,
+				Move:           *move,
 				ForceConflicts: *forceConflicts,
 				EXIF:           tool,
 			})
