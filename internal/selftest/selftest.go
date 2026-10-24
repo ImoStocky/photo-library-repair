@@ -92,6 +92,16 @@ func (e *env) scan() (ingest.Report, error) {
 	return *rep, nil
 }
 
+// scanForce re-scans the temp directory with Force set: the fingerprint
+// cache must reuse the stored rows for unchanged files.
+func (e *env) scanForce() (ingest.Report, error) {
+	rep, err := ingest.Scan(e.s, ingest.Options{Dirs: []string{e.dir}, Force: true, Workers: 2}, fingerprint.Compute)
+	if err != nil {
+		return ingest.Report{}, err
+	}
+	return *rep, nil
+}
+
 // groupPlan runs the group and plan phases. It returns the stored plans and
 // the member file names per plan id. (The store's group_id column is
 // transient: the plan phase's ClearGroups resets it, so membership must be
@@ -216,11 +226,12 @@ func inverted(data []byte) []byte {
 }
 
 // checkScanAndGroup verifies that the scan records real images, counts a
-// file that only pretends to be a JPEG as non-image, and that the group
-// phase chains the exact copy and the quality re-encoding into one group
-// while an unrelated picture stays apart.
+// file that only pretends to be a JPEG as non-image, that the group phase
+// chains the exact copy and the quality re-encoding into one group while an
+// unrelated picture stays apart, and that a forced re-scan of unchanged
+// files reuses the stored fingerprints.
 func checkScanAndGroup() Check {
-	const name = "scan: records images, counts fakes, groups exact and near copies"
+	const name = "scan: records images, counts fakes, groups exact and near copies, caches unchanged re-scans"
 	e, err := newEnv()
 	if err != nil {
 		return Check{Name: name, Detail: err.Error()}
@@ -249,6 +260,18 @@ func checkScanAndGroup() Check {
 		return Check{Name: name, Detail: fmt.Sprintf(
 			"scan report: seen=%d added=%d non-image=%d errors=%d (want 4/4/1/0)",
 			rep.FilesSeen, rep.ImagesAdded, rep.NonImage, rep.Errors)}
+	}
+
+	// Forced re-scan of the untouched directory: every file is seen again,
+	// none is re-hashed (fingerprint cache).
+	rep2, err := e.scanForce()
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("rescan: %v", err)}
+	}
+	if rep2.FilesSeen != 4 || rep2.ImagesCached != 4 || rep2.ImagesAdded != 0 {
+		return Check{Name: name, Detail: fmt.Sprintf(
+			"rescan report: seen=%d cached=%d added=%d (want 4/4/0)",
+			rep2.FilesSeen, rep2.ImagesCached, rep2.ImagesAdded)}
 	}
 
 	plans, members, err := e.groupPlan()

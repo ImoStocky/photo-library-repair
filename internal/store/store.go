@@ -23,6 +23,7 @@ type Image struct {
 	SHA256      string
 	Phash       string // 32 hex chars (16-byte perceptual hash), "" when the picture could not be hashed
 	CreatedAt   int64  // unix seconds, file birth time (mtime fallback)
+	MTime       int64  // unix nanoseconds, file modification time (fingerprint cache key)
 	ExifCapture string // raw EXIF capture wall clock, e.g. "2020:05:01 12:30:00"
 	ExifOffset  string // EXIF timezone offset, e.g. "+05:30" or "Z"; "" when unknown
 	Width       int    // displayed width (after EXIF orientation)
@@ -79,6 +80,7 @@ CREATE TABLE IF NOT EXISTS images (
   height INTEGER NOT NULL DEFAULT 0,
   kind TEXT NOT NULL DEFAULT '',
   size INTEGER NOT NULL DEFAULT 0,
+  mtime INTEGER NOT NULL DEFAULT 0,
   gps_lat REAL NOT NULL DEFAULT 0,
   gps_lon REAL NOT NULL DEFAULT 0,
   has_gps INTEGER NOT NULL DEFAULT 0,
@@ -144,6 +146,7 @@ func migrate(db *sql.DB) error {
 		{"images", "has_gps", "INTEGER NOT NULL DEFAULT 0"},
 		{"groups", "pixel_phash", "TEXT NOT NULL DEFAULT ''"},
 		{"groups", "resolved_by", "TEXT NOT NULL DEFAULT 'rules'"},
+		{"images", "mtime", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		have, err := columnExists(db, add.table, add.col)
 		if err != nil {
@@ -250,12 +253,12 @@ func (s *Store) UpsertImage(img Image) (id string, created bool, err error) {
 			UPDATE images SET
 			  name = ?, sha256 = ?, phash = ?, created_at = ?,
 			  exif_capture = ?, exif_offset = ?,
-			  width = ?, height = ?, kind = ?, size = ?,
+			  width = ?, height = ?, kind = ?, size = ?, mtime = ?,
 			  gps_lat = ?, gps_lon = ?, has_gps = ?
 			WHERE id = ?`,
 			img.Name, img.SHA256, img.Phash, img.CreatedAt,
 			img.ExifCapture, img.ExifOffset,
-			img.Width, img.Height, img.Kind, img.Size,
+			img.Width, img.Height, img.Kind, img.Size, img.MTime,
 			img.GPSLat, img.GPSLon, boolInt(img.HasGPS), id)
 		return id, false, err
 	}
@@ -264,11 +267,11 @@ func (s *Store) UpsertImage(img Image) (id string, created bool, err error) {
 	}
 	_, err = s.db.Exec(`
 		INSERT INTO images (id, source_id, rel_path, name, sha256, phash, created_at,
-		                      exif_capture, exif_offset, width, height, kind, size,
+		                      exif_capture, exif_offset, width, height, kind, size, mtime,
 		                      gps_lat, gps_lon, has_gps, group_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		img.ID, img.SourceID, img.RelPath, img.Name, img.SHA256, img.Phash, img.CreatedAt,
-		img.ExifCapture, img.ExifOffset, img.Width, img.Height, img.Kind, img.Size,
+		img.ExifCapture, img.ExifOffset, img.Width, img.Height, img.Kind, img.Size, img.MTime,
 		img.GPSLat, img.GPSLon, boolInt(img.HasGPS), img.GroupID)
 	return img.ID, true, err
 }
@@ -277,7 +280,7 @@ func (s *Store) UpsertImage(img Image) (id string, created bool, err error) {
 func (s *Store) AllImages() ([]Image, error) {
 	rows, err := s.db.Query(`
 		SELECT id, source_id, rel_path, name, sha256, phash, created_at,
-		       exif_capture, exif_offset, width, height, kind, size,
+		       exif_capture, exif_offset, width, height, kind, size, mtime,
 		       gps_lat, gps_lon, has_gps, group_id
 		FROM images ORDER BY source_id, rel_path`)
 	if err != nil {
@@ -290,12 +293,41 @@ func (s *Store) AllImages() ([]Image, error) {
 		var hasGPS int
 		if err := rows.Scan(&img.ID, &img.SourceID, &img.RelPath, &img.Name, &img.SHA256,
 			&img.Phash, &img.CreatedAt, &img.ExifCapture, &img.ExifOffset,
-			&img.Width, &img.Height, &img.Kind, &img.Size,
+			&img.Width, &img.Height, &img.Kind, &img.Size, &img.MTime,
 			&img.GPSLat, &img.GPSLon, &hasGPS, &img.GroupID); err != nil {
 			return nil, err
 		}
 		img.HasGPS = hasGPS != 0
 		out = append(out, img)
+	}
+	return out, rows.Err()
+}
+
+// ImagesBySource returns the stored rows of one source keyed by relative
+// path. The ingest fingerprint cache uses them to skip re-hashing files
+// whose (size, mtime) has not changed since the last scan.
+func (s *Store) ImagesBySource(sourceID int64) (map[string]Image, error) {
+	rows, err := s.db.Query(`
+		SELECT id, source_id, rel_path, name, sha256, phash, created_at,
+		       exif_capture, exif_offset, width, height, kind, size, mtime,
+		       gps_lat, gps_lon, has_gps, group_id
+		FROM images WHERE source_id = ?`, sourceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]Image{}
+	for rows.Next() {
+		var img Image
+		var hasGPS int
+		if err := rows.Scan(&img.ID, &img.SourceID, &img.RelPath, &img.Name, &img.SHA256,
+			&img.Phash, &img.CreatedAt, &img.ExifCapture, &img.ExifOffset,
+			&img.Width, &img.Height, &img.Kind, &img.Size, &img.MTime,
+			&img.GPSLat, &img.GPSLon, &hasGPS, &img.GroupID); err != nil {
+			return nil, err
+		}
+		img.HasGPS = hasGPS != 0
+		out[img.RelPath] = img
 	}
 	return out, rows.Err()
 }

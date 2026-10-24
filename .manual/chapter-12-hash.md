@@ -31,9 +31,11 @@ pairs.
 - `internal/phash` — `Compute`, `Hash.Hamming`, Lanczos resize, DCT.
 - `internal/fingerprint` — decode by kind, apply orientation, call phash,
   attach EXIF facts from `meta`.
+- `internal/ingest` — fingerprint cache: on a forced re-scan, a file whose
+  (size, mtime) matches the stored `images` row keeps its stored sha256,
+  phash and EXIF facts instead of being re-hashed.
 
-**Gaps:** no `Candidates` / band index; no durable phash cache table
-(re-hash on forced re-scan).
+**Gaps:** no `Candidates` / band index (mvp-gaps #7).
 
 ## Pseudocode (target)
 

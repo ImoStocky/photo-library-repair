@@ -5,6 +5,10 @@
 // Directories that were already recorded as sources are skipped unless
 // Options.Force is set; a forced re-scan re-syncs the source, dropping rows
 // for files that no longer exist.
+//
+// A forced re-scan does not re-hash unchanged files: when a file's size and
+// modification time match the stored row, its sha256, perceptual hash and
+// EXIF facts are reused from the store (the fingerprint cache).
 package ingest
 
 import (
@@ -44,6 +48,7 @@ type Report struct {
 	FilesSeen     int
 	ImagesAdded   int
 	ImagesUpdated int
+	ImagesCached  int // fingerprints reused from the store (size+mtime unchanged)
 	NonImage      int
 	Errors        int
 }
@@ -58,6 +63,7 @@ type job struct {
 	relPath   string
 	name      string
 	size      int64
+	mtime     int64 // unix nanoseconds, fingerprint cache key
 	kind      string
 	createdAt int64
 }
@@ -114,7 +120,17 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 		}
 		rep.DirsScanned++
 
-		if err := hashAll(s, jobs, opts.Workers, hash, runStart, &seq, rep); err != nil {
+		// Fingerprint cache: stored rows of a known source, so unchanged
+		// files skip the re-hash on a forced re-scan.
+		facts := map[string]store.Image{}
+		if exists {
+			facts, err = s.ImagesBySource(sourceID)
+			if err != nil {
+				return rep, fmt.Errorf("scan %q: %w", dir, err)
+			}
+		}
+
+		if err := hashAll(s, jobs, opts.Workers, hash, runStart, &seq, rep, facts); err != nil {
 			return rep, fmt.Errorf("scan %q: %w", dir, err)
 		}
 
@@ -180,6 +196,7 @@ func collect(root string, minSize int64, seenInodes map[uint64]bool) ([]job, map
 			relPath:   rel,
 			name:      d.Name(),
 			size:      fi.Size(),
+			mtime:     fi.ModTime().UnixNano(),
 			kind:      kind,
 			createdAt: createdAt,
 		})
@@ -190,8 +207,9 @@ func collect(root string, minSize int64, seenInodes map[uint64]bool) ([]job, map
 }
 
 // hashAll runs sha256 + fingerprint over the jobs with a worker pool and
-// upserts the results.
-func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time.Time, seq *atomic.Int64, rep *Report) error {
+// upserts the results. Files whose (size, mtime) match the stored facts
+// (the cache, keyed per source) are not re-read or re-hashed.
+func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time.Time, seq *atomic.Int64, rep *Report, facts map[string]store.Image) error {
 	jobsCh := make(chan job)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -201,6 +219,24 @@ func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time
 		wg.Go(func() {
 			for j := range jobsCh {
 				rep.FilesSeen++
+				if stored, ok := facts[j.relPath]; ok && stored.Size == j.size && stored.MTime == j.mtime {
+					// Unchanged since the last scan: reuse the stored
+					// sha256/phash/EXIF facts and only refresh the row.
+					stored.Name = j.name
+					if _, _, err := s.UpsertImage(stored); err != nil {
+						mu.Lock()
+						rep.Errors++
+						if firstErr == nil {
+							firstErr = err
+						}
+						mu.Unlock()
+					} else {
+						mu.Lock()
+						rep.ImagesCached++
+						mu.Unlock()
+					}
+					continue
+				}
 				sum, err := sha256File(j.fullPath)
 				if err != nil {
 					mu.Lock()
@@ -230,6 +266,7 @@ func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time
 					Height:      info.Height,
 					Kind:        j.kind,
 					Size:        j.size,
+					MTime:       j.mtime,
 					HasGPS:      info.HasGPS,
 					GPSLat:      info.GPSLat,
 					GPSLon:      info.GPSLon,

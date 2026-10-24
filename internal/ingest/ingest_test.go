@@ -1,8 +1,10 @@
 package ingest
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 
 	"photo-library-repair/internal/fingerprint"
@@ -94,6 +96,80 @@ func TestScanAndSkipAndForce(t *testing.T) {
 	images, _ = s.AllImages()
 	if len(images) != 1 || images[0].RelPath != filepath.Join("sub", "b.png") {
 		t.Fatalf("after force = %+v", images)
+	}
+}
+
+// countingHasher counts its calls and gives every call a distinct phash,
+// so a test can tell re-hashed files from cached ones.
+func countingHasher(calls *int32) Hasher {
+	return func(path string, k string) (fingerprint.Info, error) {
+		n := atomic.AddInt32(calls, 1)
+		return fingerprint.Info{
+			Phash:       fmt.Sprintf("%032x", n),
+			Width:       100,
+			Height:      50,
+			Kind:        k,
+			EXIFCapture: "2020:01:01 12:00:00",
+			EXIFOffset:  "+02:00",
+		}, nil
+	}
+}
+
+func TestScanForceReusesUnchangedFingerprints(t *testing.T) {
+	root := t.TempDir()
+	a := filepath.Join(root, "a.jpg")
+	b := filepath.Join(root, "b.png")
+	write(t, a, jpegBytes())
+	write(t, b, pngBytes())
+
+	s, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	var calls int32
+	rep, err := Scan(s, Options{Dirs: []string{root}, Workers: 2}, countingHasher(&calls))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.ImagesAdded != 2 || atomic.LoadInt32(&calls) != 2 {
+		t.Fatalf("first scan = %+v calls=%d, want 2 added and 2 calls", rep, calls)
+	}
+	images, _ := s.AllImages()
+	if len(images) != 2 || images[0].MTime == 0 || images[1].MTime == 0 {
+		t.Fatalf("mtime not stored: %+v", images)
+	}
+	phashB := images[1].Phash
+
+	// Forced re-scan of the untouched directory: both files keep their
+	// stored fingerprints and the hasher is not called again.
+	rep, err = Scan(s, Options{Dirs: []string{root}, Force: true, Workers: 2}, countingHasher(&calls))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.FilesSeen != 2 || rep.ImagesCached != 2 || rep.ImagesAdded != 0 || rep.ImagesUpdated != 0 {
+		t.Fatalf("force scan (unchanged) = %+v, want seen 2 cached 2", rep)
+	}
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Fatalf("hasher called %d times, want 2 (unchanged files must not be re-hashed)", calls)
+	}
+
+	// Change one file: only it is re-hashed, the other stays cached.
+	write(t, a, append(jpegBytes(), 0x01, 0x02))
+	rep, err = Scan(s, Options{Dirs: []string{root}, Force: true, Workers: 2}, countingHasher(&calls))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.FilesSeen != 2 || rep.ImagesCached != 1 || rep.ImagesUpdated != 1 {
+		t.Fatalf("force scan (one changed) = %+v, want seen 2 cached 1 updated 1", rep)
+	}
+	if atomic.LoadInt32(&calls) != 3 {
+		t.Fatalf("hasher called %d times, want 3", calls)
+	}
+	images, _ = s.AllImages()
+	if images[1].Phash != phashB {
+		t.Fatalf("cached file lost its phash (was %q, now %q)", phashB, images[1].Phash)
 	}
 }
 

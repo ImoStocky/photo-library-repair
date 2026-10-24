@@ -142,8 +142,8 @@ func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB 
 		return 1
 	}
 	fmt.Printf("scanned %d dir(s), skipped %d already scanned\n", rep.DirsScanned, rep.DirsSkipped)
-	fmt.Printf("files seen %d: %d added, %d updated, %d non-image, %d errors\n",
-		rep.FilesSeen, rep.ImagesAdded, rep.ImagesUpdated, rep.NonImage, rep.Errors)
+	fmt.Printf("files seen %d: %d added, %d updated, %d cached, %d non-image, %d errors\n",
+		rep.FilesSeen, rep.ImagesAdded, rep.ImagesUpdated, rep.ImagesCached, rep.NonImage, rep.Errors)
 	return 0
 }
 

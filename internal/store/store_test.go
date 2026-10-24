@@ -66,6 +66,7 @@ func TestImageUpsertAndGroups(t *testing.T) {
 		Height:      3000,
 		Kind:        "jpeg",
 		Size:        123456,
+		MTime:       1700000000123456789,
 	}
 	gotID, created, err := s.UpsertImage(img)
 	if err != nil || !created {
@@ -88,6 +89,9 @@ func TestImageUpsertAndGroups(t *testing.T) {
 	}
 	if len(images) != 1 || images[0].SHA256 != "bb" || images[0].Width != 8000 {
 		t.Fatalf("AllImages = %+v", images)
+	}
+	if images[0].MTime != 1700000000123456789 {
+		t.Fatalf("MTime = %d, want the stored nanosecond value", images[0].MTime)
 	}
 
 	if err := s.SetGroupAssignments(map[string]int64{img.ID: 7}); err != nil {
