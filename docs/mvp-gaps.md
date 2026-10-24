@@ -17,11 +17,11 @@ pipeline (scan → group → plan → apply/amalgamate).
 | 3 | `--move` for apply | Not implemented | Copy is the safe default. If a move is wanted, delete the source file manually after applying; the plan records which source file provided each stored image (`plr report`). |
 | 4 | `report.json` written into the result directory | Not implemented | `plr report` prints the equivalent summary (sources, images, per-group plans, conflicts). |
 | 5 | Client/server split (gRPC, job queue, SSE) | Not implemented | The CLI is a single binary; every phase reads and writes the same SQLite file. No bypass needed — this is the MVP form of the system. |
-| 6 | ExifTool as the metadata engine | Pure-Go reader (`internal/meta`) and writer (`internal/exifwrite`) instead | Covers the tags the pipeline needs (capture time, offset, GPS, orientation). Full ExifTool tag parity (e.g. copying camera description/copyright tags) is out of scope; those tags are dropped from the output. |
+| 6 | ExifTool as the metadata engine | Implemented | `internal/exif` embeds the real ExifTool 13.59 (WebAssembly, pure Go, no cgo): reads every available tag, writes the merged facts, preserves all other tags. Built-in `meta`/`exifwrite` remain the fallback when the engine cannot start. Writes always go to a new file (in-place engine writes are unsafe — see [dependencies](dependencies.md)). |
 | 7 | Banding candidate index for large libraries | O(n²) pairwise hamming in `group.Aggregate` | Fine for MVP sizes (low tens of thousands of images). If grouping gets slow, add a band index before the exact pairwise pass. |
 | 8 | phash cache keyed by (path, size, mtime) | Not implemented | Re-scanning re-hashes every file. The directory skip (`--force` required to re-scan) limits the cost; a forced re-scan after edits is the supported workflow. |
 | 9 | HDBSCAN/OPTICS, `--min-cluster-size` | Intentionally omitted | Chain aggregation with `--max-hamming` is the clustering engine; tune the radius per library. |
-| 10 | Copying extra camera tags (description, artist, copyright, ...) onto the output | Not implemented | Output EXIF carries only the resolved capture time, offset, orientation and GPS. |
+| 10 | Copying extra camera tags (description, artist, copyright, ...) onto the output | Implemented | Engine writes preserve **every** metadata tag in the source (title, description, artist, copyright, camera fields, ...) while overwriting the merged facts; covered by `plr selftest` check 6. |
 | 11 | `--conflict-hamming` flag | Parsed but unused | The plan phase has no rule that consumes it; the flag is kept for interface parity. Conflicts come from EXIF disagreement and the creation-time-vs-capture check. |
 
 ## Notes

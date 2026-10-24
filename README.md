@@ -41,6 +41,13 @@ plr increment --dir NEW_PHOTOS --target RESULT --db plr.db
 | `report` | Summarize library / groups / plans |
 | `selftest` | Built-in parity checks |
 
+**EXIF engine:** read/write uses the real ExifTool 13.59 embedded as
+WebAssembly (pure Go, no system dependencies); commands print
+`exif engine: ExifTool 13.59 (embedded, full metadata)`. If the engine
+cannot start, `plr` warns and falls back to the built-in minimal
+JPEG reader/writer. Apply writes preserve every metadata tag in the
+source. Details: [`docs/dependencies.md`](docs/dependencies.md).
+
 **Naming:** *amalgamate* is the product verb for materializing the plan;
 the CLI command is still `apply`. See
 [`.manual/chapter-01-goals-and-status.md`](.manual/chapter-01-goals-and-status.md).

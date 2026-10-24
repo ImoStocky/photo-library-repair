@@ -40,9 +40,12 @@ regressions.
 
 *Open:* pure-Go read for common case; writes stay on ExifTool.
 
-**MVP diverge:** pure-Go `internal/meta` + `internal/exifwrite` for the
-tags the pipeline needs (capture, offset, GPS, orientation). Extra camera
-description/copyright tags not copied. See mvp-gaps #6 / #10.
+**MVP:** `internal/exif` — the real ExifTool 13.59 embedded as WebAssembly
+(pure Go, no cgo, no system dependencies). Reads every available tag;
+writes go to a new file with all other tags preserved (in-place engine
+writes are unsafe — see `docs/dependencies.md`). Built-in
+`internal/meta` + `internal/exifwrite` remain the fallback when the engine
+cannot start.
 
 ## 9.4 Storage
 
@@ -64,13 +67,17 @@ Single ExifTool process = only shared mutable I/O (mutex). Hashing
 embarrassingly parallel (`≈ NumCPU()`, cap 32). Cluster/aggregate/merge:
 single goroutine over in-memory slices.
 
-**MVP:** worker pool in `ingest`; no ExifTool process.
+**MVP:** worker pool in `ingest`; one embedded ExifTool engine instance
+per CLI command (internal mutex), shared by the workers.
 
 ## 9.7 Format libraries (EXIF / HEIC)
 
-**Decision:** EXIF read/write → `dsoprea/go-exif`; HEIC decode →
-`vegidio/heif-go` (both pure Go). First picks, not final — re-evaluate once
-HEIC decode performance is measured on a real library. Deferred alternatives
-(libheif CGO bindings, etc.) documented with rationale.
+**Decision:** EXIF read/write → `yashikota/exiftool-go` v1.2.0 (real
+ExifTool 13.59 embedded as WebAssembly; pure Go, no cgo); HEIC decode →
+`vegidio/heif-go` (pure Go). First picks, not final — re-evaluate once
+HEIC decode performance is measured on a real library, and re-check the
+WASM cost profile of the EXIF engine at large-library scale. Deferred
+alternatives (exec wrappers, libexif CGO bindings, etc.) documented with
+rationale.
 
 **Full record:** [`docs/dependencies.md`](../docs/dependencies.md).

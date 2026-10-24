@@ -11,6 +11,7 @@ import (
 	"sort"
 
 	"photo-library-repair/internal/apply"
+	"photo-library-repair/internal/exif"
 	"photo-library-repair/internal/fingerprint"
 	"photo-library-repair/internal/group"
 	"photo-library-repair/internal/ingest"
@@ -115,17 +116,25 @@ func runScan(args []string) int {
 		return 1
 	}
 	defer s.Close()
-	return runScanPhase(s, dirs, *force, *workers, *minSizeKB)
+	tool := openEXIF("scan")
+	if tool != nil {
+		defer tool.Close()
+	}
+	return runScanPhase(s, dirs, *force, *workers, *minSizeKB, tool)
 }
 
 // runScanPhase is the scan step, shared by "plr scan" and "plr build".
-func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB int) int {
+func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB int, tool *exif.Tool) int {
+	hasher := fingerprint.Compute
+	if tool != nil {
+		hasher = fingerprint.WithEXIF(tool)
+	}
 	rep, err := ingest.Scan(s, ingest.Options{
 		Dirs:    dirs,
 		Force:   force,
 		Workers: workers,
 		MinSize: int64(minSizeKB) * 1024,
-	}, fingerprint.Compute)
+	}, hasher)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr scan:", err)
 		return 1
@@ -300,11 +309,16 @@ func runApply(args []string) int {
 		return 1
 	}
 	defer s.Close()
+	tool := openEXIF("apply")
+	if tool != nil {
+		defer tool.Close()
+	}
 	return runApplyPhase(s, apply.Options{
 		Target:         *target,
 		DryRun:         *dryRun,
 		NoEXIF:         *noEXIF,
 		ForceConflicts: *forceConflicts,
+		EXIF:           tool,
 	})
 }
 
@@ -344,6 +358,20 @@ func renamedSuffix(n int) string {
 	return fmt.Sprintf(" (%d renamed)", n)
 }
 
+// openEXIF starts the full-data EXIF engine (the embedded ExifTool). When
+// it cannot be started, the pipeline continues with the built-in minimal
+// reader/writer and the failure is reported.
+func openEXIF(cmd string) *exif.Tool {
+	tool, err := exif.New()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "plr %s: EXIF engine unavailable (%v); built-in EXIF reader/writer only\n", cmd, err)
+		return nil
+	}
+	ver, _ := tool.Version()
+	fmt.Printf("exif engine: ExifTool %s (embedded, full metadata)\n", ver)
+	return tool
+}
+
 func runBuild(args []string) int { return runPipeline("build", args) }
 
 // runIncrement merges new photos into an existing library: scan the new
@@ -381,11 +409,15 @@ func runPipeline(cmd string, args []string) int {
 		return 1
 	}
 	defer s.Close()
+	tool := openEXIF(cmd)
+	if tool != nil {
+		defer tool.Close()
+	}
 	phases := []struct {
 		label string
 		fn    func() int
 	}{
-		{"scan", func() int { return runScanPhase(s, dirs, *force, *workers, *minSizeKB) }},
+		{"scan", func() int { return runScanPhase(s, dirs, *force, *workers, *minSizeKB, tool) }},
 		{"group", func() int { return runGroupPhase(s, *maxHamming) }},
 		{"plan", func() int { return runPlanPhase(s, nil) }},
 		{"apply", func() int {
@@ -394,6 +426,7 @@ func runPipeline(cmd string, args []string) int {
 				DryRun:         *dryRun,
 				NoEXIF:         *noEXIF,
 				ForceConflicts: *forceConflicts,
+				EXIF:           tool,
 			})
 		}},
 	}

@@ -34,8 +34,9 @@ internal/ingest/        # scan
 internal/phash/         # 16-byte DCT perceptual hash
 internal/fingerprint/   # decode + hash + EXIF facts
 internal/group/         # Aggregate + ResolveGroup (plan/conflicts)
-internal/meta/          # JPEG EXIF read
-internal/exifwrite/     # JPEG EXIF write
+internal/meta/          # JPEG EXIF read (fallback)
+internal/exif/          # full-data EXIF engine (embedded ExifTool, WASM)
+internal/exifwrite/     # JPEG EXIF write (fallback)
 internal/store/         # SQLite sources/images/groups
 internal/apply/         # amalgamate (copy + write EXIF)
 internal/selftest/      # plr selftest

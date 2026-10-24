@@ -4,6 +4,7 @@ go 1.27.0
 
 require (
 	github.com/ardanlabs/kronk v1.32.9
+	github.com/yashikota/exiftool-go v1.2.0
 	golang.org/x/sys v0.48.0
 	modernc.org/sqlite v1.60.1
 )
@@ -74,6 +75,7 @@ require (
 	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/spiffe/go-spiffe/v2 v2.9.0 // indirect
+	github.com/tetratelabs/wazero v1.12.0 // indirect
 	github.com/ulikunitz/xz v0.5.17 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/contrib/detectors/gcp v1.47.0 // indirect

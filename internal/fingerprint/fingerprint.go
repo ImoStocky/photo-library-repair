@@ -19,6 +19,7 @@ import (
 	"image/png"
 	"os"
 
+	"photo-library-repair/internal/exif"
 	"photo-library-repair/internal/meta"
 	"photo-library-repair/internal/phash"
 )
@@ -39,10 +40,25 @@ type Info struct {
 	GPSLon      float64
 }
 
-// Compute reads path and derives its fingerprint. Formats without a
-// decoder (webp, tiff, heic) yield an Info with an empty Phash and no
-// error; corrupt pictures of decodable formats are an error.
+// Compute reads path and derives its fingerprint with the built-in
+// decoders and the minimal JPEG EXIF reader. Formats without a decoder
+// (webp, tiff, heic) yield an Info with an empty Phash and no error;
+// corrupt pictures of decodable formats are an error.
 func Compute(path, kind string) (Info, error) {
+	return compute(path, kind, nil)
+}
+
+// WithEXIF returns a hasher that reads the EXIF facts through the
+// full-data engine, which sees every available tag; the pipeline
+// consumes the standard four. A nil engine falls back to the built-in
+// reader.
+func WithEXIF(t *exif.Tool) func(path, kind string) (Info, error) {
+	return func(path, kind string) (Info, error) {
+		return compute(path, kind, t)
+	}
+}
+
+func compute(path, kind string, t *exif.Tool) (Info, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Info{}, err
@@ -65,8 +81,7 @@ func Compute(path, kind string) (Info, error) {
 	info.Width, info.Height = b.Dx(), b.Dy()
 
 	if kind == "jpeg" {
-		f, err := meta.FromJPEG(data)
-		if err == nil {
+		if f, ok := exifFacts(path, data, t); ok {
 			info.EXIFCapture = f.Capture
 			info.EXIFOffset = f.Offset
 			info.HasGPS = f.HasGPS
@@ -80,6 +95,25 @@ func Compute(path, kind string) (Info, error) {
 		}
 	}
 	return info, nil
+}
+
+// exifFacts derives the EXIF facts of a JPEG, preferring the full-data
+// engine and falling back to the built-in reader.
+func exifFacts(path string, data []byte, t *exif.Tool) (meta.Facts, bool) {
+	if t != nil {
+		if f, err := t.Facts(path); err == nil {
+			return meta.Facts{
+				Capture:     f.Capture,
+				Offset:      f.Offset,
+				GPSLat:      f.GPSLat,
+				GPSLon:      f.GPSLon,
+				HasGPS:      f.HasGPS,
+				Orientation: f.Orientation,
+			}, true
+		}
+	}
+	f, err := meta.FromJPEG(data)
+	return f, err == nil
 }
 
 // decode dispatches on the image kind.

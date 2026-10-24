@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"photo-library-repair/internal/exif"
 	"photo-library-repair/internal/exifwrite"
 	"photo-library-repair/internal/group"
 	"photo-library-repair/internal/meta"
@@ -24,10 +25,11 @@ import (
 
 // Options controls an apply run.
 type Options struct {
-	Target         string // directory that receives the final images
-	DryRun         bool   // report what would be done without touching the target
-	NoEXIF         bool   // copy files without writing merged EXIF
-	ForceConflicts bool   // apply conflict groups using their best-effort plan
+	Target         string     // directory that receives the final images
+	DryRun         bool       // report what would be done without touching the target
+	NoEXIF         bool       // copy files without writing merged EXIF
+	ForceConflicts bool       // apply conflict groups using their best-effort plan
+	EXIF           *exif.Tool // full-data engine; nil uses the built-in writer
 }
 
 // FileResult describes one file the run copies (or would copy).
@@ -142,7 +144,7 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 			continue
 		}
 
-		if err := place(srcPath, destPath, writeEXIF, facts); err != nil {
+		if err := place(srcPath, destPath, writeEXIF, facts, opts.EXIF); err != nil {
 			rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: %v", g.ID, err))
 			continue
 		}
@@ -157,24 +159,41 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 
 // place copies src to dest, writing merged EXIF when requested. The write
 // goes to a temporary file that is renamed into place, so the target never
-// holds a partial file.
-func place(src, dest string, writeEXIF bool, facts exifwrite.Facts) error {
+// holds a partial file. With the full-data engine, every metadata tag in
+// the source survives; the built-in writer only carries the merged facts.
+func place(src, dest string, writeEXIF bool, facts exifwrite.Facts, tool *exif.Tool) error {
 	if !writeEXIF {
 		return copyFile(src, dest)
 	}
-	data, err := os.ReadFile(src)
-	if err != nil {
-		return err
-	}
-	orig, _ := meta.FromJPEG(data) // preserve the source orientation
-	facts.Orientation = orig.Orientation
-	out, err := exifwrite.SetJPEG(data, facts)
-	if err != nil {
-		return err
-	}
 	tmp := dest + ".tmp"
-	if err := os.WriteFile(tmp, out, 0o644); err != nil {
-		return err
+	if tool != nil {
+		// Full-data write: everything in src survives and the merged
+		// facts are overwritten. The zero Orientation leaves the
+		// source's own orientation tag untouched.
+		if err := tool.WriteFacts(src, tmp, exif.Facts{
+			Capture: facts.Capture,
+			Offset:  facts.Offset,
+			HasGPS:  facts.HasGPS,
+			GPSLat:  facts.GPSLat,
+			GPSLon:  facts.GPSLon,
+		}); err != nil {
+			os.Remove(tmp)
+			return err
+		}
+	} else {
+		data, err := os.ReadFile(src)
+		if err != nil {
+			return err
+		}
+		orig, _ := meta.FromJPEG(data) // preserve the source orientation
+		facts.Orientation = orig.Orientation
+		out, err := exifwrite.SetJPEG(data, facts)
+		if err != nil {
+			return err
+		}
+		if err := os.WriteFile(tmp, out, 0o644); err != nil {
+			return err
+		}
 	}
 	if err := os.Rename(tmp, dest); err != nil {
 		os.Remove(tmp)

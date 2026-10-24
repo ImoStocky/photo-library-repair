@@ -137,8 +137,8 @@ func TestNormalizeOffset(t *testing.T) {
 		"+05:99":  "",
 	}
 	for in, want := range cases {
-		if got := normalizeOffset(in); got != want {
-			t.Fatalf("normalizeOffset(%q) = %q, want %q", in, got, want)
+		if got := NormalizeOffset(in); got != want {
+			t.Fatalf("NormalizeOffset(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

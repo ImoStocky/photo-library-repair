@@ -59,7 +59,8 @@ SQLite `plr.db`: `sources` / `images` / `groups`. Local CLI only.
 | Hash | `internal/phash`, `fingerprint` | Done — 16-byte DCT phash (czkawka-style) |
 | Group | `internal/group.Aggregate` | Done — sha256 + Hamming CC |
 | Plan / conflicts | `internal/group.ResolveGroup` | Done — rules per phase-5 brief; `Resolver` stub for Kronk |
-| Amalgamate / apply | `internal/apply` | Done — copy + JPEG EXIF; no `--move` |
+| Metadata engine | `internal/exif` | Done — embedded ExifTool 13.59 (WebAssembly, pure Go): reads every available tag, writes merged facts, preserves all other tags; built-in minimal reader/writer as fallback |
+| Amalgamate / apply | `internal/apply` | Done — copy + merged EXIF via the engine (all other tags preserved); no `--move` |
 | One-shot | `plr build` | Done |
 | Incremental growth | `plr increment` | Done — scan + group + plan + apply into the existing DB; S6 partition actions (present/matched/new) remain out of scope |
 | Kronk conflict resolve | `internal/kronk` | Done — opt-in `plr plan --ai` (Kronk decision model); rules remain the default |

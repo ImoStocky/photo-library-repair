@@ -136,7 +136,7 @@ func readIFD(d []byte, off int, bo binary.ByteOrder) entries {
 		return nil
 	}
 	var out entries
-	for k := 0; k < n; k++ {
+	for k := range n {
 		e := d[off+k*12 : off+k*12+12]
 		tag := int(bo.Uint16(e[0:2]))
 		typ := int(bo.Uint16(e[2:4]))
@@ -259,20 +259,20 @@ func fromTIFF(d []byte) (Facts, error) {
 // DateTimeDigitized, pairing each with its own OffsetTime tag.
 func captureTime(exif, ifd0 entries) (string, string) {
 	if ts := exif.ascii(tagDateTimeOriginal); ts != "" {
-		return cleanTime(ts), normalizeOffset(exif.ascii(tagOffsetTimeOrig))
+		return CleanTime(ts), NormalizeOffset(exif.ascii(tagOffsetTimeOrig))
 	}
 	if ts := ifd0.ascii(tagDateTime); ts != "" {
-		return cleanTime(ts), normalizeOffset(ifd0.ascii(tagOffsetTime))
+		return CleanTime(ts), NormalizeOffset(ifd0.ascii(tagOffsetTime))
 	}
 	if ts := exif.ascii(tagDateTimeDig); ts != "" {
-		return cleanTime(ts), normalizeOffset(exif.ascii(tagOffsetTimeDig))
+		return CleanTime(ts), NormalizeOffset(exif.ascii(tagOffsetTimeDig))
 	}
 	return "", ""
 }
 
-// cleanTime trims the string and drops fractional seconds, which some
+// CleanTime trims the string and drops fractional seconds, which some
 // cameras append.
-func cleanTime(s string) string {
+func CleanTime(s string) string {
 	s = strings.TrimSpace(s)
 	if i := strings.IndexByte(s, '.'); i >= 0 {
 		s = s[:i]
@@ -280,9 +280,9 @@ func cleanTime(s string) string {
 	return s
 }
 
-// normalizeOffset maps the EXIF offset spellings to "+HH:MM" or "Z" and
+// NormalizeOffset maps the EXIF offset spellings to "+HH:MM" or "Z" and
 // returns "" when the value is unusable.
-func normalizeOffset(s string) string {
+func NormalizeOffset(s string) string {
 	s = strings.TrimSpace(s)
 	switch s {
 	case "":

@@ -15,6 +15,7 @@ import (
 	"slices"
 
 	"photo-library-repair/internal/apply"
+	"photo-library-repair/internal/exif"
 	"photo-library-repair/internal/fingerprint"
 	"photo-library-repair/internal/group"
 	"photo-library-repair/internal/ingest"
@@ -43,6 +44,7 @@ func Run() []Check {
 		checkConflicts(),
 		checkApply(),
 		checkStoreUpsert(),
+		checkEXIFEngine(),
 	}
 }
 
@@ -530,6 +532,96 @@ func checkStoreUpsert() Check {
 	}
 	if images[0].ID != orig.ID {
 		return Check{Name: name, Detail: fmt.Sprintf("id changed from %s to %s", orig.ID, images[0].ID)}
+	}
+	return Check{Name: name, OK: true}
+}
+
+// checkEXIFEngine verifies that the full-data EXIF engine reads every tag
+// of a file, writes merged facts to a new file, and preserves the tags the
+// pipeline does not use. It mirrors the apply flow: the source is never
+// rewritten in place.
+func checkEXIFEngine() Check {
+	const name = "exif engine: full read, merged write, preserves other tags"
+	tool, err := exif.New()
+	if err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	defer tool.Close()
+
+	dir, err := os.MkdirTemp("", "plr-selftest-exif-")
+	if err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	defer os.RemoveAll(dir)
+
+	src := filepath.Join(dir, "rich.jpg")
+	if err := os.WriteFile(src, exifJPEG(7, 95, "2024:05:01 12:30:00", "+02:00", true), 0o644); err != nil {
+		return Check{Name: name, Detail: err.Error()}
+	}
+	f, err := tool.Facts(src)
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("read: %v", err)}
+	}
+	if f.Capture != "2024:05:01 12:30:00" || f.Offset != "+02:00" {
+		return Check{Name: name, Detail: fmt.Sprintf("facts %q %q (want 2024:05:01 12:30:00 +02:00)", f.Capture, f.Offset)}
+	}
+	if !f.HasGPS || math.Abs(f.GPSLat-52.5204) > 1e-3 || math.Abs(f.GPSLon-13.4055) > 1e-3 {
+		return Check{Name: name, Detail: fmt.Sprintf("gps %v %v,%v (want 52.5204, 13.4055)", f.HasGPS, f.GPSLat, f.GPSLon)}
+	}
+	if f.Tags < 10 {
+		return Check{Name: name, Detail: fmt.Sprintf("full read saw %d tags (want at least 10)", f.Tags)}
+	}
+
+	// A copy that carries extra tags the pipeline does not know.
+	rich := filepath.Join(dir, "rich-tagged.jpg")
+	extra := map[string]any{
+		"Title":            "Selftest picture",
+		"Author":           "Selftest",
+		"Copyright":        "(c) plr",
+		"ImageDescription": "kept on write",
+	}
+	if err := tool.SetTags(src, rich, extra); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("tag copy: %v", err)}
+	}
+	m, err := tool.Read(rich)
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("read copy: %v", err)}
+	}
+	for k, want := range extra {
+		if got := fmt.Sprint(m[k]); got != fmt.Sprint(want) {
+			return Check{Name: name, Detail: fmt.Sprintf("tag %s = %q after copy (want %q)", k, got, want)}
+		}
+	}
+
+	// The merged write: new capture facts, GPS from the read, a fresh file.
+	out := filepath.Join(dir, "merged.jpg")
+	if err := tool.WriteFacts(rich, out, exif.Facts{
+		Capture: "2024:05:01 13:45:00",
+		Offset:  "+03:00",
+		HasGPS:  true,
+		GPSLat:  f.GPSLat,
+		GPSLon:  f.GPSLon,
+	}); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("write: %v", err)}
+	}
+	f2, err := tool.Facts(out)
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("re-read: %v", err)}
+	}
+	if f2.Capture != "2024:05:01 13:45:00" || f2.Offset != "+03:00" {
+		return Check{Name: name, Detail: fmt.Sprintf("merged facts %q %q (want 2024:05:01 13:45:00 +03:00)", f2.Capture, f2.Offset)}
+	}
+	if !f2.HasGPS || math.Abs(f2.GPSLat-f.GPSLat) > 1e-3 || math.Abs(f2.GPSLon-f.GPSLon) > 1e-3 {
+		return Check{Name: name, Detail: fmt.Sprintf("merged gps %v %v,%v (want %v,%v)", f2.HasGPS, f2.GPSLat, f2.GPSLon, f.GPSLat, f.GPSLon)}
+	}
+	m, err = tool.Read(out)
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("re-read tags: %v", err)}
+	}
+	for k, want := range extra {
+		if got := fmt.Sprint(m[k]); got != fmt.Sprint(want) {
+			return Check{Name: name, Detail: fmt.Sprintf("tag %s = %q after merged write (want %q)", k, got, want)}
+		}
 	}
 	return Check{Name: name, OK: true}
 }
