@@ -4,7 +4,7 @@
 
 **Spec:** [chapter 02 §2.1](chapter-02-semantics.md).
 **Decision:** [chapter 05 §9.1](chapter-05-decisions.md).
-**Status:** Mostly done (no banding).
+**Status:** Mostly done (banding in `group.Aggregate`).
 
 ## Responsibility
 
@@ -28,14 +28,18 @@ pairs.
 
 ## Current package
 
-- `internal/phash` — `Compute`, `Hash.Hamming`, Lanczos resize, DCT.
+- `internal/phash` — `Compute`, `Hash.Hamming`, `Hash.Band`, Lanczos resize,
+  DCT.
 - `internal/fingerprint` — decode by kind, apply orientation, call phash,
   attach EXIF facts from `meta`.
+- `internal/group` — `Aggregate` runs the band candidate index: the 128-bit
+  hash is split into `maxHamming+1` contiguous bands (`phash.Hash.Band`,
+  width capped at 64 bits); two hashes at distance ≤ `maxHamming` must share
+  a whole band (pigeonhole), so only bucket mates are exact-tested.
+  Identical sha256 / phash strings group through O(n) maps.
 - `internal/ingest` — fingerprint cache: on a forced re-scan, a file whose
   (size, mtime) matches the stored `images` row keeps its stored sha256,
   phash and EXIF facts instead of being re-hashed.
-
-**Gaps:** no `Candidates` / band index (mvp-gaps #7).
 
 ## Pseudocode (target)
 

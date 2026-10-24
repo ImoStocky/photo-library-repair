@@ -22,6 +22,7 @@
 package phash
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"image"
@@ -107,6 +108,36 @@ func (h Hash) Hamming(o Hash) int {
 		d += bits.OnesCount8(h[i] ^ o[i])
 	}
 	return d
+}
+
+// Band returns the width bits of the hash starting at bit offset bit
+// (offset 0 is the most significant bit of the first byte). Width must not
+// exceed 64.
+//
+// Band is the building block of the band candidate index: split the hash
+// into k+1 contiguous bands and, by the pigeonhole principle, any two
+// hashes at hamming distance k or less share at least one whole band, so
+// near-duplicate grouping only needs to exact-test bucket mates.
+func (h Hash) Band(bit, width int) uint64 {
+	hi := binary.BigEndian.Uint64(h[:8])
+	lo := binary.BigEndian.Uint64(h[8:])
+	switch {
+	case bit+width <= 64:
+		return hi >> uint(64-bit-width) & bandMask(width)
+	case bit >= 64:
+		b := bit - 64
+		return lo >> uint(64-b-width) & bandMask(width)
+	default:
+		hiPart := 64 - bit
+		return (hi&bandMask(hiPart))<<uint(width-hiPart) | lo>>uint(64-width+hiPart)
+	}
+}
+
+func bandMask(width int) uint64 {
+	if width >= 64 {
+		return ^uint64(0)
+	}
+	return (1 << uint(width)) - 1
 }
 
 // Hex renders the hash as a 32-character lowercase hex string.

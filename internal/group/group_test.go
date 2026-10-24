@@ -1,10 +1,18 @@
 package group
 
 import (
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"math/rand/v2"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"photo-library-repair/internal/phash"
 )
 
 // Controlled 128-bit hashes: a<b<c chain at hamming 1-2, d is far away.
@@ -271,6 +279,128 @@ func TestPickNamePreferences(t *testing.T) {
 		}
 		if got := pickName(imgs, tc.pixel); got != tc.want {
 			t.Fatalf("pickName(%v, %s) = %q, want %q", tc.names, tc.pixel, got, tc.want)
+		}
+	}
+}
+
+// bruteAggregate is the pre-banding all-pairs reference: identical sha256,
+// identical phash strings, and hamming distance within maxHamming all
+// group. It pins the behavior the band index must reproduce exactly.
+func bruteAggregate(imgs []Image, maxHamming int) [][]Image {
+	n := len(imgs)
+	parent := make([]int, n)
+	for i := range parent {
+		parent[i] = i
+	}
+	find := func(x int) int {
+		for parent[x] != x {
+			parent[x] = parent[parent[x]]
+			x = parent[x]
+		}
+		return x
+	}
+	union := func(a, b int) {
+		ra, rb := find(a), find(b)
+		if ra != rb {
+			parent[rb] = ra
+		}
+	}
+	for i := range n {
+		for j := i + 1; j < n; j++ {
+			if imgs[i].SHA256 != "" && imgs[i].SHA256 == imgs[j].SHA256 {
+				union(i, j)
+				continue
+			}
+			if imgs[i].Phash != "" && imgs[i].Phash == imgs[j].Phash {
+				union(i, j)
+				continue
+			}
+			if imgs[i].Phash != "" && imgs[j].Phash != "" {
+				h, _ := phash.HashFromHex(imgs[i].Phash)
+				g, _ := phash.HashFromHex(imgs[j].Phash)
+				if h.Hamming(g) <= maxHamming {
+					union(i, j)
+				}
+			}
+		}
+	}
+	byRoot := map[int][]Image{}
+	for i := range n {
+		byRoot[find(i)] = append(byRoot[find(i)], imgs[i])
+	}
+	out := make([][]Image, 0, len(byRoot))
+	for _, g := range byRoot {
+		out = append(out, g)
+	}
+	return out
+}
+
+func memberSets(groups [][]Image) map[string][]string {
+	out := map[string][]string{}
+	for _, g := range groups {
+		ids := make([]string, len(g))
+		for i, m := range g {
+			ids[i] = m.ID
+		}
+		slices.Sort(ids)
+		for _, id := range ids {
+			out[id] = ids
+		}
+	}
+	return out
+}
+
+// TestAggregateBandingMatchesBruteForce checks the band-index Aggregate
+// against the all-pairs reference across radii, including the exact and
+// negative radii where banding is degenerate or skipped.
+func TestAggregateBandingMatchesBruteForce(t *testing.T) {
+	rng := rand.New(rand.NewPCG(9, 4))
+	var imgs []Image
+	for i := range 40 {
+		h := make([]byte, 16)
+		binary.BigEndian.PutUint64(h[:8], rng.Uint64())
+		binary.BigEndian.PutUint64(h[8:], rng.Uint64())
+		imgs = append(imgs, Image{
+			ID: fmt.Sprintf("i%02d", i), Name: fmt.Sprintf("i%02d.jpg", i),
+			Phash: hex.EncodeToString(h), SHA256: fmt.Sprintf("sha-%d", i),
+			CreatedAt: int64(i), Width: 1, Height: 1, Size: 1,
+		})
+	}
+	// Near pairs: one bit off from their originals at i=1,5,9,13,17.
+	for _, i := range []int{1, 5, 9, 13, 17} {
+		var b [16]byte
+		hex.Decode(b[:], []byte(imgs[i].Phash))
+		b[0] ^= 1
+		imgs = append(imgs, Image{
+			ID: fmt.Sprintf("n%02d", i), Name: fmt.Sprintf("n%02d.jpg", i),
+			Phash: hex.EncodeToString(b[:]), SHA256: fmt.Sprintf("sha-n%d", i),
+			CreatedAt: int64(100 + i), Width: 1, Height: 1, Size: 1,
+		})
+	}
+	// A sha duplicate with far phashes.
+	imgs[2].SHA256 = imgs[30].SHA256
+	// An exact phash-string duplicate with a distinct sha.
+	imgs = append(imgs, Image{
+		ID: "dup", Name: "dup.jpg",
+		Phash: imgs[7].Phash, SHA256: "sha-dup",
+		CreatedAt: 200, Width: 1, Height: 1, Size: 1,
+	})
+	// Malformed phash pair and a phash-less image.
+	for _, id := range []string{"bad1", "bad2"} {
+		imgs = append(imgs, Image{
+			ID: id, Name: id + ".jpg", Phash: "zz", SHA256: "sha-" + id,
+			CreatedAt: 300, Width: 1, Height: 1, Size: 1,
+		})
+	}
+	imgs = append(imgs, Image{
+		ID: "nop", Name: "nop.jpg", SHA256: "sha-nop",
+		CreatedAt: 400, Width: 1, Height: 1, Size: 1,
+	})
+
+	for _, radius := range []int{0, 1, 2, 8, 12, 16, -1} {
+		_, groups := Aggregate(imgs, radius)
+		if got, want := memberSets(groups), memberSets(bruteAggregate(imgs, radius)); !reflect.DeepEqual(got, want) {
+			t.Fatalf("radius %d: banding grouping differs from brute force", radius)
 		}
 	}
 }

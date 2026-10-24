@@ -2,10 +2,12 @@ package phash
 
 import (
 	"bytes"
+	"encoding/binary"
 	"image"
 	"image/color"
 	"image/jpeg"
 	"math"
+	"math/rand/v2"
 	"testing"
 
 	"photo-library-repair/internal/testimg"
@@ -312,5 +314,58 @@ func TestComputeGolden(t *testing.T) {
 	const want = "7700f8ffadaa07506c750741ec550775"
 	if h.Hex() != want {
 		t.Fatalf("golden hash = %s, want %s", h.Hex(), want)
+	}
+}
+
+func TestBandCoversTheHash(t *testing.T) {
+	a, _ := HashFromHex("0123456789abcdef0123456789abcdef")
+	// 16 bands of 8 bits reconstruct the hash byte by byte.
+	var got Hash
+	for i := range 16 {
+		got[i] = byte(a.Band(i*8, 8))
+	}
+	if got != a {
+		t.Fatalf("8-bit bands = %x, want %x", got, a)
+	}
+	// 128 bands of 1 bit match a big-endian bit readout.
+	for bit := range Bits {
+		want := byte((a[bit/8] >> uint(7-bit%8)) & 1)
+		if got := a.Band(bit, 1); got != uint64(want) {
+			t.Fatalf("bit %d = %d, want %d", bit, got, want)
+		}
+	}
+	// A straddling band takes the low bits of byte 7, all of byte 8,
+	// and the high bits of byte 9.
+	want := uint64(a[7]&0x0F)<<12 | uint64(a[8])<<4 | uint64(a[9]>>4)
+	if got := a.Band(60, 16); got != want {
+		t.Fatalf("Band(60,16) = %x, want %x", got, want)
+	}
+}
+
+func TestBandPigeonhole(t *testing.T) {
+	rng := rand.New(rand.NewPCG(1, 2))
+	for k := 0; k <= 4; k++ {
+		width := min((Bits+k)/(k+1), 64)
+		for trial := range 100 {
+			var a Hash
+			binary.BigEndian.PutUint64(a[:8], rng.Uint64())
+			binary.BigEndian.PutUint64(a[8:], rng.Uint64())
+			b := a
+			for d := 0; d < k; d++ {
+				pos := int(rng.Uint32() % Bytes)
+				b[pos] ^= 1 << (rng.Uint32() % 8)
+			}
+			found := false
+			for bnd := 0; bnd*width < Bits; bnd++ {
+				if a.Band(bnd*width, width) == b.Band(bnd*width, width) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("k=%d trial %d: distance-%d pair %x/%x shares no band",
+					k, trial, a.Hamming(b), a, b)
+			}
+		}
 	}
 }

@@ -114,6 +114,12 @@ type Resolver interface {
 // chain through transitive closure. It returns the imageID -> groupID
 // assignment (ids 1..n, in order of first appearance) and the member
 // lists per group.
+//
+// Near-duplicate candidates come from a band index: the 128-bit hash is
+// split into maxHamming+1 contiguous bands, and two hashes at distance
+// maxHamming or less must share a whole band (pigeonhole), so only bucket
+// mates are exact-tested. Grouping stays exact, without the all-pairs
+// pass.
 func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 	n := len(imgs)
 	parent := make([]int, n)
@@ -134,24 +140,72 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 		}
 	}
 
+	// Identical sha256 always groups.
+	bySha := map[string]int{}
+	for i, im := range imgs {
+		if im.SHA256 == "" {
+			continue
+		}
+		if first, ok := bySha[im.SHA256]; ok {
+			union(first, i)
+		} else {
+			bySha[im.SHA256] = i
+		}
+	}
+	// Identical phash strings always group (this also covers unparseable
+	// hashes, which all parse to zero).
+	byPhash := map[string]int{}
+	for i, im := range imgs {
+		if im.Phash == "" {
+			continue
+		}
+		if first, ok := byPhash[im.Phash]; ok {
+			union(first, i)
+		} else {
+			byPhash[im.Phash] = i
+		}
+	}
+
 	var hashes []phash.Hash
 	for _, im := range imgs {
 		h, _ := phash.HashFromHex(im.Phash) // "" fails; hash stays zero
 		hashes = append(hashes, h)
 	}
-	for i := range n {
-		for j := i + 1; j < n; j++ {
-			if imgs[i].SHA256 != "" && imgs[i].SHA256 == imgs[j].SHA256 {
-				union(i, j)
+	if maxHamming >= 0 && n > 1 {
+		width := min((phash.Bits+maxHamming)/(maxHamming+1),
+			// Band values fit in 64 bits
+			64)
+		type bandKey struct {
+			band  int
+			value uint64
+		}
+		buckets := map[bandKey][]int{}
+		for i, im := range imgs {
+			if im.Phash == "" {
 				continue
 			}
-			if imgs[i].Phash != "" && imgs[i].Phash == imgs[j].Phash {
-				union(i, j)
-				continue
+			for b := 0; b*width < phash.Bits; b++ {
+				key := bandKey{b, hashes[i].Band(b*width, width)}
+				buckets[key] = append(buckets[key], i)
 			}
-			if imgs[i].Phash != "" && imgs[j].Phash != "" &&
-				hashes[i].Hamming(hashes[j]) <= maxHamming {
-				union(i, j)
+		}
+		seen := map[int64]bool{}
+		for _, idxs := range buckets {
+			for a := range idxs {
+				for c := a + 1; c < len(idxs); c++ {
+					i, j := idxs[a], idxs[c]
+					if i > j {
+						i, j = j, i
+					}
+					pair := int64(i)*int64(n) + int64(j)
+					if seen[pair] {
+						continue
+					}
+					seen[pair] = true
+					if hashes[i].Hamming(hashes[j]) <= maxHamming {
+						union(i, j)
+					}
+				}
 			}
 		}
 	}
