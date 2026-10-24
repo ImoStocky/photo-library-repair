@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"photo-library-repair/internal/apply"
 	"photo-library-repair/internal/exif"
@@ -29,6 +30,10 @@ import (
 // default (12) so quality re-encodings of the same picture always chain,
 // which is what the checks want to exercise.
 const maxHamming = 16
+
+// conflictHamming is the near-identical conflict limit the checks use; it
+// matches the CLI default for --conflict-hamming.
+const conflictHamming = 2
 
 // Check is the outcome of one built-in check.
 type Check struct {
@@ -132,7 +137,7 @@ func (e *env) groupPlan() (plans []store.Group, members map[int64][]string, err 
 				planMembers = append(planMembers, im)
 			}
 		}
-		p := group.ResolveGroup(planMembers, nil)
+		p := group.ResolveGroup(planMembers, nil, conflictHamming)
 		g := store.Group{
 			ID:              id,
 			Status:          p.Status,
@@ -336,11 +341,12 @@ func checkCaptureRules() Check {
 	return Check{Name: name, OK: true}
 }
 
-// checkConflicts verifies that EXIF disagreements the automatic rules cannot
-// settle (differing timezone offsets, one member with GPS and one without)
-// are surfaced as conflicts with a reason.
+// checkConflicts verifies that disagreements the automatic rules cannot
+// settle (differing timezone offsets, one member with GPS and one without,
+// near-identical pictures with identical capture times) are surfaced as
+// conflicts with a reason.
 func checkConflicts() Check {
-	const name = "plan: flags offset and GPS disagreement as conflicts"
+	const name = "plan: flags offset, GPS and near-identical pairs as conflicts"
 	e, err := newEnv()
 	if err != nil {
 		return Check{Name: name, Detail: err.Error()}
@@ -352,6 +358,8 @@ func checkConflicts() Check {
 		"IMG_C2.jpg": exifJPEG(4, 90, "2024:05:01 12:30:00", "+05:00", false),
 		"IMG_D1.jpg": exifJPEG(5, 95, "2024:05:01 12:30:00", "+02:00", true),
 		"IMG_D2.jpg": exifJPEG(5, 90, "2024:05:01 12:30:00", "+02:00", false),
+		"IMG_E1.jpg": exifJPEG(6, 95, "2024:05:01 12:30:00", "+02:00", true),
+		"IMG_E2.jpg": exifJPEG(6, 95, "2024:05:01 12:30:00", "+02:00", true), // byte-identical, same capture
 	}
 	for rel, data := range files {
 		if err := e.write(rel, data); err != nil {
@@ -365,11 +373,11 @@ func checkConflicts() Check {
 	if err != nil {
 		return Check{Name: name, Detail: fmt.Sprintf("group/plan: %v", err)}
 	}
-	if len(plans) != 2 {
-		return Check{Name: name, Detail: fmt.Sprintf("%d groups (want 2)", len(plans))}
+	if len(plans) != 3 {
+		return Check{Name: name, Detail: fmt.Sprintf("%d groups (want 3)", len(plans))}
 	}
 
-	offPlan, ok := planFor(plans, members, "IMG_C1.jpg")
+	offPlan, ok := planFor(plans, members, "IMG_C1.jpg") // offset group
 	if !ok || offPlan.Status != group.StatusConflict {
 		return Check{Name: name, Detail: fmt.Sprintf("offset group: status %q reason %q (want conflict)", offPlan.Status, offPlan.Reason)}
 	}
@@ -379,6 +387,13 @@ func checkConflicts() Check {
 	gpsPlan, ok := planFor(plans, members, "IMG_D1.jpg")
 	if !ok || gpsPlan.Status != group.StatusConflict {
 		return Check{Name: name, Detail: fmt.Sprintf("GPS group: status %q reason %q (want conflict)", gpsPlan.Status, gpsPlan.Reason)}
+	}
+	nearPlan, ok := planFor(plans, members, "IMG_E1.jpg")
+	if !ok || nearPlan.Status != group.StatusConflict {
+		return Check{Name: name, Detail: fmt.Sprintf("near-identical group: status %q reason %q (want conflict)", nearPlan.Status, nearPlan.Reason)}
+	}
+	if !strings.Contains(nearPlan.Reason, "near-identical") {
+		return Check{Name: name, Detail: fmt.Sprintf("near-identical reason %q", nearPlan.Reason)}
 	}
 	return Check{Name: name, OK: true}
 }

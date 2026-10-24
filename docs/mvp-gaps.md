@@ -22,7 +22,7 @@ pipeline (scan → group → plan → apply/amalgamate).
 | 8 | phash cache keyed by (path, size, mtime) | Not implemented | Re-scanning re-hashes every file. The directory skip (`--force` required to re-scan) limits the cost; a forced re-scan after edits is the supported workflow. |
 | 9 | HDBSCAN/OPTICS, `--min-cluster-size` | Intentionally omitted | Chain aggregation with `--max-hamming` is the clustering engine; tune the radius per library. |
 | 10 | Copying extra camera tags (description, artist, copyright, ...) onto the output | Implemented | Engine writes preserve **every** metadata tag in the source (title, description, artist, copyright, camera fields, ...) while overwriting the merged facts; covered by `plr selftest` check 6. |
-| 11 | `--conflict-hamming` flag | Parsed but unused | The plan phase has no rule that consumes it; the flag is kept for interface parity. Conflicts come from EXIF disagreement and the creation-time-vs-capture check. |
+| 11 | `--conflict-hamming` flag | Implemented | Plan rule: any pair of group members whose perceptual hashes are within `--conflict-hamming` bits (default 2) and whose capture instants are identical marks the group as a conflict ("near-identical pictures … with identical capture time"); a negative limit disables the rule. Composes with the EXIF-disagreement conflicts, which take precedence; the AI resolver can settle the result. |
 
 ## Notes
 

@@ -99,7 +99,9 @@ func chooseName(ms []Member) string {
 ## CLI
 
 `plr plan` — writes into `groups` status/reason/pixel/capture/gps/name.
-`--conflict-hamming` is parsed but unused (mvp-gaps #11).
+`--conflict-hamming` (default 2) drives the near-identical conflict rule in
+`group.ResolveGroup`: a member pair within the limit with identical capture
+instants turns the group into a conflict.
 
 ## When fixing parity
 

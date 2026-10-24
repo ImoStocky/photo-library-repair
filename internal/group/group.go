@@ -14,6 +14,9 @@
 //     before its own capture time is a conflict;
 //   - several EXIF pictures agree when only their capture times differ;
 //     any other EXIF disagreement (offsets, GPS) is a conflict;
+//   - two pictures whose perceptual hashes differ by at most the conflict
+//     limit (ResolveGroup's third argument) and whose capture instants
+//     are identical are a conflict; a negative limit disables the rule;
 //   - the stored name is the member name that most resembles an original
 //     camera file name.
 //
@@ -188,7 +191,9 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 
 // ResolveGroup applies the resolution rules to one group of pictures.
 // res may be nil, in which case conflicts stay unresolved.
-func ResolveGroup(imgs []Image, res Resolver) Plan {
+// conflictHamming is the phash limit (bits) of the near-identical
+// conflict rule; a negative value disables that rule.
+func ResolveGroup(imgs []Image, res Resolver, conflictHamming int) Plan {
 	if len(imgs) == 0 {
 		panic("group: ResolveGroup of an empty group")
 	}
@@ -240,6 +245,12 @@ func ResolveGroup(imgs []Image, res Resolver) Plan {
 		captureIdx, conflictReason = resolveMultipleEXIF(imgs, exif)
 		if conflictReason == "" {
 			reason = "earliest EXIF capture time; EXIF data agrees"
+		}
+	}
+
+	if conflictReason == "" {
+		if d, found := nearIdenticalPair(imgs, conflictHamming); found {
+			conflictReason = fmt.Sprintf("near-identical pictures (phash distance %d, limit %d) with identical capture time", d, conflictHamming)
 		}
 	}
 
@@ -320,6 +331,46 @@ func resolveMultipleEXIF(imgs, exif []Image) (int, string) {
 		}
 	}
 	return indexof(imgs, exif[all[best].idx].ID), ""
+}
+
+// nearIdenticalPair reports the first pair of members whose perceptual
+// hashes differ by at most limit bits and whose capture instants are
+// identical, with their distance. Members without a usable hash are
+// skipped; a negative limit disables the rule.
+func nearIdenticalPair(imgs []Image, limit int) (int, bool) {
+	if limit < 0 {
+		return 0, false
+	}
+	type member struct {
+		hash    phash.Hash
+		instant int64
+		ok      bool
+	}
+	members := make([]member, len(imgs))
+	for i, im := range imgs {
+		if im.Phash == "" {
+			continue
+		}
+		h, err := phash.HashFromHex(im.Phash)
+		if err != nil {
+			continue
+		}
+		members[i] = member{hash: h, instant: captureInstant(im), ok: true}
+	}
+	for i := range members {
+		if !members[i].ok {
+			continue
+		}
+		for j := i + 1; j < len(members); j++ {
+			if !members[j].ok || members[j].instant != members[i].instant {
+				continue
+			}
+			if d := members[i].hash.Hamming(members[j].hash); d <= limit {
+				return d, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // bestPixels picks the file with the most pixels, breaking ties on file

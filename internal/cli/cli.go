@@ -198,7 +198,6 @@ func runPlan(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	_ = conflictHamming // no rule uses it yet; see docs/mvp-gaps.md
 	s, err := store.Open(*db)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr plan:", err)
@@ -216,11 +215,11 @@ func runPlan(args []string) int {
 		defer close()
 		fmt.Printf("decision model %s loaded; settling conflicts\n", res.Name())
 	}
-	return runPlanPhase(s, res)
+	return runPlanPhase(s, res, *conflictHamming)
 }
 
 // runPlanPhase is the plan step, shared by "plr plan" and "plr build".
-func runPlanPhase(s *store.Store, res group.Resolver) int {
+func runPlanPhase(s *store.Store, res group.Resolver, conflictHamming int) int {
 	imgs, err := s.AllImages()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr plan:", err)
@@ -252,7 +251,7 @@ func runPlanPhase(s *store.Store, res group.Resolver) int {
 	slices.Sort(ids)
 	aiSettled := 0
 	for _, id := range ids {
-		p := group.ResolveGroup(byGroup[id], res)
+		p := group.ResolveGroup(byGroup[id], res, conflictHamming)
 		if p.ResolvedBy != group.Rules {
 			aiSettled++
 		}
@@ -412,7 +411,6 @@ func runPipeline(cmd string, args []string) int {
 		fmt.Fprintf(os.Stderr, "plr %s: --dir and --target are required\n", cmd)
 		return 2
 	}
-	_ = conflictHamming // no rule uses it yet; see docs/mvp-gaps.md
 	s, err := store.Open(*db)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr "+cmd+":", err)
@@ -429,7 +427,7 @@ func runPipeline(cmd string, args []string) int {
 	}{
 		{"scan", func() int { return runScanPhase(s, dirs, *force, *workers, *minSizeKB, tool) }},
 		{"group", func() int { return runGroupPhase(s, *maxHamming) }},
-		{"plan", func() int { return runPlanPhase(s, nil) }},
+		{"plan", func() int { return runPlanPhase(s, nil, *conflictHamming) }},
 		{"apply", func() int {
 			return runApplyPhase(s, apply.Options{
 				Target:         *target,
