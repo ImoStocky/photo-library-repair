@@ -1,6 +1,7 @@
 package apply
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -91,6 +92,90 @@ func TestApplyCopiesJPEGWithEXIF(t *testing.T) {
 	}
 	if !f.HasGPS || f.GPSLat < 52.52 || f.GPSLon < 13.40 {
 		t.Fatalf("gps = %v %v %v", f.HasGPS, f.GPSLat, f.GPSLon)
+	}
+}
+
+func TestApplyWritesReportJSON(t *testing.T) {
+	s, srcDir, sid := newStore(t)
+	addFile(t, srcDir, "a.jpg", testimg.JPEG(testimg.Textured(32, 24, 1), 90))
+	addFile(t, srcDir, "b.jpg", testimg.JPEG(testimg.Textured(32, 24, 2), 90))
+	addImage(t, s, sid, "a.jpg", "a.jpg", "a", "jpeg", 100)
+	addImage(t, s, sid, "b.jpg", "b.jpg", "b", "jpeg", 100)
+	if err := s.SaveGroup(store.Group{ID: 1, Status: group.StatusResolved, PixelImageID: "a",
+		CaptureTime: "2024:05:01 12:30:00", CaptureInstant: instant,
+		HasGPS: true, GPSLat: 52.5204, GPSLon: 13.4055,
+		StoredName: "a.jpg"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveGroup(store.Group{ID: 2, Status: group.StatusConflict, PixelImageID: "b",
+		Reason: "offsets disagree", CaptureInstant: instant, StoredName: "b.jpg"}); err != nil {
+		t.Fatal(err)
+	}
+
+	target := t.TempDir()
+	rep, err := Apply(s, Options{Target: target})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Errors) != 0 {
+		t.Fatalf("errors: %v", rep.Errors)
+	}
+
+	data, err := os.ReadFile(filepath.Join(target, "report.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rj struct {
+		Generated string `json:"generated"`
+		Target    string `json:"target"`
+		Copied    int    `json:"copied"`
+		Skipped   int    `json:"skipped"`
+		Files     []struct {
+			Source string `json:"source"`
+			Dest   string `json:"dest"`
+			EXIF   bool   `json:"exif"`
+		} `json:"files"`
+		Groups []struct {
+			ID          int64   `json:"id"`
+			StoredName  string  `json:"stored_name"`
+			Status      string  `json:"status"`
+			Reason      string  `json:"reason"`
+			CaptureTime string  `json:"capture_time"`
+			HasGPS      bool    `json:"has_gps"`
+			GPSLat      float64 `json:"gps_lat"`
+			PixelSource string  `json:"pixel_source"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal(data, &rj); err != nil {
+		t.Fatalf("parse report.json: %v", err)
+	}
+	if rj.Target != target {
+		t.Fatalf("target = %q, want %q", rj.Target, target)
+	}
+	if rj.Copied != 1 || rj.Skipped != 1 {
+		t.Fatalf("copied=%d skipped=%d, want 1/1", rj.Copied, rj.Skipped)
+	}
+	if len(rj.Files) != 1 || !rj.Files[0].EXIF {
+		t.Fatalf("files = %+v", rj.Files)
+	}
+	if rj.Files[0].Source != filepath.Join(srcDir, "a.jpg") {
+		t.Fatalf("file source = %q", rj.Files[0].Source)
+	}
+	if len(rj.Groups) != 2 || rj.Groups[0].ID != 1 || rj.Groups[1].ID != 2 {
+		t.Fatalf("groups = %+v", rj.Groups)
+	}
+	g0, g1 := rj.Groups[0], rj.Groups[1]
+	if g0.Status != group.StatusResolved || g1.Status != group.StatusConflict {
+		t.Fatalf("statuses = %q %q", g0.Status, g1.Status)
+	}
+	if g0.CaptureTime != "2024:05:01 12:30:00" || !g0.HasGPS || g0.GPSLat != 52.5204 {
+		t.Fatalf("resolved facts = %+v", g0)
+	}
+	if g0.PixelSource != filepath.Join(srcDir, "a.jpg") {
+		t.Fatalf("pixel source = %q", g0.PixelSource)
+	}
+	if g1.Reason != "offsets disagree" {
+		t.Fatalf("conflict reason = %q", g1.Reason)
 	}
 }
 

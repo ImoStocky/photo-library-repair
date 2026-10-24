@@ -9,10 +9,13 @@
 package apply
 
 import (
+	"cmp"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -35,11 +38,11 @@ type Options struct {
 
 // FileResult describes one file the run copies (or would copy).
 type FileResult struct {
-	Source  string // source pixel file path
-	Dest    string // destination path in the target
-	Renamed bool   // the stored name collided and was adjusted
-	EXIF    bool   // merged EXIF will be (was) written
-	Moved   bool   // move mode: the source file was deleted
+	Source  string `json:"source"`
+	Dest    string `json:"dest"`
+	Renamed bool   `json:"renamed,omitempty"` // the stored name collided and was adjusted
+	EXIF    bool   `json:"exif,omitempty"`    // merged EXIF will be (was) written
+	Moved   bool   `json:"moved,omitempty"`   // move mode: the source file was deleted
 }
 
 // Report summarizes an apply run.
@@ -53,11 +56,82 @@ type Report struct {
 	Errors  []string
 }
 
+// groupJSON is one plan entry in report.json.
+type groupJSON struct {
+	ID              int64   `json:"id"`
+	StoredName      string  `json:"stored_name"`
+	Status          string  `json:"status"`
+	Reason          string  `json:"reason,omitempty"`
+	CaptureTime     string  `json:"capture_time,omitempty"`
+	CaptureFallback bool    `json:"capture_fallback,omitempty"`
+	HasGPS          bool    `json:"has_gps,omitempty"`
+	GPSLat          float64 `json:"gps_lat,omitzero"`
+	GPSLon          float64 `json:"gps_lon,omitzero"`
+	PixelSource     string  `json:"pixel_source,omitempty"`
+}
+
+// reportJSON is the machine-readable summary written into the target
+// directory as report.json after a non-dry-run apply.
+type reportJSON struct {
+	Generated string       `json:"generated"`
+	Target    string       `json:"target"`
+	Copied    int          `json:"copied"`
+	Moved     int          `json:"moved,omitempty"`
+	Renamed   int          `json:"renamed,omitempty"`
+	Skipped   int          `json:"skipped,omitempty"`
+	Files     []FileResult `json:"files"`
+	Groups    []groupJSON  `json:"groups"`
+	Errors    []string     `json:"errors,omitempty"`
+}
+
+// writeReportJSON writes report.json into target summarizing the run and
+// every group's plan (including skipped conflicts).
+func writeReportJSON(target string, rep Report, groups []store.Group, byID map[string]store.Image, sources map[int64]string) error {
+	rj := reportJSON{
+		Generated: time.Now().UTC().Format(time.RFC3339),
+		Target:    target,
+		Copied:    rep.Copied,
+		Moved:     rep.Moved,
+		Renamed:   rep.Renamed,
+		Skipped:   rep.Skipped,
+		Files:     rep.Files,
+		Groups:    make([]groupJSON, 0, len(groups)),
+		Errors:    rep.Errors,
+	}
+	ordered := slices.Clone(groups)
+	slices.SortFunc(ordered, func(a, b store.Group) int { return cmp.Compare(a.ID, b.ID) })
+	for _, g := range ordered {
+		ej := groupJSON{
+			ID:              g.ID,
+			StoredName:      g.StoredName,
+			Status:          g.Status,
+			Reason:          g.Reason,
+			CaptureTime:     g.CaptureTime,
+			CaptureFallback: g.CaptureFallback,
+			HasGPS:          g.HasGPS,
+			GPSLat:          g.GPSLat,
+			GPSLon:          g.GPSLon,
+		}
+		if im, ok := byID[g.PixelImageID]; ok {
+			ej.PixelSource = filepath.Join(sources[im.SourceID], im.RelPath)
+		}
+		rj.Groups = append(rj.Groups, ej)
+	}
+	data, err := json.MarshalIndent(rj, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	return os.WriteFile(filepath.Join(target, "report.json"), data, 0o644)
+}
+
 // Apply materializes the library's plans into opts.Target. It reads the
 // store only; the database is not modified. In move mode the pixel file of
-// each successfully placed group is deleted from the source directory. A
-// non-nil error is returned for fatal setup problems (unreadable library,
-// uncreatable target); per-file problems are accumulated in Report.Errors.
+// each successfully placed group is deleted from the source directory.
+// After placing files it writes a report.json into opts.Target summarizing
+// the run and every group's plan. A non-nil error is returned for fatal
+// setup problems (unreadable library, uncreatable target); per-file
+// problems are accumulated in Report.Errors.
 func Apply(s *store.Store, opts Options) (Report, error) {
 	var rep Report
 	rep.DryRun = opts.DryRun
@@ -168,6 +242,12 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 		rep.Copied++
 		if name != g.StoredName {
 			rep.Renamed++
+		}
+	}
+
+	if !opts.DryRun {
+		if err := writeReportJSON(opts.Target, rep, groups, byID, sources); err != nil {
+			rep.Errors = append(rep.Errors, fmt.Sprintf("write report.json: %v", err))
 		}
 	}
 	return rep, nil

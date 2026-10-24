@@ -81,8 +81,9 @@ Commands:
             resolved_by the model id.
   apply     Copy the planned pixel files into --target and write the merged
             EXIF (capture time, offset, GPS) onto the copies. With --move the
-            source file is deleted once its copy is in place. Conflict
-            groups are skipped unless --force-conflicts is given.
+            source file is deleted once its copy is in place. Writes a
+            report.json summary into --target. Conflict groups are skipped
+            unless --force-conflicts is given.
   build     scan + group + plan + apply in one go.
   increment Merge new photos into an existing library: scan the new dirs
             into the same DB, then re-group (new near-duplicates chain into

@@ -8,8 +8,8 @@ on demand). **apply** is the current CLI command and Go package for that
 same step. Keep both names in docs; **do not rename the CLI while other
 agents are working**. Sources and the SQLite library are not consumed.
 
-**Status:** Partial — copy + `--move` + EXIF write; no rename-vacate /
-`report.json`. Old-draft rename/commit actions are optional later.
+**Status:** Partial — copy + `--move` + EXIF write + `report.json`; no
+rename-vacate. Old-draft rename/commit actions are optional later.
 
 ## Responsibility
 
@@ -43,7 +43,9 @@ directory, write chosen metadata onto the copies, emit report. I/O.
   reported (both files remain); a true dest == src is never followed by a
   deletion (same-file guard).
 - Skips `StatusConflict` groups unless forced.
-- No rename-vacate graph; no `report.json` (use `plr report`).
+- Writes `report.json` into the target after a non-dry-run: run summary
+  (files, counts, errors) plus every group's plan.
+- No rename-vacate graph.
 
 ## Pseudocode (target)
 

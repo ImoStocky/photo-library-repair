@@ -5,6 +5,7 @@ package selftest
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"image"
 	"image/color"
@@ -386,7 +387,7 @@ func checkConflicts() Check {
 // merged EXIF, leaves conflict groups alone, honors --dry-run, applies
 // conflicts when forced, and renames stored names that already exist.
 func checkApply() Check {
-	const name = "apply: writes merged EXIF, skips conflicts, honors dry-run, moves sources, renames collisions"
+	const name = "apply: writes merged EXIF + report.json, skips conflicts, honors dry-run, moves sources, renames collisions"
 	e, err := newEnv()
 	if err != nil {
 		return Check{Name: name, Detail: err.Error()}
@@ -440,6 +441,34 @@ func checkApply() Check {
 	if facts.Capture != "2024:05:01 12:30:00" || facts.Offset != "+02:00" || !facts.HasGPS {
 		return Check{Name: name, Detail: fmt.Sprintf("merged EXIF %q %q gps=%v (want 2024:05:01 12:30:00 +02:00 gps)",
 			facts.Capture, facts.Offset, facts.HasGPS)}
+	}
+
+	data, err := os.ReadFile(filepath.Join(target, "report.json"))
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("report.json missing: %v", err)}
+	}
+	var rj struct {
+		Generated string `json:"generated"`
+		Copied    int    `json:"copied"`
+		Skipped   int    `json:"skipped"`
+		Files     []struct {
+			Source string `json:"source"`
+			Dest   string `json:"dest"`
+			EXIF   bool   `json:"exif"`
+		} `json:"files"`
+		Groups []struct {
+			Status string `json:"status"`
+		} `json:"groups"`
+	}
+	if err := json.Unmarshal(data, &rj); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("parse report.json: %v", err)}
+	}
+	if rj.Copied != 1 || rj.Skipped != 1 || len(rj.Groups) != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("report.json copied=%d skipped=%d groups=%d (want 1/1/2)",
+			rj.Copied, rj.Skipped, len(rj.Groups))}
+	}
+	if len(rj.Files) != 1 || !rj.Files[0].EXIF || rj.Files[0].Dest != out {
+		return Check{Name: name, Detail: fmt.Sprintf("report.json files = %+v", rj.Files)}
 	}
 
 	dryTarget := filepath.Join(target, "dry") // must not be created
