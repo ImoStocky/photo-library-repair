@@ -1,6 +1,5 @@
 // Package fingerprint computes the per-file facts recorded while scanning:
-// the 128-bit perceptual hash, the displayed dimensions, and the EXIF
-// capture facts.
+// the perceptual hash, the displayed dimensions, and the EXIF capture facts.
 //
 // JPEG, PNG and GIF are decoded with the standard library. WebP, TIFF and
 // HEIF have no pure-Go decoder in this prototype, so files of those kinds
@@ -29,7 +28,7 @@ var errNoDecoder = errors.New("no decoder for this format")
 
 // Info is the computed fingerprint of one image file.
 type Info struct {
-	Phash       string // 32 hex chars (16-byte perceptual hash), "" when unhashable
+	Phash       string // hex perceptual hash (length depends on alg/size), "" when unhashable
 	Width       int    // displayed width (after EXIF orientation)
 	Height      int    // displayed height
 	Kind        string // jpeg|png|gif|webp|tiff|heic
@@ -41,24 +40,31 @@ type Info struct {
 }
 
 // Compute reads path and derives its fingerprint with the built-in
-// decoders and the minimal JPEG EXIF reader. Formats without a decoder
-// (webp, tiff, heic) yield an Info with an empty Phash and no error;
-// corrupt pictures of decodable formats are an error.
+// decoders, the minimal JPEG EXIF reader, and the default (legacy 16×8
+// DCT) perceptual hash. Formats without a decoder (webp, tiff, heic)
+// yield an Info with an empty Phash and no error; corrupt pictures of
+// decodable formats are an error.
 func Compute(path, kind string) (Info, error) {
-	return compute(path, kind, nil)
+	return compute(path, kind, nil, phash.Config{})
 }
 
 // WithEXIF returns a hasher that reads the EXIF facts through the
 // full-data engine, which sees every available tag; the pipeline
 // consumes the standard four. A nil engine falls back to the built-in
-// reader.
+// reader. Uses the default perceptual-hash config.
 func WithEXIF(t *exif.Tool) func(path, kind string) (Info, error) {
+	return Hasher(phash.Config{}, t)
+}
+
+// Hasher returns a fingerprint function that uses cfg for the perceptual
+// hash and optional t for full-data EXIF.
+func Hasher(cfg phash.Config, t *exif.Tool) func(path, kind string) (Info, error) {
 	return func(path, kind string) (Info, error) {
-		return compute(path, kind, t)
+		return compute(path, kind, t, cfg)
 	}
 }
 
-func compute(path, kind string, t *exif.Tool) (Info, error) {
+func compute(path, kind string, t *exif.Tool, cfg phash.Config) (Info, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Info{}, err
@@ -72,7 +78,7 @@ func compute(path, kind string, t *exif.Tool) (Info, error) {
 		}
 		return info, fmt.Errorf("decode %s: %w", path, err)
 	}
-	h, err := phash.Compute(img)
+	h, err := phash.ComputeWith(img, cfg)
 	if err != nil {
 		return info, fmt.Errorf("hash %s: %w", path, err)
 	}

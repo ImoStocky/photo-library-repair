@@ -14,7 +14,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 
 	"photo-library-repair/internal/apply"
 	"photo-library-repair/internal/exif"
@@ -366,11 +365,11 @@ func checkCaptureRules() Check {
 }
 
 // checkConflicts verifies that disagreements the automatic rules cannot
-// settle (differing timezone offsets, one member with GPS and one without,
-// near-identical pictures with identical capture times) are surfaced as
-// conflicts with a reason.
+// settle (differing timezone offsets, one member with GPS and one without)
+// are surfaced as conflicts with a reason, while exact duplicates with the
+// same capture time resolve normally (bestPixels picks the winner).
 func checkConflicts() Check {
-	const name = "plan: flags offset, GPS and near-identical pairs as conflicts"
+	const name = "plan: flags offset and GPS conflicts; exact duplicates resolve"
 	e, err := newEnv()
 	if err != nil {
 		return Check{Name: name, Detail: err.Error()}
@@ -412,12 +411,9 @@ func checkConflicts() Check {
 	if !ok || gpsPlan.Status != group.StatusConflict {
 		return Check{Name: name, Detail: fmt.Sprintf("GPS group: status %q reason %q (want conflict)", gpsPlan.Status, gpsPlan.Reason)}
 	}
-	nearPlan, ok := planFor(plans, members, "IMG_E1.jpg")
-	if !ok || nearPlan.Status != group.StatusConflict {
-		return Check{Name: name, Detail: fmt.Sprintf("near-identical group: status %q reason %q (want conflict)", nearPlan.Status, nearPlan.Reason)}
-	}
-	if !strings.Contains(nearPlan.Reason, "near-identical") {
-		return Check{Name: name, Detail: fmt.Sprintf("near-identical reason %q", nearPlan.Reason)}
+	dupPlan, ok := planFor(plans, members, "IMG_E1.jpg")
+	if !ok || dupPlan.Status != group.StatusResolved {
+		return Check{Name: name, Detail: fmt.Sprintf("exact-duplicate group: status %q reason %q (want resolved)", dupPlan.Status, dupPlan.Reason)}
 	}
 	return Check{Name: name, OK: true}
 }

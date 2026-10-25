@@ -4,17 +4,18 @@
 
 **Spec:** [chapter 02 §2.1](chapter-02-semantics.md).
 **Decision:** [chapter 05 §9.1](chapter-05-decisions.md).
-**Status:** Mostly done (banding in `group.Aggregate`).
+**Status:** Mostly done (banding in `group.Aggregate`; multi-alg/size phash).
 
 ## Responsibility
 
-Orient + DCT phash (16-byte), Hamming distance, banding candidate index.
-Pure.
+Orient + perceptual hash, Hamming distance, banding candidate index. Pure.
 
 ## Spec summary
 
-- 16-byte DCT phash after EXIF orientation (`hash_size=16`).
-- JPEG may use ~64 px edge preview for speed; store full oriented dims.
+- Default: legacy 16×8 DCT phash (128 bits) after EXIF orientation.
+- Also via `--phash-alg` / `--phash-size`: square DCT **8×8 / 16×16 / 32×32**,
+  and Czkawka/image_hasher **mean**, **median**, **gradient**,
+  **vert-gradient**, **double-gradient**, **blockhash** (sizes 8/16/32).
 - Default radius for clustering/merge: **12** bits (MVP CLI default is 12).
 - Cache key `(path, size, mtime_ns)`.
 
@@ -28,15 +29,16 @@ pairs.
 
 ## Current package
 
-- `internal/phash` — `Compute`, `Hash.Hamming`, `Hash.Band`, Lanczos resize,
-  DCT.
-- `internal/fingerprint` — decode by kind, apply orientation, call phash,
-  attach EXIF facts from `meta`.
-- `internal/group` — `Aggregate` runs the band candidate index: the 128-bit
-  hash is split into `maxHamming+1` contiguous bands (`phash.Hash.Band`,
-  width capped at 64 bits); two hashes at distance ≤ `maxHamming` must share
-  a whole band (pigeonhole), so only bucket mates are exact-tested.
-  Identical sha256 / phash strings group through O(n) maps.
+- `internal/phash` — `Compute` / `ComputeWith(Config)`, `Hash.Hamming`,
+  `Hash.Band`, Lanczos resize, DCT (legacy + square sizes), and Czkawka
+  Mean / Median / Gradient / VertGradient / DoubleGradient / Blockhash.
+- `internal/fingerprint` — decode by kind, apply orientation, call phash
+  (`Hasher(cfg, tool)`), attach EXIF facts from `meta`.
+- `internal/group` — `Aggregate` runs the band candidate index over the
+  stored hash bit length (`maxHamming+1` bands, width capped at 64 bits);
+  two hashes at distance ≤ `maxHamming` must share a whole band
+  (pigeonhole), so only bucket mates are exact-tested. Identical sha256 /
+  phash strings group through O(n) maps.
 - `internal/ingest` — fingerprint cache: on a forced re-scan, a file whose
   (size, mtime) matches the stored `images` row keeps its stored sha256,
   phash and EXIF facts instead of being re-hashed.

@@ -17,6 +17,7 @@ import (
 	"photo-library-repair/internal/group"
 	"photo-library-repair/internal/ingest"
 	kronkai "photo-library-repair/internal/kronk"
+	"photo-library-repair/internal/phash"
 	"photo-library-repair/internal/selftest"
 	"photo-library-repair/internal/store"
 )
@@ -63,6 +64,7 @@ const usageText = `plr - photo library repair
 
 Usage:
   plr scan     --dir DIR... [--force] [--db PATH] [--workers N] [--min-size-kb N]
+               [--phash-alg ALG] [--phash-size 8|16|32]
   plr group    [--max-hamming N] [--db PATH]
   plr plan     [--conflict-hamming N] [--ai] [--model SOURCE] [--db PATH]
   plr apply    --target DIR [--dry-run] [--no-exif] [--move] [--force-conflicts] [--db PATH]
@@ -74,9 +76,13 @@ Usage:
   plr selftest
 
 Commands:
-  scan      Walk directories, record every image (sha256, 16-byte perceptual
-            hash, EXIF capture time) into the SQL library. Directories that
-            were already scanned are skipped unless --force is given.
+  scan      Walk directories, record every image (sha256, perceptual hash,
+            EXIF capture time) into the SQL library. --phash-alg selects
+            the hasher: dct (default, legacy 16x8 when --phash-size is
+            omitted), or a Czkawka/image_hasher algorithm — mean, median,
+            gradient, vert-gradient, double-gradient, blockhash.
+            --phash-size 8|16|32 selects a square hash. Directories already
+            scanned are skipped unless --force is given.
   group     Group images: exact sha256 matches share a group, and images
             whose perceptual hashes differ by at most --max-hamming bits are
             chained into the same group.
@@ -119,12 +125,19 @@ func runScan(args []string) int {
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	workers := fs.Int("workers", 4, "number of hash workers")
 	minSizeKB := fs.Int("min-size-kb", 0, "ignore images smaller than this many kilobytes")
+	phashAlg := fs.String("phash-alg", "dct", "perceptual hash: dct|mean|median|gradient|vert-gradient|double-gradient|blockhash")
+	phashSize := fs.Int("phash-size", 0, "square hash size 8, 16, or 32 (0 = legacy 16x8 DCT)")
 	fs.Var(&dirs, "dir", "directory to scan (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if len(dirs) == 0 {
 		fmt.Fprintln(os.Stderr, "plr scan: at least one --dir is required")
+		return 2
+	}
+	cfg, err := parsePhashConfig(*phashAlg, *phashSize)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr scan:", err)
 		return 2
 	}
 	s, err := store.Open(*db)
@@ -137,15 +150,22 @@ func runScan(args []string) int {
 	if tool != nil {
 		defer tool.Close()
 	}
-	return runScanPhase(s, dirs, *force, *workers, *minSizeKB, tool)
+	return runScanPhase(s, dirs, *force, *workers, *minSizeKB, tool, cfg)
+}
+
+// parsePhashConfig builds a phash.Config from CLI flags.
+func parsePhashConfig(alg string, size int) (phash.Config, error) {
+	a, err := phash.ParseAlg(alg)
+	if err != nil {
+		return phash.Config{}, err
+	}
+	cfg := phash.Config{Alg: a, Size: phash.Size(size)}
+	return cfg.Normalize()
 }
 
 // runScanPhase is the scan step, shared by "plr scan" and "plr build".
-func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB int, tool *exif.Tool) int {
-	hasher := fingerprint.Compute
-	if tool != nil {
-		hasher = fingerprint.WithEXIF(tool)
-	}
+func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB int, tool *exif.Tool, cfg phash.Config) int {
+	hasher := fingerprint.Hasher(cfg, tool)
 	rep, err := ingest.Scan(s, ingest.Options{
 		Dirs:    dirs,
 		Force:   force,
@@ -418,12 +438,19 @@ func runPipeline(cmd string, args []string) int {
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	workers := fs.Int("workers", 4, "number of hash workers")
 	minSizeKB := fs.Int("min-size-kb", 0, "ignore images smaller than this many kilobytes")
+	phashAlg := fs.String("phash-alg", "dct", "perceptual hash: dct|mean|median|gradient|vert-gradient|double-gradient|blockhash")
+	phashSize := fs.Int("phash-size", 0, "square hash size 8, 16, or 32 (0 = legacy 16x8 DCT)")
 	fs.Var(&dirs, "dir", "directory to scan (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if len(dirs) == 0 || *target == "" {
 		fmt.Fprintf(os.Stderr, "plr %s: --dir and --target are required\n", cmd)
+		return 2
+	}
+	cfg, err := parsePhashConfig(*phashAlg, *phashSize)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr "+cmd+":", err)
 		return 2
 	}
 	s, err := store.Open(*db)
@@ -440,7 +467,7 @@ func runPipeline(cmd string, args []string) int {
 		label string
 		fn    func() int
 	}{
-		{"scan", func() int { return runScanPhase(s, dirs, *force, *workers, *minSizeKB, tool) }},
+		{"scan", func() int { return runScanPhase(s, dirs, *force, *workers, *minSizeKB, tool, cfg) }},
 		{"group", func() int { return runGroupPhase(s, *maxHamming) }},
 		{"plan", func() int { return runPlanPhase(s, nil, *conflictHamming) }},
 		{"commit", func() int { return runCommitPhase(s, cmd) }},

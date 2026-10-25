@@ -1,63 +1,199 @@
-// Package phash computes the 16-byte (128-bit) perceptual hash used for
-// near-duplicate grouping.
+// Package phash computes perceptual hashes for near-duplicate grouping.
 //
-// The construction mirrors the DCT preprocessing of qarmin/img_hash, the
-// hashing library behind czkawka's similar-image search:
+// # Legacy DCT hash (Compute / Config{Alg: AlgDCT})
 //
-//  1. convert the picture to 8-bit luma,
-//  2. resize to twice the hash region (32x16) with LANCZOS3, quantizing the
-//     result back to 8-bit,
-//  4. keep only the low-frequency top-left quadrant of the DCT (16x8 =
-//     128 coefficients),
-//  5. threshold each coefficient against the median of the quadrant: bit i
-//     is 1 when the coefficient is >= the median.
+// The default 16×8 (128-bit) DCT path mirrors qarmin/img_hash's optional DCT
+// preprocessing. Square DCT sizes 8×8 / 16×16 / 32×32 are also available.
 //
-// Bits are packed least-significant-bit first, like img_hash's default.
-// Hamming distance over the 128 bits measures similarity.
+// # Czkawka-compatible hashes
 //
-// Compute works for any image size: the LANCZOS3 resize is streamed row by
-// row, so working memory is bounded by the 32 x source-height grid
-// intermediate no matter how large the picture is, and the filter
-// degenerates to the identity when the source already is the 32x16 grid.
+// ComputeWith implements the algorithms Czkawka/Krokiet expose via
+// image_hasher — Mean, Median, Gradient, VertGradient, DoubleGradient,
+// Blockhash — at square sizes 8, 16 and 32. Bits are packed LSB-first.
 package phash
 
 import (
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"image"
 	"math/bits"
 	"slices"
+	"strings"
 )
 
 const (
-	// Bytes is the perceptual hash size in bytes.
+	// Bytes is the legacy default perceptual hash size in bytes (DCT 16×8).
 	Bytes = 16
-	// Bits is the perceptual hash size in bits.
+	// Bits is the legacy default perceptual hash size in bits.
 	Bits = Bytes * 8
-	// hashW x hashH is the low-frequency DCT quadrant that becomes the hash.
-	hashW = 16
-	hashH = 8
-	// The DCT is computed at twice the hash region (img_hash SIZE_MULTIPLIER).
-	gridW = hashW * 2
-	gridH = hashH * 2
 )
 
-// Hash is a 16-byte (128-bit) perceptual hash, bits packed LSB first.
-type Hash [Bytes]byte
+// Alg selects the perceptual-hash construction.
+type Alg string
 
-// Compute derives the perceptual hash of an image.
+const (
+	// AlgDCT is median-thresholded DCT (legacy pHash). Empty Config.Alg defaults here.
+	AlgDCT Alg = "dct"
+	// AlgMean compares each resized pixel to the mean (aHash-like).
+	AlgMean Alg = "mean"
+	// AlgMedian compares each resized pixel to the median.
+	AlgMedian Alg = "median"
+	// AlgGradient is the horizontal gradient hash (dHash-like).
+	AlgGradient Alg = "gradient"
+	// AlgVertGradient is the vertical gradient hash.
+	AlgVertGradient Alg = "vert-gradient"
+	// AlgDoubleGradient chains horizontal then vertical gradients.
+	AlgDoubleGradient Alg = "double-gradient"
+	// AlgBlockhash is the blockhash.io algorithm (no resize).
+	AlgBlockhash Alg = "blockhash"
+)
+
+// Size is the square hash dimension N for an N×N hash (8, 16, or 32).
+type Size int
+
+const (
+	Size8  Size = 8
+	Size16 Size = 16
+	Size32 Size = 32
+)
+
+// Config selects the hash algorithm and dimension.
+//
+// For [AlgDCT], Size 0 keeps the legacy 16×8 (128-bit) hash; Size 8/16/32
+// produce square N×N DCT hashes (N² bits). For Czkawka algorithms, Size
+// defaults to 16 when zero and must be 8, 16, or 32.
+type Config struct {
+	Alg  Alg
+	Size Size
+}
+
+// Normalize fills defaults and rejects unsupported combinations.
+func (c Config) Normalize() (Config, error) {
+	if c.Alg == "" {
+		c.Alg = AlgDCT
+	}
+	switch c.Alg {
+	case AlgDCT, AlgMean, AlgMedian, AlgGradient, AlgVertGradient, AlgDoubleGradient, AlgBlockhash:
+	default:
+		return c, fmt.Errorf("unknown phash alg %q", c.Alg)
+	}
+	if c.Size == 0 {
+		if c.Alg != AlgDCT {
+			c.Size = Size16
+		}
+		return c, nil
+	}
+	switch c.Size {
+	case Size8, Size16, Size32:
+	default:
+		return c, fmt.Errorf("phash size must be 8, 16, or 32, got %d", c.Size)
+	}
+	return c, nil
+}
+
+// ParseAlg maps a Czkawka/Krokiet algorithm name (case-insensitive).
+func ParseAlg(s string) (Alg, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "dct", "phash", "":
+		return AlgDCT, nil
+	case "mean":
+		return AlgMean, nil
+	case "median":
+		return AlgMedian, nil
+	case "gradient":
+		return AlgGradient, nil
+	case "vertgradient", "vert-gradient", "vert_gradient", "v.grad.", "vgrad":
+		return AlgVertGradient, nil
+	case "doublegradient", "double-gradient", "double_gradient", "d.grad.", "dgrad":
+		return AlgDoubleGradient, nil
+	case "blockhash":
+		return AlgBlockhash, nil
+	default:
+		return "", fmt.Errorf("unknown hash algorithm %q", s)
+	}
+}
+
+// ParseSize accepts 8, 16 or 32.
+func ParseSize(n int) (Size, error) {
+	switch Size(n) {
+	case Size8, Size16, Size32:
+		return Size(n), nil
+	default:
+		return 0, fmt.Errorf("hash size %d not supported (want 8, 16 or 32)", n)
+	}
+}
+
+// BitLen returns how many hash bits Alg produces at size (0 = legacy DCT 128).
+func (a Alg) BitLen(size Size) int {
+	if a == AlgDCT && size == 0 {
+		return Bits
+	}
+	n := int(size)
+	if n == 0 {
+		n = 16
+	}
+	switch a {
+	case AlgDCT, AlgMean, AlgMedian, AlgGradient, AlgVertGradient, AlgBlockhash:
+		return n * n
+	case AlgDoubleGradient:
+		return n*n/2 + n
+	default:
+		return 0
+	}
+}
+
+// Hash is a packed LSB-first bit string of variable length.
+type Hash []byte
+
+// Compute derives the legacy 16×8 DCT perceptual hash of an image.
 func Compute(img image.Image) (Hash, error) {
+	return ComputeWith(img, Config{})
+}
+
+// ComputeWith derives a perceptual hash under cfg.
+func ComputeWith(img image.Image, cfg Config) (Hash, error) {
+	cfg, err := cfg.Normalize()
+	if err != nil {
+		return nil, err
+	}
 	b := img.Bounds()
 	if b.Empty() {
-		return Hash{}, fmt.Errorf("empty image")
+		return nil, fmt.Errorf("empty image")
 	}
+	n := int(cfg.Size)
 
-	// Resize to the DCT grid with LANCZOS3, streamed row by row so the
-	// source is never fully materialized; quantize the result back to
-	// 8-bit, matching the img_hash pipeline (the resize output is 8-bit
-	// luma before the DCT).
-	resized := lanczosGrid(img, b)
+	switch cfg.Alg {
+	case AlgDCT:
+		if cfg.Size == 0 {
+			return computeDCT(img, b, 16, 8)
+		}
+		return computeDCT(img, b, n, n)
+	case AlgMean:
+		luma := lanczosU8(img, b, n, n)
+		return packBoolBits(meanBits(luma)), nil
+	case AlgMedian:
+		luma := lanczosU8(img, b, n, n)
+		return packBoolBits(medianBits(luma)), nil
+	case AlgGradient:
+		luma := lanczosU8(img, b, n+1, n)
+		return packBoolBits(gradientBits(luma, n+1)), nil
+	case AlgVertGradient:
+		luma := lanczosU8(img, b, n, n+1)
+		return packBoolBits(vertGradientBits(luma, n)), nil
+	case AlgDoubleGradient:
+		return computeDoubleGradient(img, b, n)
+	case AlgBlockhash:
+		return blockhash(img, b, n, n)
+	default:
+		return nil, fmt.Errorf("unknown phash alg %q", cfg.Alg)
+	}
+}
+
+// computeDCT resizes to (2*hashW)×(2*hashH), runs a 2-D DCT, and
+// median-thresholds the top-left hashW×hashH quadrant.
+func computeDCT(img image.Image, b image.Rectangle, hashW, hashH int) (Hash, error) {
+	gridW, gridH := hashW*2, hashH*2
+	resized := lanczosResize(img, b, gridW, gridH)
 	grid := make([][]float64, gridH)
 	for i := range grid {
 		grid[i] = make([]float64, gridW)
@@ -65,27 +201,36 @@ func Compute(img image.Image) (Hash, error) {
 			grid[i][j] = float64(clamp8(resized[i*gridW+j]))
 		}
 	}
-
 	dct := dct2d(grid)
+	vals := make([]float64, 0, hashW*hashH)
+	for i := range hashH {
+		vals = append(vals, dct[i][:hashW]...)
+	}
+	return packMedianBits(vals), nil
+}
 
-	// Crop to the low-frequency top-left quadrant and threshold against
-	// its median.
-	vals := quadrant(dct)
+func packMedianBits(vals []float64) Hash {
 	med := median(vals)
-
-	var hsh Hash
+	nbytes := (len(vals) + 7) / 8
+	hsh := make(Hash, nbytes)
 	for i, v := range vals {
 		if v >= med {
 			hsh[i/8] |= 1 << uint(i%8)
 		}
 	}
-	return hsh, nil
+	return hsh
 }
+
+// BitLen returns the number of bits in the hash (8 × len(h)).
+func (h Hash) BitLen() int { return len(h) * 8 }
 
 // Valid reports whether the hash carries information. All-zero and
 // all-ones hashes are rejected (constant or near-constant pictures),
-// mirroring czkawka's is_hash_valid.
+// mirroring czkawka's is_hash_valid. A nil/empty hash is invalid.
 func (h Hash) Valid() bool {
+	if len(h) == 0 {
+		return false
+	}
 	allZero, allOne := true, true
 	for _, b := range h {
 		if b != 0 {
@@ -102,7 +247,11 @@ func (h Hash) Valid() bool {
 }
 
 // Hamming returns the number of bits that differ between two hashes.
+// Hashes of unequal length are treated as maximally different.
 func (h Hash) Hamming(o Hash) int {
+	if len(h) != len(o) {
+		return max(len(h), len(o)) * 8
+	}
 	var d int
 	for i := range h {
 		d += bits.OnesCount8(h[i] ^ o[i])
@@ -112,62 +261,44 @@ func (h Hash) Hamming(o Hash) int {
 
 // Band returns the width bits of the hash starting at bit offset bit
 // (offset 0 is the most significant bit of the first byte). Width must not
-// exceed 64.
-//
-// Band is the building block of the band candidate index: split the hash
-// into k+1 contiguous bands and, by the pigeonhole principle, any two
-// hashes at hamming distance k or less share at least one whole band, so
-// near-duplicate grouping only needs to exact-test bucket mates.
+// exceed 64; bits past the end of the hash read as zero.
 func (h Hash) Band(bit, width int) uint64 {
-	hi := binary.BigEndian.Uint64(h[:8])
-	lo := binary.BigEndian.Uint64(h[8:])
-	switch {
-	case bit+width <= 64:
-		return hi >> uint(64-bit-width) & bandMask(width)
-	case bit >= 64:
-		b := bit - 64
-		return lo >> uint(64-b-width) & bandMask(width)
-	default:
-		hiPart := 64 - bit
-		return (hi&bandMask(hiPart))<<uint(width-hiPart) | lo>>uint(64-width+hiPart)
+	if width <= 0 {
+		return 0
 	}
+	if width > 64 {
+		width = 64
+	}
+	var out uint64
+	for i := range width {
+		pos := bit + i
+		by := pos / 8
+		if by >= len(h) {
+			break
+		}
+		if h[by]&(1<<uint(7-pos%8)) != 0 {
+			out |= 1 << uint(width-1-i)
+		}
+	}
+	return out
 }
 
-func bandMask(width int) uint64 {
-	if width >= 64 {
-		return ^uint64(0)
-	}
-	return (1 << uint(width)) - 1
-}
+// Hex renders the hash as a lowercase hex string.
+func (h Hash) Hex() string { return hex.EncodeToString(h) }
 
-// Hex renders the hash as a 32-character lowercase hex string.
-func (h Hash) Hex() string { return hex.EncodeToString(h[:]) }
-
-// HashFromHex parses a 32-character hex string.
+// HashFromHex parses a hex string into a Hash. Length must be even and
+// non-zero (any algorithm/size is accepted).
 func HashFromHex(s string) (Hash, error) {
-	var h Hash
 	b, err := hex.DecodeString(s)
 	if err != nil {
-		return h, err
+		return nil, err
 	}
-	if len(b) != Bytes {
-		return h, fmt.Errorf("perceptual hash has %d bytes, want %d", len(b), Bytes)
+	if len(b) == 0 {
+		return nil, fmt.Errorf("perceptual hash is empty")
 	}
-	copy(h[:], b)
-	return h, nil
+	return Hash(b), nil
 }
 
-// quadrant returns the top-left hashW x hashH block of the DCT matrix in
-// row-major order (img_hash crop_2d).
-func quadrant(dct [][]float64) []float64 {
-	vals := make([]float64, 0, Bits)
-	for i := range hashH {
-		vals = append(vals, dct[i][:hashW]...)
-	}
-	return vals
-}
-
-// clamp8 rounds to the nearest 8-bit luma value, clamped to 0..255.
 func clamp8(v float64) uint8 {
 	if v < 0 {
 		return 0

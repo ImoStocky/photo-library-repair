@@ -22,7 +22,8 @@ pipeline (scan → group → plan → apply/amalgamate).
 | 8 | phash cache keyed by (path, size, mtime) | Implemented | Forced re-scans compare each file's (size, mtime) with the stored row (new `mtime` column, unix nanoseconds): unchanged files keep their stored sha256/phash/EXIF facts and are never re-read, re-sha256'd or re-fingerprinted — `plr scan` counts them as `cached`. Changed files go through the normal fingerprint path. |
 | 9 | HDBSCAN/OPTICS, `--min-cluster-size` | Intentionally omitted | Chain aggregation with `--max-hamming` is the clustering engine; tune the radius per library. |
 | 10 | Copying extra camera tags (description, artist, copyright, ...) onto the output | Implemented | Engine writes preserve **every** metadata tag in the source (title, description, artist, copyright, camera fields, ...) while overwriting the merged facts; covered by `plr selftest` check 6. |
-| 11 | `--conflict-hamming` flag | Implemented | Plan rule: any pair of group members whose perceptual hashes are within `--conflict-hamming` bits (default 2) and whose capture instants are identical marks the group as a conflict ("near-identical pictures … with identical capture time"); a negative limit disables the rule. Composes with the EXIF-disagreement conflicts, which take precedence; the AI resolver can settle the result. |
+| 11 | `--conflict-hamming` flag | Implemented | Plan rule: a member pair whose perceptual hashes differ by 1…`--conflict-hamming` bits (default 2) and share a capture instant marks the group as a conflict ("near-identical pictures … with identical capture time"). Exact phash matches (distance 0 — normal re-encodes / duplicates) resolve via bestPixels. A negative limit disables the rule. Composes with the EXIF-disagreement conflicts, which take precedence; the AI resolver can settle the result. |
+| 12 | Alternate perceptual-hash types (Czkawka algs + sizes) | Implemented (hasher); architecture open | `internal/phash` / `--phash-alg` / `--phash-size` now cover: **dct** (legacy 16×8 default, or square 8/16/32), and Czkawka/image_hasher **mean**, **median**, **gradient**, **vert-gradient**, **double-gradient**, **blockhash** at sizes **8 / 16 / 32**. DoubleGradient packs horiz then vert comparisons on an (N/2+1)² Lanczos3 grid (40/144/544 bits). Against DedupTestSet, DCT alone still plateaus (~F1 0.875); remaining misses need the candidate/veto architecture below, not a larger radius. |
 
 ## Notes
 
@@ -33,3 +34,28 @@ pipeline (scan → group → plan → apply/amalgamate).
 - Selftest groups with a phash radius of 16 bits (the CLI default is 12) so
   quality re-encodings of the same picture always chain; the checks verify
   the resolution rules, not the default radius.
+- DedupTestSet vs Czkawka (`results_similar_images*.json` under
+  `Downloads/DedupTestSet/DedupTestSet/`): best DCT radius on that corpus is
+  **14** (smallest radius on the max-F1 plateau); 20 is on the same plateau.
+
+## Architecture direction (phash is unreliable alone)
+
+Phash (any family) can both **miss** hard re-encodes/thumbnails and **merge**
+unrelated frames. Planned heading for grouping:
+
+1. **Permissive candidates** — phash (and banding) only *propose* near-dup
+   groups; default radius may stay generous for recall.
+2. **EXIF veto** — if members' EXIF strongly disagrees (capture time/offset,
+   camera, GPS, …), treat that as evidence they are **different photos** and
+   refuse the merge (or mark a conflict). True duplicates usually share EXIF;
+   a phash hit with mismatched EXIF is a false friend.
+3. **Keep unresolvable conflicts in the library** — do not drop them from
+   `groups` / apply forever; they stay recorded so a later pass can settle
+   them. Apply may still skip materializing conflict pixels until forced.
+4. **Vision fallback via Kronk** — for leftovers the rules cannot settle,
+   call the Kronk SDK with a vision-capable model to decide whether images
+   depict the same scene; write `resolved_by` accordingly (same pattern as
+   today's `--ai` conflict resolver, broadened to "same picture?").
+
+Diameter-bounded clusters (no silent friend-of-friend chains) remain a
+companion hardening; see chapter 12 / 15 when implementing.

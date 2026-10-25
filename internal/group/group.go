@@ -115,11 +115,11 @@ type Resolver interface {
 // assignment (ids 1..n, in order of first appearance) and the member
 // lists per group.
 //
-// Near-duplicate candidates come from a band index: the 128-bit hash is
-// split into maxHamming+1 contiguous bands, and two hashes at distance
-// maxHamming or less must share a whole band (pigeonhole), so only bucket
-// mates are exact-tested. Grouping stays exact, without the all-pairs
-// pass.
+// Near-duplicate candidates come from a band index: each hash is split into
+// maxHamming+1 contiguous bands, and two hashes at distance maxHamming or
+// less must share a whole band (pigeonhole), so only bucket mates are
+// exact-tested. Grouping stays exact, without the all-pairs pass. All
+// images in one library are assumed to share the same hash length.
 func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 	n := len(imgs)
 	parent := make([]int, n)
@@ -167,12 +167,16 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 	}
 
 	var hashes []phash.Hash
+	bitLen := 0
 	for _, im := range imgs {
-		h, _ := phash.HashFromHex(im.Phash) // "" fails; hash stays zero
+		h, _ := phash.HashFromHex(im.Phash) // "" fails; hash stays nil
 		hashes = append(hashes, h)
+		if n := h.BitLen(); n > bitLen {
+			bitLen = n
+		}
 	}
-	if maxHamming >= 0 && n > 1 {
-		width := min((phash.Bits+maxHamming)/(maxHamming+1),
+	if maxHamming >= 0 && n > 1 && bitLen > 0 {
+		width := min((bitLen+maxHamming)/(maxHamming+1),
 			// Band values fit in 64 bits
 			64)
 		type bandKey struct {
@@ -184,7 +188,7 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 			if im.Phash == "" {
 				continue
 			}
-			for b := 0; b*width < phash.Bits; b++ {
+			for b := 0; b*width < bitLen; b++ {
 				key := bandKey{b, hashes[i].Band(b*width, width)}
 				buckets[key] = append(buckets[key], i)
 			}
@@ -419,7 +423,10 @@ func nearIdenticalPair(imgs []Image, limit int) (int, bool) {
 			if !members[j].ok || members[j].instant != members[i].instant {
 				continue
 			}
-			if d := members[i].hash.Hamming(members[j].hash); d <= limit {
+			// Exact phash match (d == 0) is a normal re-encode / duplicate:
+			// bestPixels picks the winner. The rule is for suspiciously
+			// similar-but-not-identical frames that share a capture instant.
+			if d := members[i].hash.Hamming(members[j].hash); d > 0 && d <= limit {
 				return d, true
 			}
 		}

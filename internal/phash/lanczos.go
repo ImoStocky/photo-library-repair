@@ -17,24 +17,15 @@ func lanczosKernel(x float64) float64 {
 	return (math.Sin(px) / px) * (math.Sin(px/3) / (px / 3))
 }
 
-// lanczosGrid rescales the picture in b to the DCT grid (gridW x gridH)
-// with a separable LANCZOS3 filter.
-//
-// The horizontal pass reads the source row by row: every output pixel is a
-// windowed average of at most 7 samples of one source row (the kernel
-// support is fixed in kernel units, independent of the ratio), so the pass
-// costs O(gridW x sourceHeight) and the only working buffer is
-// gridW x sourceHeight floats. The result is identical for every source
-// size, including upscale, and degenerates to the identity when the source
-// already is the grid size.
-func lanczosGrid(img image.Image, b image.Rectangle) []float64 {
+// lanczosResize rescales the picture in b to tw×th with a separable
+// LANCZOS3 filter and returns float luma row-major.
+func lanczosResize(img image.Image, b image.Rectangle, tw, th int) []float64 {
 	sw, sh := b.Dx(), b.Dy()
 
-	// Horizontal pass: b -> gridW x sh.
-	mid := make([]float64, gridW*sh)
-	sx := float64(sw) / float64(gridW)
+	mid := make([]float64, tw*sh)
+	sx := float64(sw) / float64(tw)
 	for y := range sh {
-		for x := range gridW {
+		for x := range tw {
 			c := (float64(x)+0.5)*sx - 0.5
 			var num, den float64
 			for k := int(math.Floor(c - 3)); k <= int(math.Ceil(c+3)); k++ {
@@ -48,16 +39,15 @@ func lanczosGrid(img image.Image, b image.Rectangle) []float64 {
 				den += wgt
 			}
 			if den != 0 {
-				mid[y*gridW+x] = num / den
+				mid[y*tw+x] = num / den
 			}
 		}
 	}
 
-	// Vertical pass: gridW x sh -> gridW x gridH.
-	out := make([]float64, gridW*gridH)
-	sy := float64(sh) / float64(gridH)
-	for y := range gridH {
-		for x := range gridW {
+	out := make([]float64, tw*th)
+	sy := float64(sh) / float64(th)
+	for y := range th {
+		for x := range tw {
 			c := (float64(y)+0.5)*sy - 0.5
 			var num, den float64
 			for k := int(math.Floor(c - 3)); k <= int(math.Ceil(c+3)); k++ {
@@ -65,13 +55,23 @@ func lanczosGrid(img image.Image, b image.Rectangle) []float64 {
 					continue
 				}
 				wgt := lanczosKernel(c - float64(k))
-				num += mid[k*gridW+x] * wgt
+				num += mid[k*tw+x] * wgt
 				den += wgt
 			}
 			if den != 0 {
-				out[y*gridW+x] = num / den
+				out[y*tw+x] = num / den
 			}
 		}
+	}
+	return out
+}
+
+// lanczosU8 is lanczosResize quantized to 8-bit luma (image_hasher Bytes path).
+func lanczosU8(img image.Image, b image.Rectangle, tw, th int) []uint8 {
+	f := lanczosResize(img, b, tw, th)
+	out := make([]uint8, len(f))
+	for i, v := range f {
+		out[i] = clamp8(v)
 	}
 	return out
 }

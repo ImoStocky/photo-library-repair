@@ -82,7 +82,7 @@ func TestComputeDeterministic(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a != b {
+	if !bytes.Equal(a, b) {
 		t.Fatalf("hash not deterministic: %x vs %x", a, b)
 	}
 	if a.Hamming(b) != 0 {
@@ -103,7 +103,7 @@ func TestComputeConstantImage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a != b {
+	if !bytes.Equal(a, b) {
 		t.Fatalf("constant image hash differs by source size: %x vs %x", a, b)
 	}
 	if a[0]&1 == 0 {
@@ -146,7 +146,8 @@ func TestDifferentImagesDiffer(t *testing.T) {
 }
 
 func TestHammingAndHex(t *testing.T) {
-	var a, b Hash
+	a := make(Hash, Bytes)
+	b := make(Hash, Bytes)
 	a[0] = 0xFF
 	b[0] = 0x0F
 	if d := a.Hamming(b); d != 4 {
@@ -160,11 +161,11 @@ func TestHammingAndHex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c != a {
+	if !bytes.Equal(c, a) {
 		t.Fatalf("hex round trip = %x, want %x", c, a)
 	}
-	if _, err := HashFromHex("abcd"); err == nil {
-		t.Fatal("HashFromHex must reject wrong length")
+	if _, err := HashFromHex(""); err == nil {
+		t.Fatal("HashFromHex must reject empty string")
 	}
 }
 
@@ -173,7 +174,7 @@ func TestValid(t *testing.T) {
 	if zero.Valid() {
 		t.Fatal("all-zero hash must be invalid")
 	}
-	var one Hash
+	one := make(Hash, Bytes)
 	for i := range one {
 		one[i] = 0xFF
 	}
@@ -252,16 +253,17 @@ func TestDctRectangular(t *testing.T) {
 	}
 }
 
-func TestLanczosGridConstant(t *testing.T) {
+func TestLanczosResizeConstant(t *testing.T) {
 	// A constant picture rescales to the same constant through the
-	// streaming resize, at any source size relative to the grid.
+	// streaming resize, at any source size relative to the destination.
 	img := image.NewGray(image.Rect(0, 0, 10, 10))
 	for i := range img.Pix {
 		img.Pix[i] = 43
 	}
-	out := lanczosGrid(img, img.Bounds())
-	if len(out) != gridW*gridH {
-		t.Fatalf("grid length = %d, want %d", len(out), gridW*gridH)
+	const dw, dh = 32, 16
+	out := lanczosResize(img, img.Bounds(), dw, dh)
+	if len(out) != dw*dh {
+		t.Fatalf("grid length = %d, want %d", len(out), dw*dh)
 	}
 	for i, v := range out {
 		if v < 42.99 || v > 43.01 {
@@ -284,8 +286,8 @@ func TestComputeAnySize(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Compute(%dx%d) failed: %v", s.w, s.h, err)
 		}
-		if h == (Hash{}) {
-			t.Fatalf("Compute(%dx%d) produced an all-zero hash", s.w, s.h)
+		if len(h) != Bytes {
+			t.Fatalf("Compute(%dx%d) length = %d, want %d", s.w, s.h, len(h), Bytes)
 		}
 	}
 }
@@ -320,11 +322,11 @@ func TestComputeGolden(t *testing.T) {
 func TestBandCoversTheHash(t *testing.T) {
 	a, _ := HashFromHex("0123456789abcdef0123456789abcdef")
 	// 16 bands of 8 bits reconstruct the hash byte by byte.
-	var got Hash
+	got := make(Hash, 16)
 	for i := range 16 {
 		got[i] = byte(a.Band(i*8, 8))
 	}
-	if got != a {
+	if !bytes.Equal(got, a) {
 		t.Fatalf("8-bit bands = %x, want %x", got, a)
 	}
 	// 128 bands of 1 bit match a big-endian bit readout.
@@ -347,10 +349,10 @@ func TestBandPigeonhole(t *testing.T) {
 	for k := 0; k <= 4; k++ {
 		width := min((Bits+k)/(k+1), 64)
 		for trial := range 100 {
-			var a Hash
+			a := make(Hash, Bytes)
 			binary.BigEndian.PutUint64(a[:8], rng.Uint64())
 			binary.BigEndian.PutUint64(a[8:], rng.Uint64())
-			b := a
+			b := Hash(bytes.Clone(a))
 			for d := 0; d < k; d++ {
 				pos := int(rng.Uint32() % Bytes)
 				b[pos] ^= 1 << (rng.Uint32() % 8)
@@ -367,5 +369,137 @@ func TestBandPigeonhole(t *testing.T) {
 					k, trial, a.Hamming(b), a, b)
 			}
 		}
+	}
+}
+
+func TestComputeWithSizes(t *testing.T) {
+	img := photoLike(400, 300, 0)
+	for _, size := range []Size{Size8, Size16, Size32} {
+		h, err := ComputeWith(img, Config{Alg: AlgDCT, Size: size})
+		if err != nil {
+			t.Fatalf("dct size %d: %v", size, err)
+		}
+		wantBits := int(size) * int(size)
+		if h.BitLen() < wantBits || h.BitLen() > wantBits+7 {
+			// BitLen is 8*ceil(bits/8); exact bit count is size².
+			t.Fatalf("dct size %d: BitLen=%d, want packed length for %d bits", size, h.BitLen(), wantBits)
+		}
+		if len(h) != (wantBits+7)/8 {
+			t.Fatalf("dct size %d: %d bytes, want %d", size, len(h), (wantBits+7)/8)
+		}
+	}
+}
+
+func TestDoubleGradientSizes(t *testing.T) {
+	img := photoLike(400, 300, 0)
+	// image_hasher: N*(N/2+1)*2 bits for hash_size(N,N).
+	wantBits := map[Size]int{Size8: 40, Size16: 144, Size32: 544}
+	for size, bits := range wantBits {
+		h, err := ComputeWith(img, Config{Alg: AlgDoubleGradient, Size: size})
+		if err != nil {
+			t.Fatalf("gradient size %d: %v", size, err)
+		}
+		if len(h) != (bits+7)/8 {
+			t.Fatalf("gradient size %d: %d bytes, want %d for %d bits", size, len(h), (bits+7)/8, bits)
+		}
+		// Deterministic.
+		h2, _ := ComputeWith(img, Config{Alg: AlgDoubleGradient, Size: size})
+		if !bytes.Equal(h, h2) {
+			t.Fatalf("gradient size %d not deterministic", size)
+		}
+	}
+}
+
+func TestDoubleGradientSimilarJPEG(t *testing.T) {
+	orig := photoLike(400, 300, 0)
+	a, err := ComputeWith(orig, Config{Alg: AlgDoubleGradient, Size: Size16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := ComputeWith(jpegEncode(t, orig, 90), Config{Alg: AlgDoubleGradient, Size: Size16})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 144-bit hash: allow a generous re-encode budget.
+	if d := a.Hamming(b); d > 40 {
+		t.Fatalf("gradient jpeg q=90 hamming = %d, want <= 40", d)
+	}
+}
+
+func TestConfigNormalize(t *testing.T) {
+	c, err := (Config{}).Normalize()
+	if err != nil || c.Alg != AlgDCT || c.Size != 0 {
+		t.Fatalf("default = %+v, err %v", c, err)
+	}
+	c, err = (Config{Alg: AlgDoubleGradient}).Normalize()
+	if err != nil || c.Size != Size16 {
+		t.Fatalf("gradient default size = %+v, err %v", c, err)
+	}
+	if _, err := (Config{Alg: "nope"}).Normalize(); err == nil {
+		t.Fatal("want error for unknown alg")
+	}
+	if _, err := (Config{Size: 12}).Normalize(); err == nil {
+		t.Fatal("want error for bad size")
+	}
+}
+
+func TestCzkawkaAlgsSizes(t *testing.T) {
+	img := photoLike(400, 300, 0)
+	algs := []Alg{AlgMean, AlgMedian, AlgGradient, AlgVertGradient, AlgDoubleGradient, AlgBlockhash}
+	for _, alg := range algs {
+		for _, size := range []Size{Size8, Size16, Size32} {
+			h, err := ComputeWith(img, Config{Alg: alg, Size: size})
+			if err != nil {
+				t.Fatalf("%s size %d: %v", alg, size, err)
+			}
+			want := (alg.BitLen(size) + 7) / 8
+			if len(h) != want {
+				t.Fatalf("%s size %d: %d bytes, want %d (bitlen %d)",
+					alg, size, len(h), want, alg.BitLen(size))
+			}
+			h2, err := ComputeWith(img, Config{Alg: alg, Size: size})
+			if err != nil || !bytes.Equal(h, h2) {
+				t.Fatalf("%s size %d not deterministic", alg, size)
+			}
+			if !h.Valid() {
+				t.Fatalf("%s size %d produced invalid (constant) hash %x", alg, size, h)
+			}
+		}
+	}
+}
+
+func TestCzkawkaAlgsDistinguishImages(t *testing.T) {
+	a := photoLike(400, 300, 0)
+	b := gradient(400, 300) // structurally different
+	algs := []Alg{AlgMean, AlgMedian, AlgGradient, AlgVertGradient, AlgDoubleGradient, AlgBlockhash}
+	for _, alg := range algs {
+		ha, err := ComputeWith(a, Config{Alg: alg, Size: Size16})
+		if err != nil {
+			t.Fatal(err)
+		}
+		hb, err := ComputeWith(b, Config{Alg: alg, Size: Size16})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if d := ha.Hamming(hb); d == 0 {
+			t.Fatalf("%s: different images hashed equal", alg)
+		}
+	}
+}
+
+func TestParseAlg(t *testing.T) {
+	cases := map[string]Alg{
+		"mean": AlgMean, "Mean": AlgMean,
+		"double_gradient": AlgDoubleGradient, "d.grad.": AlgDoubleGradient,
+		"blockhash": AlgBlockhash, "dct": AlgDCT,
+	}
+	for in, want := range cases {
+		got, err := ParseAlg(in)
+		if err != nil || got != want {
+			t.Fatalf("ParseAlg(%q) = %q, %v (want %q)", in, got, err, want)
+		}
+	}
+	if _, err := ParseAlg("nope"); err == nil {
+		t.Fatal("want error")
 	}
 }

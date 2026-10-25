@@ -215,7 +215,17 @@ func TestResolveNearIdenticalSameCaptureConflicts(t *testing.T) {
 		t.Fatalf("plan = %+v", p)
 	}
 
+	// Exact phash match (re-encode / duplicate) is not a conflict: bestPixels
+	// picks the winner.
+	b.Phash = a.Phash
+	b.ExifCapture = "2024:05:01 12:00:00"
+	p = ResolveGroup([]Image{a, b}, nil, 2)
+	if p.Status != StatusResolved {
+		t.Fatalf("exact phash match must resolve: %+v", p)
+	}
+
 	// The same hashes with different capture times do not conflict.
+	b.Phash = hb
 	b.ExifCapture = "2024:05:01 12:05:00"
 	p = ResolveGroup([]Image{a, b}, nil, 2)
 	if p.Status != StatusResolved {
