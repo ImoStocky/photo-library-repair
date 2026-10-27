@@ -26,9 +26,18 @@ import (
 // errNoDecoder marks formats this build cannot decode to pixels.
 var errNoDecoder = errors.New("no decoder for this format")
 
+// ExtraHash is one additional perceptual hash computed in the same decode
+// pass as Info.Phash (the candidate DCT). Ingest stores these under sha256.
+type ExtraHash struct {
+	Alg  phash.Alg
+	Size phash.Size // 0 = legacy DCT 16×8
+	Hex  string
+}
+
 // Info is the computed fingerprint of one image file.
 type Info struct {
-	Phash       string // hex perceptual hash (length depends on alg/size), "" when unhashable
+	Phash       string // candidate DCT hex (primary phash), "" when unhashable
+	ExtraHashes []ExtraHash
 	Width       int    // displayed width (after EXIF orientation)
 	Height      int    // displayed height
 	Kind        string // jpeg|png|gif|webp|tiff|heic
@@ -64,6 +73,14 @@ func Hasher(cfg phash.Config, t *exif.Tool) func(path, kind string) (Info, error
 	}
 }
 
+// IdentityExtras are the secondary hashes written into content_phash on
+// every successful decode so DoublePhash identity can run without
+// re-opening the file. Candidate Phash stays DCT (cfg).
+var IdentityExtras = []phash.Config{
+	{Alg: phash.AlgBlockhash, Size: phash.Size16},
+	{Alg: phash.AlgDoubleGradient, Size: phash.Size16},
+}
+
 func compute(path, kind string, t *exif.Tool, cfg phash.Config) (Info, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -78,6 +95,10 @@ func compute(path, kind string, t *exif.Tool, cfg phash.Config) (Info, error) {
 		}
 		return info, fmt.Errorf("decode %s: %w", path, err)
 	}
+	cfg, err = cfg.Normalize()
+	if err != nil {
+		return info, err
+	}
 	h, err := phash.ComputeWith(img, cfg)
 	if err != nil {
 		return info, fmt.Errorf("hash %s: %w", path, err)
@@ -85,6 +106,21 @@ func compute(path, kind string, t *exif.Tool, cfg phash.Config) (Info, error) {
 	b := img.Bounds()
 	info.Phash = h.Hex()
 	info.Width, info.Height = b.Dx(), b.Dy()
+	info.ExtraHashes = append(info.ExtraHashes, ExtraHash{
+		Alg: cfg.Alg, Size: cfg.Size, Hex: info.Phash,
+	})
+	for _, extra := range IdentityExtras {
+		if extra.Alg == cfg.Alg && extra.Size == cfg.Size {
+			continue
+		}
+		eh, err := phash.ComputeWith(img, extra)
+		if err != nil {
+			continue // secondary hashes are best-effort
+		}
+		info.ExtraHashes = append(info.ExtraHashes, ExtraHash{
+			Alg: extra.Alg, Size: extra.Size, Hex: eh.Hex(),
+		})
+	}
 
 	if kind == "jpeg" {
 		if f, ok := exifFacts(path, data, t); ok {

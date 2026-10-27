@@ -65,7 +65,7 @@ const usageText = `plr - photo library repair
 Usage:
   plr scan     --dir DIR... [--force] [--db PATH] [--workers N] [--min-size-kb N]
                [--phash-alg ALG] [--phash-size 8|16|32]
-  plr group    [--max-hamming N] [--db PATH]
+  plr group    [--max-hamming N] [--identity pass|double-phash|vision] [--db PATH]
   plr plan     [--conflict-hamming N] [--ai] [--model SOURCE] [--db PATH]
   plr apply    --target DIR [--dry-run] [--no-exif] [--move] [--force-conflicts] [--db PATH]
   plr build    --dir DIR... --target DIR [scan, group, plan and apply flags]
@@ -83,9 +83,9 @@ Commands:
             gradient, vert-gradient, double-gradient, blockhash.
             --phash-size 8|16|32 selects a square hash. Directories already
             scanned are skipped unless --force is given.
-  group     Group images: exact sha256 matches share a group, and images
-            whose perceptual hashes differ by at most --max-hamming bits are
-            chained into the same group.
+  group     Group images: Aggregate candidates by DCT phash (--max-hamming),
+            then refine with --identity (pass = legacy; double-phash =
+            blockhash∩double-gradient by sha256; vision = Kronk stub).
   plan      Resolve every group: earliest EXIF capture time (timezone
             aware; file creation time never overrides EXIF), best quality
             pixels, GPS. Groups with near-identical pictures and identical
@@ -184,7 +184,10 @@ func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB 
 
 func runGroup(args []string) int {
 	fs := flag.NewFlagSet("group", flag.ExitOnError)
-	maxHamming := fs.Int("max-hamming", 12, "maximum perceptual-hash hamming distance to chain images into one group")
+	maxHamming := fs.Int("max-hamming", 12, "maximum DCT phash hamming distance for candidate groups")
+	identity := fs.String("identity", "pass", "identity strategy: pass, double-phash, or vision")
+	blockH := fs.Int("identity-block-hamming", 24, "double-phash: max blockhash-16 distance")
+	gradH := fs.Int("identity-grad-hamming", 20, "double-phash: max double-gradient-16 distance")
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -195,11 +198,23 @@ func runGroup(args []string) int {
 		return 1
 	}
 	defer s.Close()
-	return runGroupPhase(s, *maxHamming)
+	return runGroupPhase(s, groupPhaseOpts{
+		MaxHamming: *maxHamming,
+		Identity:   *identity,
+		BlockH:     *blockH,
+		GradH:      *gradH,
+	})
+}
+
+type groupPhaseOpts struct {
+	MaxHamming int
+	Identity   string
+	BlockH     int
+	GradH      int
 }
 
 // runGroupPhase is the group step, shared by "plr group" and "plr build".
-func runGroupPhase(s *store.Store, maxHamming int) int {
+func runGroupPhase(s *store.Store, opts groupPhaseOpts) int {
 	imgs, err := s.AllImages()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr group:", err)
@@ -209,7 +224,17 @@ func runGroupPhase(s *store.Store, maxHamming int) int {
 		fmt.Println("no images recorded; run plr scan first")
 		return 0
 	}
-	assign, groups := group.Aggregate(toGroupImages(imgs), maxHamming)
+	strat, err := identityStrategy(s, opts)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr group:", err)
+		return 2
+	}
+	pipe := group.Pipeline{CandidateRadius: opts.MaxHamming, Identity: strat}
+	assign, groups, err := pipe.Run(toGroupImages(imgs))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr group:", err)
+		return 1
+	}
 	if err := s.SetGroupAssignments(assign); err != nil {
 		fmt.Fprintln(os.Stderr, "plr group:", err)
 		return 1
@@ -220,8 +245,41 @@ func runGroupPhase(s *store.Store, maxHamming int) int {
 			multi++
 		}
 	}
-	fmt.Printf("%d images -> %d groups (%d with duplicates)\n", len(imgs), len(groups), multi)
+	fmt.Printf("%d images -> %d groups (%d with duplicates) [identity=%s]\n",
+		len(imgs), len(groups), multi, strat.Name())
 	return 0
+}
+
+func identityStrategy(s *store.Store, opts groupPhaseOpts) (group.IdentityStrategy, error) {
+	switch opts.Identity {
+	case "", "pass":
+		return group.PassThrough{}, nil
+	case "double-phash":
+		return group.DoublePhash{
+			Lookup:       storePhashLookup{s},
+			BlockHamming: opts.BlockH,
+			GradHamming:  opts.GradH,
+		}, nil
+	case "vision":
+		return group.DecisionModel{Decider: group.UnsureDecider{}}, nil
+	default:
+		return nil, fmt.Errorf("unknown --identity %q (want pass, double-phash, or vision)", opts.Identity)
+	}
+}
+
+// storePhashLookup adapts store.GetContentPhash to group.ContentPhashLookup.
+type storePhashLookup struct{ s *store.Store }
+
+func (l storePhashLookup) Phash(sha256 string, alg phash.Alg, size phash.Size) (phash.Hash, bool, error) {
+	hex, ok, err := l.s.GetContentPhash(sha256, string(alg), int(size))
+	if err != nil || !ok {
+		return nil, ok, err
+	}
+	h, err := phash.HashFromHex(hex)
+	if err != nil {
+		return nil, false, err
+	}
+	return h, true, nil
 }
 
 func runPlan(args []string) int {
@@ -429,7 +487,10 @@ func runPipeline(cmd string, args []string) int {
 	dirs := multiFlag{}
 	target := fs.String("target", "", "directory that receives the final images (required)")
 	force := fs.Bool("force", false, "re-scan directories that were already scanned")
-	maxHamming := fs.Int("max-hamming", 12, "maximum perceptual-hash hamming distance to chain images into one group")
+	maxHamming := fs.Int("max-hamming", 12, "maximum DCT phash hamming distance for candidate groups")
+	identity := fs.String("identity", "pass", "identity strategy: pass, double-phash, or vision")
+	blockH := fs.Int("identity-block-hamming", 24, "double-phash: max blockhash-16 distance")
+	gradH := fs.Int("identity-grad-hamming", 20, "double-phash: max double-gradient-16 distance")
 	conflictHamming := fs.Int("conflict-hamming", 2, "perceptual hashes within this distance with identical capture times mark the group as a conflict")
 	dryRun := fs.Bool("dry-run", false, "report what would be copied without touching the target")
 	noEXIF := fs.Bool("no-exif", false, "copy files without writing merged EXIF")
@@ -438,8 +499,8 @@ func runPipeline(cmd string, args []string) int {
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	workers := fs.Int("workers", 4, "number of hash workers")
 	minSizeKB := fs.Int("min-size-kb", 0, "ignore images smaller than this many kilobytes")
-	phashAlg := fs.String("phash-alg", "dct", "perceptual hash: dct|mean|median|gradient|vert-gradient|double-gradient|blockhash")
-	phashSize := fs.Int("phash-size", 0, "square hash size 8, 16, or 32 (0 = legacy 16x8 DCT)")
+	phashAlg := fs.String("phash-alg", "dct", "candidate perceptual hash (default dct)")
+	phashSize := fs.Int("phash-size", 0, "square DCT size 8, 16, or 32 (0 = legacy 16x8 DCT)")
 	fs.Var(&dirs, "dir", "directory to scan (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -468,7 +529,14 @@ func runPipeline(cmd string, args []string) int {
 		fn    func() int
 	}{
 		{"scan", func() int { return runScanPhase(s, dirs, *force, *workers, *minSizeKB, tool, cfg) }},
-		{"group", func() int { return runGroupPhase(s, *maxHamming) }},
+		{"group", func() int {
+			return runGroupPhase(s, groupPhaseOpts{
+				MaxHamming: *maxHamming,
+				Identity:   *identity,
+				BlockH:     *blockH,
+				GradH:      *gradH,
+			})
+		}},
 		{"plan", func() int { return runPlanPhase(s, nil, *conflictHamming) }},
 		{"commit", func() int { return runCommitPhase(s, cmd) }},
 		{"apply", func() int {

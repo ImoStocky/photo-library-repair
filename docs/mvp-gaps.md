@@ -41,21 +41,21 @@ pipeline (scan → group → plan → apply/amalgamate).
 ## Architecture direction (phash is unreliable alone)
 
 Phash (any family) can both **miss** hard re-encodes/thumbnails and **merge**
-unrelated frames. Planned heading for grouping:
+unrelated frames. Working heading for grouping (Strategy + Chain):
 
-1. **Permissive candidates** — phash (and banding) only *propose* near-dup
-   groups; default radius may stay generous for recall.
-2. **EXIF veto** — if members' EXIF strongly disagrees (capture time/offset,
-   camera, GPS, …), treat that as evidence they are **different photos** and
-   refuse the merge (or mark a conflict). True duplicates usually share EXIF;
-   a phash hit with mismatched EXIF is a false friend.
-3. **Keep unresolvable conflicts in the library** — do not drop them from
-   `groups` / apply forever; they stay recorded so a later pass can settle
-   them. Apply may still skip materializing conflict pixels until forced.
-4. **Vision fallback via Kronk** — for leftovers the rules cannot settle,
-   call the Kronk SDK with a vision-capable model to decide whether images
-   depict the same scene; write `resolved_by` accordingly (same pattern as
-   today's `--ai` conflict resolver, broadened to "same picture?").
+1. **Scan is sha256-first** — content digest keys `content_phash(sha256, alg,
+   size, hex)`. Same bytes from different paths share one hash row.
+   **Candidate phash stays DCT** (`images.phash`, default legacy 16×8);
+   scan also writes blockhash-16 + double-gradient-16 into `content_phash`.
+2. **Candidates** — `Aggregate` on DCT phash (`--max-hamming`) proposes
+   clusters (banding index).
+3. **Identity strategies** (`--identity`): `pass` (legacy), `double-phash`
+   (intersect blockhash∩double-gradient by sha256), `vision` (Kronk stub:
+   keep candidate until a real VisionDecider returns Same).
+4. **EXIF / conflict plan** — existing `ResolveGroup` (offsets, GPS,
+   near-identical); keep conflicts in the library. Apply may still skip
+   conflict pixels until `--force-conflicts`.
+5. **Vision fallback** — Kronk pairwise identity later; conflict `--ai`
+   resolver already exists.
 
-Diameter-bounded clusters (no silent friend-of-friend chains) remain a
-companion hardening; see chapter 12 / 15 when implementing.
+Diameter-bounded clusters remain a follow-on hardening.

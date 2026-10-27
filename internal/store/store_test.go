@@ -131,6 +131,37 @@ func TestImageUpsertAndGroups(t *testing.T) {
 	}
 }
 
+func TestContentPhashKeyedBySHA256(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	h := ContentPhash{SHA256: "abc", Alg: "dct", Size: 0, Hex: "aa"}
+	if err := s.PutContentPhash(h); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutContentPhash(ContentPhash{SHA256: "abc", Alg: "blockhash", Size: 16, Hex: "bb"}); err != nil {
+		t.Fatal(err)
+	}
+	// Upsert same key updates hex, does not duplicate.
+	if err := s.PutContentPhash(ContentPhash{SHA256: "abc", Alg: "dct", Size: 0, Hex: "cc"}); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := s.GetContentPhash("abc", "dct", 0)
+	if err != nil || !ok || got != "cc" {
+		t.Fatalf("GetContentPhash dct = (%q, %v, %v), want cc", got, ok, err)
+	}
+	all, err := s.ContentPhashes("abc")
+	if err != nil || len(all) != 2 {
+		t.Fatalf("ContentPhashes = %v, err %v", all, err)
+	}
+	if _, ok, err := s.GetContentPhash("missing", "dct", 0); err != nil || ok {
+		t.Fatalf("missing key should be !ok, got ok=%v err=%v", ok, err)
+	}
+}
+
 func TestCommitAndRollback(t *testing.T) {
 	s, err := Open(":memory:")
 	if err != nil {

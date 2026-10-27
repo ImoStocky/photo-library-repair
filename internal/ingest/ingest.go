@@ -1,6 +1,6 @@
 // Package ingest walks source directories and records every image into the
-// library: identity (path, sha256), the 16-byte perceptual hash, file
-// creation time and the EXIF capture time.
+// library: identity (path, sha256), candidate DCT phash, content-addressed
+// extra hashes keyed by sha256, file creation time and EXIF capture time.
 //
 // Directories that were already recorded as sources are skipped unless
 // Options.Force is set; a forced re-scan re-syncs the source, dropping rows
@@ -273,6 +273,22 @@ func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time
 				}
 				img.SourceID = j.sourceID
 				_, created, err := s.UpsertImage(img)
+				if err == nil && sum != "" {
+					for _, eh := range info.ExtraHashes {
+						if eh.Hex == "" {
+							continue
+						}
+						if putErr := s.PutContentPhash(store.ContentPhash{
+							SHA256: sum,
+							Alg:    string(eh.Alg),
+							Size:   int(eh.Size),
+							Hex:    eh.Hex,
+						}); putErr != nil {
+							err = putErr
+							break
+						}
+					}
+				}
 				mu.Lock()
 				if err != nil {
 					rep.Errors++

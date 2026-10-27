@@ -21,7 +21,7 @@ type Image struct {
 	RelPath     string
 	Name        string
 	SHA256      string
-	Phash       string // 32 hex chars (16-byte perceptual hash), "" when the picture could not be hashed
+	Phash       string // candidate DCT hex (primary phash); "" when unhashable
 	CreatedAt   int64  // unix seconds, file birth time (mtime fallback)
 	MTime       int64  // unix nanoseconds, file modification time (fingerprint cache key)
 	ExifCapture string // raw EXIF capture wall clock, e.g. "2020:05:01 12:30:00"
@@ -141,6 +141,15 @@ CREATE TABLE IF NOT EXISTS commit_actions (
   new_stored_name TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_commit_actions_commit ON commit_actions(commit_id);
+
+CREATE TABLE IF NOT EXISTS content_phash (
+  sha256 TEXT NOT NULL,
+  alg TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  hex TEXT NOT NULL,
+  PRIMARY KEY (sha256, alg, size)
+);
+CREATE INDEX IF NOT EXISTS idx_content_phash_sha ON content_phash(sha256);
 `
 
 // Open opens (creating if needed) the SQLite library at path.
