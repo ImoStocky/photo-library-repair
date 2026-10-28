@@ -6,6 +6,14 @@
 // repaired library looks like, apply materializes it. Conflict groups are
 // skipped unless Options.ForceConflicts is set, in which case their
 // best-effort plan is applied.
+//
+// Apply keeps a ledger of what it wrote (store.GroupOutput, keyed by
+// target directory). Re-applying an unchanged library leaves the target
+// untouched instead of duplicating files; a collision prefix (%06d_) is
+// assigned once and never chains; a plan whose stored name changed moves
+// its output in place; and an output whose pixel source or merged facts
+// changed is rewritten under the name it already has. A target that was
+// materialized before the ledger existed is adopted from its report.json.
 package apply
 
 import (
@@ -36,24 +44,53 @@ type Options struct {
 	EXIF           *exif.Tool // full-data engine; nil uses the built-in writer
 }
 
-// FileResult describes one file the run copies (or would copy).
+// Per-file actions reported by FileResult.Action.
+const (
+	ActionNew       = "new"       // the group's output is written for the first time
+	ActionUpdated   = "updated"   // the output exists but its content was rewritten
+	ActionRenamed   = "renamed"   // the existing output was moved to a new name
+	ActionUntouched = "untouched" // the recorded output is already current
+)
+
+// FileResult describes one file the run placed, would place, or left alone.
 type FileResult struct {
 	Source  string `json:"source"`
 	Dest    string `json:"dest"`
-	Renamed bool   `json:"renamed,omitempty"` // the stored name collided and was adjusted
+	Group   int64  `json:"group,omitzero"`    // group the output belongs to
+	Action  string `json:"action,omitzero"`   // one of the Action* constants
+	Renamed bool   `json:"renamed,omitempty"` // the name differs from the plan's stored name
 	EXIF    bool   `json:"exif,omitempty"`    // merged EXIF will be (was) written
 	Moved   bool   `json:"moved,omitempty"`   // move mode: the source file was deleted
 }
 
-// Report summarizes an apply run.
+// Report summarizes an apply run. Copied, Updated and Renamed count files
+// the run acted on; Untouched counts outputs the ledger proved current.
 type Report struct {
-	DryRun  bool
-	Files   []FileResult
-	Copied  int
-	Moved   int // move mode: files whose source was deleted
-	Renamed int
-	Skipped int // conflict groups left alone because not forced
-	Errors  []string
+	DryRun    bool
+	Files     []FileResult
+	Copied    int // new outputs placed
+	Updated   int // existing outputs rewritten
+	Moved     int // move mode: files whose source was deleted
+	Renamed   int // outputs moved to a new name (incl. first-time prefixed placements)
+	Untouched int // outputs left in place by the ledger
+	Skipped   int // conflict groups left alone because not forced
+	Errors    []string
+}
+
+func (rep *Report) count(action string, renamed bool) {
+	switch action {
+	case ActionUntouched:
+		rep.Untouched++
+	case ActionUpdated:
+		rep.Updated++
+	case ActionRenamed:
+		rep.Renamed++
+	default:
+		rep.Copied++
+		if renamed {
+			rep.Renamed++
+		}
+	}
 }
 
 // groupJSON is one plan entry in report.json.
@@ -76,6 +113,8 @@ type reportJSON struct {
 	Generated string       `json:"generated"`
 	Target    string       `json:"target"`
 	Copied    int          `json:"copied"`
+	Updated   int          `json:"updated,omitempty"`
+	Untouched int          `json:"untouched,omitempty"`
 	Moved     int          `json:"moved,omitempty"`
 	Renamed   int          `json:"renamed,omitempty"`
 	Skipped   int          `json:"skipped,omitempty"`
@@ -91,6 +130,8 @@ func writeReportJSON(target string, rep Report, groups []store.Group, byID map[s
 		Generated: time.Now().UTC().Format(time.RFC3339),
 		Target:    target,
 		Copied:    rep.Copied,
+		Updated:   rep.Updated,
+		Untouched: rep.Untouched,
 		Moved:     rep.Moved,
 		Renamed:   rep.Renamed,
 		Skipped:   rep.Skipped,
@@ -125,13 +166,125 @@ func writeReportJSON(target string, rep Report, groups []store.Group, byID map[s
 	return os.WriteFile(filepath.Join(target, "report.json"), data, 0o644)
 }
 
-// Apply materializes the library's plans into opts.Target. It reads the
-// store only; the database is not modified. In move mode the pixel file of
-// each successfully placed group is deleted from the source directory.
-// After placing files it writes a report.json into opts.Target summarizing
-// the run and every group's plan. A non-nil error is returned for fatal
-// setup problems (unreadable library, uncreatable target); per-file
-// problems are accumulated in Report.Errors.
+// targetKey normalizes the target path so that the same directory shares
+// one ledger no matter how it was spelled on the command line.
+func targetKey(target string) string {
+	if abs, err := filepath.Abs(target); err == nil {
+		return filepath.Clean(abs)
+	}
+	return filepath.Clean(target)
+}
+
+// adoptLedger seeds the ledger from a report.json left by a pre-ledger
+// apply: prior file names are adopted without content fingerprints (empty
+// SHA256/Facts), so an upgrade never re-duplicates an existing target.
+// Legacy reports have no group id on file entries; they are matched back
+// through the group's pixel source path.
+func adoptLedger(target string, groups []store.Group, byID map[string]store.Image, sources map[int64]string) map[int64]store.GroupOutput {
+	data, err := os.ReadFile(filepath.Join(target, "report.json"))
+	if err != nil {
+		return nil
+	}
+	var rj reportJSON
+	if err := json.Unmarshal(data, &rj); err != nil {
+		return nil
+	}
+	byPixel := make(map[string]int64, len(groups))
+	pixelOf := make(map[int64]string, len(groups))
+	for _, g := range groups {
+		if im, ok := byID[g.PixelImageID]; ok {
+			byPixel[filepath.Join(sources[im.SourceID], im.RelPath)] = g.ID
+			pixelOf[g.ID] = g.PixelImageID
+		}
+	}
+	out := make(map[int64]store.GroupOutput)
+	for _, f := range rj.Files {
+		gid := f.Group
+		if gid == 0 {
+			gid = byPixel[f.Source]
+		}
+		if gid == 0 || f.Dest == "" {
+			continue
+		}
+		out[gid] = store.GroupOutput{Name: filepath.Base(f.Dest), PixelID: pixelOf[gid]}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// stale reports whether the recorded output no longer matches what the
+// plan asks for now. Recorded empty values are unknown (adopted rows) and
+// never count as stale.
+func stale(prev store.GroupOutput, pixelSHA, factsSig string) bool {
+	return (prev.SHA256 != "" && prev.SHA256 != pixelSHA) ||
+		(prev.Facts != "" && prev.Facts != factsSig)
+}
+
+// planFacts derives the merged EXIF facts the plan writes for one group.
+func planFacts(g store.Group, pixel store.Image, opts Options) (bool, exifwrite.Facts) {
+	if pixel.Kind != "jpeg" || opts.NoEXIF {
+		return false, exifwrite.Facts{}
+	}
+	offsetSec, ok := captureOffsetSec(g.CaptureTime, g.CaptureInstant)
+	if !ok {
+		return false, exifwrite.Facts{}
+	}
+	return true, exifwrite.Facts{
+		Capture: exifWallClock(g.CaptureInstant, offsetSec),
+		Offset:  offsetString(offsetSec),
+		HasGPS:  g.HasGPS,
+		GPSLat:  g.GPSLat,
+		GPSLon:  g.GPSLon,
+	}
+}
+
+// factsSignature fingerprints the merged EXIF facts for the ledger.
+func factsSignature(writeEXIF bool, f exifwrite.Facts) string {
+	if !writeEXIF {
+		return "plain"
+	}
+	sig := "exif:" + f.Capture + "|" + f.Offset
+	if f.HasGPS {
+		sig += fmt.Sprintf("|%.6f,%.6f", f.GPSLat, f.GPSLon)
+	}
+	return sig
+}
+
+// planName decides which file name the group's output carries. A recorded
+// name sticks forever — the collision prefix is assigned once and never
+// chains — and only moves when the plan's stored name changed, in which
+// case the output moves to the new stored name (or its prefixed form).
+// taken reports names spoken for by another group or a foreign file.
+func planName(g store.Group, prev store.GroupOutput, hadPrev bool, taken func(string) bool) string {
+	base := g.StoredName
+	prefixed := fmt.Sprintf("%06d_%s", g.ID, base)
+	if !hadPrev {
+		return uniqueName(base, g.ID, taken)
+	}
+	switch {
+	case prev.Name == base, prev.Name == prefixed:
+		return prev.Name
+	case prev.Prefixed && !taken(prefixed):
+		return prefixed // stored name changed: move on, same prefix
+	case !prev.Prefixed && !taken(base):
+		return base // stored name changed into a free name
+	case !taken(prefixed):
+		return prefixed
+	default:
+		return prev.Name
+	}
+}
+
+// Apply materializes the library's plans into opts.Target. Besides the
+// files it reads the apply ledger from the library (keyed by target
+// directory) and updates it; report.json is rewritten as a manifest of
+// every group. In move mode the pixel file of each newly placed group is
+// deleted from the source directory; untouched groups never touch their
+// sources. A non-nil error is returned for fatal setup problems
+// (unreadable library, uncreatable target); per-file problems are
+// accumulated in Report.Errors.
 func Apply(s *store.Store, opts Options) (Report, error) {
 	var rep Report
 	rep.DryRun = opts.DryRun
@@ -156,23 +309,43 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 		return rep, nil
 	}
 
+	key := targetKey(opts.Target)
+	ledger, err := s.GroupOutputs(key)
+	if err != nil {
+		return rep, fmt.Errorf("read apply ledger: %w", err)
+	}
+	if len(ledger) == 0 {
+		ledger = adoptLedger(opts.Target, groups, byID, sources)
+		if !opts.DryRun {
+			for gid, row := range ledger {
+				if err := s.SaveGroupOutput(key, gid, row); err != nil {
+					return rep, fmt.Errorf("save adopted ledger row %d: %w", gid, err)
+				}
+			}
+		}
+	}
+	// owner maps lower-cased names to the group whose ledger row claims
+	// them; pixelOwner lets a renumbered group (a full re-group renumbers)
+	// pick up the ledger row written for its own pixel file.
+	owner := make(map[string]int64, len(ledger))
+	pixelOwner := make(map[string]int64, len(ledger))
+	for gid, row := range ledger {
+		owner[strings.ToLower(row.Name)] = gid
+		if row.PixelID != "" {
+			pixelOwner[row.PixelID] = gid
+		}
+	}
+
 	if !opts.DryRun {
 		if err := os.MkdirAll(opts.Target, 0o755); err != nil {
 			return rep, fmt.Errorf("create target %q: %w", opts.Target, err)
 		}
 	}
 
-	reserved := map[string]bool{}
+	reserved := map[string]int64{} // names claimed during this run
 	exists := func(name string) bool {
-		if opts.DryRun {
-			return false
-		}
 		_, err := os.Stat(filepath.Join(opts.Target, name))
 		return err == nil
-	}
-	taken := func(name string) bool {
-		k := strings.ToLower(name)
-		return reserved[k] || exists(name)
 	}
 
 	for _, g := range groups {
@@ -193,44 +366,89 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 		}
 		srcPath := filepath.Join(srcDir, pixel.RelPath)
 
-		name := uniqueName(g.StoredName, g.ID, taken)
-		reserved[strings.ToLower(name)] = true
+		writeEXIF, facts := planFacts(g, pixel, opts)
+		sig := factsSignature(writeEXIF, facts)
+
+		prev, hadPrev := ledger[g.ID]
+		orphan := int64(0)
+		if !hadPrev && g.PixelImageID != "" {
+			if gid, ok := pixelOwner[g.PixelImageID]; ok && gid != g.ID {
+				prev, hadPrev, orphan = ledger[gid], true, gid
+			}
+		}
+
+		// taken reports whether name is spoken for by anything that is
+		// not this group's own recorded output.
+		taken := func(name string) bool {
+			k := strings.ToLower(name)
+			if o, ok := reserved[k]; ok {
+				return o != g.ID
+			}
+			if o, ok := owner[k]; ok {
+				return o != g.ID
+			}
+			return exists(name) // unclaimed file on disk belongs to someone else
+		}
+
+		name := planName(g, prev, hadPrev, taken)
+		prefixed := name != g.StoredName
 		destPath := filepath.Join(opts.Target, name)
-
-		// Derive the merged EXIF facts from the plan.
-		writeEXIF := false
-		var facts exifwrite.Facts
-		if pixel.Kind == "jpeg" && !opts.NoEXIF {
-			if offsetSec, ok := captureOffsetSec(g.CaptureTime, g.CaptureInstant); ok {
-				facts = exifwrite.Facts{
-					Capture: exifWallClock(g.CaptureInstant, offsetSec),
-					Offset:  offsetString(offsetSec),
-					HasGPS:  g.HasGPS,
-					GPSLat:  g.GPSLat,
-					GPSLon:  g.GPSLon,
-				}
-				writeEXIF = true
+		action := ActionNew
+		if hadPrev {
+			switch {
+			case name != prev.Name:
+				action = ActionRenamed
+			case stale(prev, pixel.SHA256, sig) || !exists(name):
+				action = ActionUpdated
+			default:
+				action = ActionUntouched
 			}
 		}
+		reserved[strings.ToLower(name)] = g.ID
 
+		fr := FileResult{
+			Source:  srcPath,
+			Dest:    destPath,
+			Group:   g.ID,
+			Action:  action,
+			Renamed: prefixed,
+			EXIF:    writeEXIF,
+		}
 		if opts.DryRun {
-			rep.Files = append(rep.Files, FileResult{Source: srcPath, Dest: destPath, Renamed: name != g.StoredName, EXIF: writeEXIF})
-			if name != g.StoredName {
-				rep.Renamed++
-			}
-			rep.Copied++
+			rep.Files = append(rep.Files, fr)
+			rep.count(action, fr.Renamed)
 			continue
 		}
 
-		if err := place(srcPath, destPath, writeEXIF, facts, opts.EXIF); err != nil {
-			rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: %v", g.ID, err))
+		var placeErr error
+		switch action {
+		case ActionUntouched:
+			// File stays; the ledger row is refreshed below (adopted rows
+			// start out without fingerprints).
+		case ActionUpdated:
+			placeErr = place(srcPath, destPath, writeEXIF, facts, opts.EXIF)
+		case ActionRenamed:
+			prevPath := filepath.Join(opts.Target, prev.Name)
+			if exists(prev.Name) && !stale(prev, pixel.SHA256, sig) {
+				placeErr = os.Rename(prevPath, destPath) // content still current
+			} else {
+				placeErr = place(srcPath, destPath, writeEXIF, facts, opts.EXIF)
+				if placeErr == nil {
+					os.Remove(prevPath) // free the old name; best effort
+				}
+			}
+		case ActionNew:
+			placeErr = place(srcPath, destPath, writeEXIF, facts, opts.EXIF)
+		}
+		if placeErr != nil {
+			rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: %v", g.ID, placeErr))
 			continue
 		}
-		fr := FileResult{Source: srcPath, Dest: destPath, Renamed: name != g.StoredName, EXIF: writeEXIF}
+
 		// Move mode: the destination is fully in place, so the source can
 		// go. If the removal fails, both files remain — the data is safe
-		// and the error is reported.
-		if opts.Move && !sameFile(srcPath, destPath) {
+		// and the error is reported. Untouched outputs leave sources alone.
+		if opts.Move && action != ActionUntouched && !sameFile(srcPath, destPath) {
 			if err := os.Remove(srcPath); err != nil {
 				rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: remove source after move: %v", g.ID, err))
 			} else {
@@ -239,9 +457,37 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 			}
 		}
 		rep.Files = append(rep.Files, fr)
-		rep.Copied++
-		if name != g.StoredName {
-			rep.Renamed++
+		rep.count(action, fr.Renamed)
+
+		row := store.GroupOutput{
+			Name:      name,
+			PixelID:   g.PixelImageID,
+			SHA256:    pixel.SHA256,
+			Facts:     sig,
+			Prefixed:  prefixed,
+			WrittenAt: time.Now().Unix(),
+		}
+		if err := s.SaveGroupOutput(key, g.ID, row); err != nil {
+			rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: save apply ledger: %v", g.ID, err))
+			continue
+		}
+		owner[strings.ToLower(name)] = g.ID
+		if row.PixelID != "" {
+			pixelOwner[row.PixelID] = g.ID
+		}
+		if orphan != 0 {
+			if oldRow, ok := ledger[orphan]; ok {
+				if owner[strings.ToLower(oldRow.Name)] == orphan {
+					delete(owner, strings.ToLower(oldRow.Name))
+				}
+				if oldRow.PixelID != "" && pixelOwner[oldRow.PixelID] == orphan {
+					delete(pixelOwner, oldRow.PixelID)
+				}
+			}
+			delete(ledger, orphan)
+			if err := s.DeleteGroupOutput(key, orphan); err != nil {
+				rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: drop adopted ledger row %d: %v", g.ID, orphan, err))
+			}
 		}
 	}
 

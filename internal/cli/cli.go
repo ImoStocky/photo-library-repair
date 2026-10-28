@@ -508,17 +508,8 @@ func runApplyPhase(s *store.Store, opts apply.Options) int {
 		fmt.Fprintln(os.Stderr, "plr apply:", err)
 		return 1
 	}
-	verb := "copied"
-	switch {
-	case opts.Move && !opts.DryRun:
-		verb = "moved"
-	case opts.Move:
-		verb = "would move"
-	case opts.DryRun:
-		verb = "would copy"
-	}
 	for _, f := range rep.Files {
-		line := fmt.Sprintf("%s %s -> %s", verb, f.Source, f.Dest)
+		line := fmt.Sprintf("%s %s -> %s", applyVerb(f.Action, opts), f.Source, f.Dest)
 		if f.EXIF {
 			line += " (EXIF)"
 		}
@@ -527,19 +518,45 @@ func runApplyPhase(s *store.Store, opts apply.Options) int {
 	for _, e := range rep.Errors {
 		fmt.Fprintln(os.Stderr, "plr apply:", e)
 	}
-	fmt.Printf("%s: %d file(s)%s, %d conflict group(s) skipped\n",
-		verb, rep.Copied, renamedSuffix(rep.Renamed), rep.Skipped)
+	fmt.Printf("apply: %d new, %d updated, %d renamed, %d unchanged, %d conflict group(s) skipped\n",
+		rep.Copied, rep.Updated, rep.Renamed, rep.Untouched, rep.Skipped)
 	if len(rep.Errors) > 0 {
 		return 1
 	}
 	return 0
 }
 
-func renamedSuffix(n int) string {
-	if n == 0 {
-		return ""
+// applyVerb renders the per-file action for the terminal, in the tense the
+// options ask for.
+func applyVerb(action string, opts apply.Options) string {
+	if opts.DryRun {
+		switch action {
+		case apply.ActionUntouched:
+			return "keep"
+		case apply.ActionUpdated:
+			return "would rewrite"
+		case apply.ActionRenamed:
+			return "would rename"
+		default: // new
+			if opts.Move {
+				return "would move"
+			}
+			return "would copy"
+		}
 	}
-	return fmt.Sprintf(" (%d renamed)", n)
+	switch action {
+	case apply.ActionUntouched:
+		return "unchanged"
+	case apply.ActionUpdated:
+		return "rewrote"
+	case apply.ActionRenamed:
+		return "renamed"
+	default: // new
+		if opts.Move {
+			return "moved"
+		}
+		return "copied"
+	}
 }
 
 // openEXIF starts the full-data EXIF engine (the embedded ExifTool). When

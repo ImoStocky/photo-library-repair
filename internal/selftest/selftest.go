@@ -422,7 +422,7 @@ func checkConflicts() Check {
 // merged EXIF, leaves conflict groups alone, honors --dry-run, applies
 // conflicts when forced, and renames stored names that already exist.
 func checkApply() Check {
-	const name = "apply: writes merged EXIF + report.json, skips conflicts, honors dry-run, moves sources, renames collisions"
+	const name = "apply: writes merged EXIF + report.json, skips conflicts, honors dry-run, moves sources, renames collisions, re-applies untouched"
 	e, err := newEnv()
 	if err != nil {
 		return Check{Name: name, Detail: err.Error()}
@@ -506,6 +506,19 @@ func checkApply() Check {
 		return Check{Name: name, Detail: fmt.Sprintf("report.json files = %+v", rj.Files)}
 	}
 
+	// Re-applying the same plan must leave the target untouched.
+	rep, err = apply.Apply(e.s, apply.Options{Target: target})
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("re-apply: %v", err)}
+	}
+	if rep.Copied != 0 || rep.Renamed != 0 || rep.Untouched != 1 {
+		return Check{Name: name, Detail: fmt.Sprintf("re-apply copied=%d renamed=%d untouched=%d (want 0/0/1)",
+			rep.Copied, rep.Renamed, rep.Untouched)}
+	}
+	if entries, err := os.ReadDir(target); err != nil || len(entries) != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("target entries after re-apply = %v (err %v), want 2", dirNames(entries), err)}
+	}
+
 	dryTarget := filepath.Join(target, "dry") // must not be created
 	rep, err = apply.Apply(e.s, apply.Options{Target: dryTarget, DryRun: true})
 	if err != nil {
@@ -547,6 +560,21 @@ func checkApply() Check {
 	}
 	if _, err := os.Stat(filepath.Join(collideTarget, want)); err != nil {
 		return Check{Name: name, Detail: fmt.Sprintf("renamed output missing: %v", err)}
+	}
+
+	// Re-applying keeps the assigned prefix: no chaining, no duplicates.
+	rep, err = apply.Apply(e.s, apply.Options{Target: collideTarget})
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("collide re-apply: %v", err)}
+	}
+	if rep.Copied != 0 || rep.Renamed != 0 || rep.Untouched != 1 {
+		return Check{Name: name, Detail: fmt.Sprintf("collide re-apply copied=%d renamed=%d untouched=%d (want 0/0/1)",
+			rep.Copied, rep.Renamed, rep.Untouched)}
+	}
+	if entries, err := os.ReadDir(collideTarget); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("read collide target: %v", err)}
+	} else if len(entries) != 3 { // occupied name, prefixed output, report.json
+		return Check{Name: name, Detail: fmt.Sprintf("collide target entries = %v, want 3", dirNames(entries))}
 	}
 
 	moveTarget := filepath.Join(target, "moved")
@@ -633,6 +661,15 @@ func mustRead(path string) []byte {
 		panic(err) // the file was created moments before
 	}
 	return data
+}
+
+// dirNames lists directory entry names for failure messages.
+func dirNames(entries []os.DirEntry) []string {
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Name())
+	}
+	return out
 }
 
 // checkCommitRollback verifies the commit model: each commit snapshots the

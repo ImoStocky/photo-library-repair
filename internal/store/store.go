@@ -150,6 +150,18 @@ CREATE TABLE IF NOT EXISTS content_phash (
   PRIMARY KEY (sha256, alg, size)
 );
 CREATE INDEX IF NOT EXISTS idx_content_phash_sha ON content_phash(sha256);
+
+CREATE TABLE IF NOT EXISTS group_outputs (
+  target TEXT NOT NULL,
+  group_id INTEGER NOT NULL,
+  pixel_image_id TEXT NOT NULL DEFAULT '',
+  name TEXT NOT NULL,
+  sha256 TEXT NOT NULL DEFAULT '',
+  facts TEXT NOT NULL DEFAULT '',
+  prefixed INTEGER NOT NULL DEFAULT 0,
+  written_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (target, group_id)
+);
 `
 
 // Open opens (creating if needed) the SQLite library at path.
@@ -470,6 +482,71 @@ func (s *Store) GroupCounts() (map[string]int, error) {
 		out[status] = n
 	}
 	return out, rows.Err()
+}
+
+// GroupOutput is one row of the apply ledger: the file that apply last
+// wrote into a target directory for one group, together with fingerprints
+// of the pixel source and the merged EXIF facts at write time. An empty
+// SHA256 or Facts means "unknown" (a row adopted from an older
+// report.json): such rows are treated as current until the plan itself
+// moves or renames the output.
+type GroupOutput struct {
+	Name      string // file name inside the target directory
+	PixelID   string // pixel image the output was written from
+	SHA256    string // sha256 of the pixel source at write time
+	Facts     string // signature of the merged EXIF facts written
+	Prefixed  bool   // the name differs from the stored name (collision prefix)
+	WrittenAt int64  // unix seconds of the write
+}
+
+// GroupOutputs returns the apply ledger of one target directory keyed by
+// group id.
+func (s *Store) GroupOutputs(target string) (map[int64]GroupOutput, error) {
+	rows, err := s.db.Query(`
+		SELECT group_id, name, pixel_image_id, sha256, facts, prefixed, written_at
+		FROM group_outputs WHERE target = ?`, target)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]GroupOutput{}
+	for rows.Next() {
+		var (
+			gid      int64
+			row      GroupOutput
+			prefixed int
+		)
+		if err := rows.Scan(&gid, &row.Name, &row.PixelID, &row.SHA256, &row.Facts, &prefixed, &row.WrittenAt); err != nil {
+			return nil, err
+		}
+		row.Prefixed = prefixed != 0
+		out[gid] = row
+	}
+	return out, rows.Err()
+}
+
+// SaveGroupOutput records (or replaces) the ledger row of one group in one
+// target directory.
+func (s *Store) SaveGroupOutput(target string, groupID int64, o GroupOutput) error {
+	_, err := s.db.Exec(`
+		INSERT INTO group_outputs (target, group_id, pixel_image_id, name, sha256, facts, prefixed, written_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(target, group_id) DO UPDATE SET
+		  pixel_image_id = excluded.pixel_image_id,
+		  name = excluded.name,
+		  sha256 = excluded.sha256,
+		  facts = excluded.facts,
+		  prefixed = excluded.prefixed,
+		  written_at = excluded.written_at`,
+		target, groupID, o.PixelID, o.Name, o.SHA256, o.Facts, boolInt(o.Prefixed), o.WrittenAt)
+	return err
+}
+
+// DeleteGroupOutput drops the ledger row of one group in one target
+// directory (used when a row moves to a renumbered group id).
+func (s *Store) DeleteGroupOutput(target string, groupID int64) error {
+	_, err := s.db.Exec(`DELETE FROM group_outputs WHERE target = ? AND group_id = ?`, target, groupID)
+	return err
 }
 
 func boolInt(b bool) int {
