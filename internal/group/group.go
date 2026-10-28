@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"math"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +46,11 @@ const (
 // captureTolerance is how many seconds a file's creation time may precede
 // the EXIF capture time of its own picture before the group conflicts.
 const captureTolerance = 5
+
+// DefaultMaxDisagreement is the default capture-time gap within which
+// group members may merge (see ResolveGroup's maxDisagreement): after the
+// timezone rules, members whose capture instants spread beyond it conflict.
+const DefaultMaxDisagreement = 10 * time.Second
 
 // gpsTolerance is the coordinate difference (degrees) still considered
 // the same position.
@@ -251,7 +257,10 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 // res may be nil, in which case conflicts stay unresolved.
 // conflictHamming is the phash limit (bits) of the near-identical
 // conflict rule; a negative value disables that rule.
-func ResolveGroup(imgs []Image, res Resolver, conflictHamming int) Plan {
+// maxDisagreement is the capture-time gap within which EXIF members may
+// merge (group.DefaultMaxDisagreement is the default); a wider spread
+// marks the group as a conflict. A negative value disables that rule.
+func ResolveGroup(imgs []Image, res Resolver, conflictHamming int, maxDisagreement time.Duration) Plan {
 	if len(imgs) == 0 {
 		panic("group: ResolveGroup of an empty group")
 	}
@@ -271,6 +280,14 @@ func ResolveGroup(imgs []Image, res Resolver, conflictHamming int) Plan {
 			GPSLon:          im.GPSLon,
 			StoredName:      im.Name,
 		}
+	}
+
+	// A missing timezone offset is not a position, just no information:
+	// such members inherit the group's single known offset so wall clocks
+	// compare on the same zone. Two distinct known offsets are left alone
+	// for the rules below to report as a conflict.
+	if zone, ok := groupZone(imgs); ok && zone != "" {
+		imgs = inheritZone(imgs, zone)
 	}
 
 	var exif []Image
@@ -300,7 +317,7 @@ func ResolveGroup(imgs []Image, res Resolver, conflictHamming int) Plan {
 		captureIdx = indexof(imgs, im.ID)
 		reason = "earliest EXIF capture time"
 	default:
-		captureIdx, conflictReason = resolveMultipleEXIF(imgs, exif)
+		captureIdx, conflictReason = resolveMultipleEXIF(imgs, exif, maxDisagreement)
 		if conflictReason == "" {
 			reason = "earliest EXIF capture time; EXIF data agrees"
 		}
@@ -360,7 +377,23 @@ func ResolveGroup(imgs []Image, res Resolver, conflictHamming int) Plan {
 
 // resolveMultipleEXIF applies the agreement rules to several EXIF
 // pictures and returns the capture index, or a non-empty conflict reason.
-func resolveMultipleEXIF(imgs, exif []Image) (int, string) {
+// Members with unknown timezone offsets are expected to have inherited the
+// group's zone already (see ResolveGroup); two distinct known offsets
+// conflict. Capture times must fall within maxDisagreement of each other;
+// a negative value disables that spread rule.
+func resolveMultipleEXIF(imgs, exif []Image, maxDisagreement time.Duration) (int, string) {
+	// Two distinct known offsets make the true capture instant ambiguous.
+	zone := ""
+	for _, im := range exif {
+		if im.ExifOffset == "" {
+			continue
+		}
+		if zone == "" {
+			zone = im.ExifOffset
+		} else if im.ExifOffset != zone {
+			return 0, fmt.Sprintf("EXIF timezone offsets differ (%q vs %q)", im.ExifOffset, zone)
+		}
+	}
 	type parsed struct {
 		idx     int
 		instant int64
@@ -373,11 +406,18 @@ func resolveMultipleEXIF(imgs, exif []Image) (int, string) {
 		}
 		all = append(all, parsed{idx: i, instant: t.Unix()})
 	}
+	lo, hi := all[0].instant, all[0].instant
+	for _, p := range all[1:] {
+		lo = min(lo, p.instant)
+		hi = max(hi, p.instant)
+	}
+	if maxDisagreement >= 0 {
+		if spread := time.Duration(hi-lo) * time.Second; spread > maxDisagreement {
+			return 0, fmt.Sprintf("capture times disagree (spread %s exceeds %s)", spread, maxDisagreement)
+		}
+	}
 	// Everything but the capture time must agree.
 	for i := 1; i < len(exif); i++ {
-		if exif[i].ExifOffset != exif[0].ExifOffset {
-			return 0, fmt.Sprintf("EXIF timezone offsets differ (%q vs %q)", exif[i].ExifOffset, exif[0].ExifOffset)
-		}
 		if !gpsAgree(exif[i], exif[0]) {
 			return 0, "EXIF GPS positions differ"
 		}
@@ -491,6 +531,41 @@ func gpsAgree(a, b Image) bool {
 // parseCapture turns an EXIF wall clock (YYYY:MM:DD HH:MM:SS) plus its
 // normalized offset into a UTC instant. An empty offset is treated as UTC
 // (callers compare offsets for agreement separately).
+// groupZone returns the single timezone offset recorded by the group's EXIF
+// members ("" when none is), with ok false when members record distinct
+// known offsets.
+func groupZone(imgs []Image) (string, bool) {
+	zone := ""
+	for _, im := range imgs {
+		if im.ExifCapture == "" || im.ExifOffset == "" {
+			continue
+		}
+		if zone == "" {
+			zone = im.ExifOffset
+		} else if im.ExifOffset != zone {
+			return "", false
+		}
+	}
+	return zone, true
+}
+
+// inheritZone returns the images with the EXIF members' unknown timezone
+// offsets filled with zone, copying the slice only when it changes.
+func inheritZone(imgs []Image, zone string) []Image {
+	if !slices.ContainsFunc(imgs, func(im Image) bool {
+		return im.ExifCapture != "" && im.ExifOffset == ""
+	}) {
+		return imgs
+	}
+	out := slices.Clone(imgs)
+	for i := range out {
+		if out[i].ExifCapture != "" && out[i].ExifOffset == "" {
+			out[i].ExifOffset = zone
+		}
+	}
+	return out
+}
+
 func parseCapture(wall, offset string) (time.Time, bool) {
 	t, err := time.Parse("2006:01:02 15:04:05", strings.TrimSpace(wall))
 	if err != nil {

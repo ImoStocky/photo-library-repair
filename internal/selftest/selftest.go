@@ -147,7 +147,7 @@ func (e *env) groupPlan() (plans []store.Group, members map[int64][]string, err 
 				planMembers = append(planMembers, im)
 			}
 		}
-		p := group.ResolveGroup(planMembers, nil, conflictHamming)
+		p := group.ResolveGroup(planMembers, nil, conflictHamming, group.DefaultMaxDisagreement)
 		g := store.Group{
 			ID:              id,
 			Status:          p.Status,
@@ -314,7 +314,7 @@ func checkCaptureRules() Check {
 
 	files := map[string][]byte{
 		"IMG_E1.jpg": exifJPEG(4, 95, "2024:05:01 12:30:00", "+02:00", true),
-		"IMG_E2.jpg": exifJPEG(4, 90, "2024:05:01 12:35:00", "+02:00", true),
+		"IMG_E2.jpg": exifJPEG(4, 90, "2024:05:01 12:30:05", "+02:00", true),
 		"IMG_F1.jpg": plainJPEG(5, 95),
 		"IMG_F2.jpg": plainJPEG(5, 90),
 	}
@@ -431,7 +431,7 @@ func checkApply() Check {
 
 	files := map[string][]byte{
 		"IMG_A1.jpg": exifJPEG(4, 95, "2024:05:01 12:30:00", "+02:00", true),
-		"IMG_A2.jpg": exifJPEG(4, 90, "2024:05:01 12:35:00", "+02:00", true),
+		"IMG_A2.jpg": exifJPEG(4, 90, "2024:05:01 12:30:05", "+02:00", true),
 		"IMG_B1.jpg": exifJPEG(5, 95, "2024:05:01 12:30:00", "+02:00", false),
 		"IMG_B2.jpg": exifJPEG(5, 90, "2024:05:01 12:30:00", "+05:00", false),
 	}
@@ -686,7 +686,7 @@ func checkCommitRollback() Check {
 
 	files := map[string][]byte{
 		"IMG_A1.jpg": exifJPEG(4, 95, "2024:05:01 12:30:00", "+02:00", true),
-		"IMG_A2.jpg": exifJPEG(4, 90, "2024:05:01 12:35:00", "+02:00", true),
+		"IMG_A2.jpg": exifJPEG(4, 90, "2024:05:01 12:30:05", "+02:00", true),
 		"IMG_B1.jpg": exifJPEG(5, 95, "2024:05:01 12:30:00", "+02:00", false),
 		"IMG_B2.jpg": exifJPEG(5, 90, "2024:05:01 12:30:00", "+05:00", false),
 	}

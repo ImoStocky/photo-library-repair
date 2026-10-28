@@ -67,7 +67,7 @@ func TestResolveSingleton(t *testing.T) {
 	one := im("a", "a.jpg", ha, ts(2024, 5, 1, 12, 0, 0), 10, 10, 1)
 	one.ExifCapture = "2024:05:01 12:00:00"
 	one.ExifOffset = "Z"
-	p := ResolveGroup([]Image{one}, nil, 2)
+	p := ResolveGroup([]Image{one}, nil, 2, DefaultMaxDisagreement)
 	if p.Status != StatusSingleton || p.PixelImageID != "a" || p.CaptureImageID != "a" {
 		t.Fatalf("plan = %+v", p)
 	}
@@ -79,7 +79,7 @@ func TestResolveSingleton(t *testing.T) {
 func TestResolveNoEXIFUsesEarliestCreation(t *testing.T) {
 	late := im("late", "IMG_0001.jpg", ha, ts(2024, 5, 1, 12, 0, 0), 800, 600, 100)
 	early := im("early", "IMG_0001 (1).jpg", hb, ts(2024, 5, 1, 10, 0, 0), 640, 480, 50)
-	p := ResolveGroup([]Image{late, early}, nil, 2)
+	p := ResolveGroup([]Image{late, early}, nil, 2, DefaultMaxDisagreement)
 	if p.Status != StatusResolved || !p.CaptureFallback {
 		t.Fatalf("plan = %+v", p)
 	}
@@ -105,7 +105,7 @@ func TestResolveSingleEXIF(t *testing.T) {
 	a.ExifCapture = "2024:05:01 12:00:00"
 	a.ExifOffset = "+02:00"
 	b := im("b", "b.jpg", hb, created, 800, 600, 20)
-	p := ResolveGroup([]Image{a, b}, nil, 2)
+	p := ResolveGroup([]Image{a, b}, nil, 2, DefaultMaxDisagreement)
 	if p.Status != StatusResolved || p.CaptureFallback {
 		t.Fatalf("plan = %+v", p)
 	}
@@ -123,7 +123,7 @@ func TestResolveSingleEXIFFileTooOldConflicts(t *testing.T) {
 	a.ExifCapture = "2024:05:01 12:00:00"
 	a.ExifOffset = "Z"
 	b := im("b", "b.jpg", hb, created, 800, 600, 20)
-	p := ResolveGroup([]Image{a, b}, nil, 2)
+	p := ResolveGroup([]Image{a, b}, nil, 2, DefaultMaxDisagreement)
 	if p.Status != StatusConflict {
 		t.Fatalf("plan = %+v", p)
 	}
@@ -134,7 +134,7 @@ func TestResolveSingleEXIFFileTooOldConflicts(t *testing.T) {
 	// Within the 5 s tolerance it resolves.
 	created = ts(2024, 5, 1, 11, 59, 57)
 	a.CreatedAt = created
-	p = ResolveGroup([]Image{a, b}, nil, 2)
+	p = ResolveGroup([]Image{a, b}, nil, 2, DefaultMaxDisagreement)
 	if p.Status != StatusResolved {
 		t.Fatalf("within tolerance must resolve: %+v", p)
 	}
@@ -145,9 +145,9 @@ func TestResolveMultipleEXIFAgree(t *testing.T) {
 	early.ExifCapture = "2024:05:01 10:30:00"
 	early.ExifOffset = "+02:00"
 	late := im("late", "IMG_0002.jpg", hb, ts(2024, 5, 1, 9, 0, 1), 800, 600, 20)
-	late.ExifCapture = "2024:05:01 11:30:00"
+	late.ExifCapture = "2024:05:01 10:30:08"
 	late.ExifOffset = "+02:00"
-	p := ResolveGroup([]Image{late, early}, nil, 2)
+	p := ResolveGroup([]Image{late, early}, nil, 2, DefaultMaxDisagreement)
 	if p.Status != StatusResolved {
 		t.Fatalf("plan = %+v", p)
 	}
@@ -167,9 +167,66 @@ func TestResolveMultipleEXIFOffsetDisagreementConflicts(t *testing.T) {
 	a.ExifCapture, a.ExifOffset = "2024:05:01 12:00:00", "+02:00"
 	b := im("b", "b.jpg", hb, ts(2024, 5, 1, 9, 0, 1), 800, 600, 20)
 	b.ExifCapture, b.ExifOffset = "2024:05:01 12:00:00", "+05:30"
-	p := ResolveGroup([]Image{a, b}, nil, 2)
+	p := ResolveGroup([]Image{a, b}, nil, 2, DefaultMaxDisagreement)
 	if p.Status != StatusConflict || p.Reason == "" {
 		t.Fatalf("plan = %+v", p)
+	}
+}
+
+func TestResolveMultipleEXIFUnknownOffsetInheritsZone(t *testing.T) {
+	a := im("a", "a.jpg", ha, ts(2024, 5, 1, 9, 0, 0), 640, 480, 10)
+	a.ExifCapture, a.ExifOffset = "2024:05:01 12:00:00", ""
+	b := im("b", "b.jpg", ha, ts(2024, 5, 1, 9, 0, 1), 800, 600, 20)
+	b.ExifCapture, b.ExifOffset = "2024:05:01 12:00:00", "+11:00"
+	// Identical wall clocks with one offset unknown: the known offset
+	// applies to both, so the instants agree and the group resolves.
+	p := ResolveGroup([]Image{a, b}, nil, 2, DefaultMaxDisagreement)
+	if p.Status != StatusResolved {
+		t.Fatalf("unknown offset must inherit the known one: %+v", p)
+	}
+	if want := ts(2024, 5, 1, 1, 0, 0); p.CaptureInstant != want { // 12:00 at +11:00
+		t.Fatalf("instant = %d, want %d", p.CaptureInstant, want)
+	}
+	if p.CaptureImageID != "a" {
+		t.Fatalf("capture = %s, want a (tie keeps the first member)", p.CaptureImageID)
+	}
+
+	// Wall clocks 8 s apart stay within the 10 s merge tolerance.
+	a.ExifCapture = "2024:05:01 12:00:08"
+	p = ResolveGroup([]Image{a, b}, nil, 2, DefaultMaxDisagreement)
+	if p.Status != StatusResolved {
+		t.Fatalf("within tolerance must resolve: %+v", p)
+	}
+	if p.CaptureImageID != "b" {
+		t.Fatalf("capture = %s, want b (earlier wall clock)", p.CaptureImageID)
+	}
+}
+
+func TestResolveMultipleEXIFCaptureTimesDisagree(t *testing.T) {
+	a := im("a", "a.jpg", ha, ts(2024, 5, 1, 9, 0, 0), 640, 480, 10)
+	a.ExifCapture, a.ExifOffset = "2024:05:01 12:00:00", "+02:00"
+	b := im("b", "b.jpg", ha, ts(2024, 5, 1, 9, 0, 1), 800, 600, 20)
+	b.ExifCapture, b.ExifOffset = "2024:05:01 12:00:10", "+02:00"
+	// Exactly at the tolerance: merges, keeping the oldest.
+	p := ResolveGroup([]Image{a, b}, nil, -1, DefaultMaxDisagreement)
+	if p.Status != StatusResolved {
+		t.Fatalf("spread at the tolerance must resolve: %+v", p)
+	}
+	if p.CaptureImageID != "a" {
+		t.Fatalf("capture = %s, want a", p.CaptureImageID)
+	}
+
+	// One second beyond it: conflict naming the disagreement.
+	b.ExifCapture = "2024:05:01 12:00:11"
+	p = ResolveGroup([]Image{a, b}, nil, -1, DefaultMaxDisagreement)
+	if p.Status != StatusConflict || !strings.Contains(p.Reason, "capture times disagree") {
+		t.Fatalf("plan = %+v", p)
+	}
+
+	// A negative tolerance disables the rule.
+	p = ResolveGroup([]Image{a, b}, nil, -1, -1)
+	if p.Status != StatusResolved {
+		t.Fatalf("negative tolerance must disable the rule: %+v", p)
 	}
 }
 
@@ -180,14 +237,14 @@ func TestResolveMultipleEXIFGPSDisagreementConflicts(t *testing.T) {
 	b := im("b", "b.jpg", hb, ts(2024, 5, 1, 9, 0, 1), 800, 600, 20)
 	b.ExifCapture, b.ExifOffset = "2024:05:01 12:00:00", "+02:00"
 	b.HasGPS, b.GPSLat, b.GPSLon = true, 48.85, 2.35
-	p := ResolveGroup([]Image{a, b}, nil, 2)
+	p := ResolveGroup([]Image{a, b}, nil, 2, DefaultMaxDisagreement)
 	if p.Status != StatusConflict {
 		t.Fatalf("plan = %+v", p)
 	}
 
 	// Missing GPS on one side also disagrees.
 	b.HasGPS, b.GPSLat, b.GPSLon = false, 0, 0
-	p = ResolveGroup([]Image{a, b}, nil, 2)
+	p = ResolveGroup([]Image{a, b}, nil, 2, DefaultMaxDisagreement)
 	if p.Status != StatusConflict {
 		t.Fatalf("gps presence must agree: %+v", p)
 	}
@@ -201,7 +258,7 @@ func TestResolveNearIdenticalSameCaptureConflicts(t *testing.T) {
 
 	// ha and hb differ by one bit: within the limit and the capture
 	// times are identical, so the pair conflicts.
-	p := ResolveGroup([]Image{a, b}, nil, 2)
+	p := ResolveGroup([]Image{a, b}, nil, 2, DefaultMaxDisagreement)
 	if p.Status != StatusConflict {
 		t.Fatalf("plan = %+v", p)
 	}
@@ -210,7 +267,7 @@ func TestResolveNearIdenticalSameCaptureConflicts(t *testing.T) {
 	}
 
 	// A tighter limit does not reach the pair.
-	p = ResolveGroup([]Image{a, b}, nil, 0)
+	p = ResolveGroup([]Image{a, b}, nil, 0, DefaultMaxDisagreement)
 	if p.Status != StatusResolved {
 		t.Fatalf("plan = %+v", p)
 	}
@@ -219,15 +276,16 @@ func TestResolveNearIdenticalSameCaptureConflicts(t *testing.T) {
 	// picks the winner.
 	b.Phash = a.Phash
 	b.ExifCapture = "2024:05:01 12:00:00"
-	p = ResolveGroup([]Image{a, b}, nil, 2)
+	p = ResolveGroup([]Image{a, b}, nil, 2, DefaultMaxDisagreement)
 	if p.Status != StatusResolved {
 		t.Fatalf("exact phash match must resolve: %+v", p)
 	}
 
-	// The same hashes with different capture times do not conflict.
+	// The same hashes with capture times apart (but within the merge
+	// tolerance) do not conflict.
 	b.Phash = hb
-	b.ExifCapture = "2024:05:01 12:05:00"
-	p = ResolveGroup([]Image{a, b}, nil, 2)
+	b.ExifCapture = "2024:05:01 12:00:05"
+	p = ResolveGroup([]Image{a, b}, nil, 2, DefaultMaxDisagreement)
 	if p.Status != StatusResolved {
 		t.Fatalf("plan = %+v", p)
 	}
@@ -245,7 +303,7 @@ func TestResolveConflictWithResolver(t *testing.T) {
 	a := im("a", "a.jpg", ha, ts(2024, 5, 1, 11, 59, 50), 640, 480, 10)
 	a.ExifCapture, a.ExifOffset = "2024:05:01 12:00:00", "Z"
 	b := im("b", "b.jpg", hb, ts(2024, 5, 1, 11, 59, 50), 800, 600, 20)
-	p := ResolveGroup([]Image{a, b}, fakeResolver{pick: "b"}, 2)
+	p := ResolveGroup([]Image{a, b}, fakeResolver{pick: "b"}, 2, DefaultMaxDisagreement)
 	if p.Status != StatusResolved {
 		t.Fatalf("resolver must settle the conflict: %+v", p)
 	}
@@ -258,7 +316,7 @@ func TestResolveConflictResolverFailureKeepsConflict(t *testing.T) {
 	a := im("a", "a.jpg", ha, ts(2024, 5, 1, 11, 59, 50), 640, 480, 10)
 	a.ExifCapture, a.ExifOffset = "2024:05:01 12:00:00", "Z"
 	b := im("b", "b.jpg", hb, ts(2024, 5, 1, 11, 59, 50), 800, 600, 20)
-	p := ResolveGroup([]Image{a, b}, failingResolver{}, 2)
+	p := ResolveGroup([]Image{a, b}, failingResolver{}, 2, DefaultMaxDisagreement)
 	if p.Status != StatusConflict {
 		t.Fatalf("failed resolver must keep the conflict: %+v", p)
 	}

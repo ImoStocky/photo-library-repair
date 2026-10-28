@@ -9,6 +9,8 @@ import (
 	"os"
 	"slices"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"photo-library-repair/internal/apply"
@@ -66,7 +68,8 @@ Usage:
   plr scan     --dir DIR... [--force] [--db PATH] [--workers N] [--min-size-kb N]
                [--phash-alg ALG] [--phash-size 8|16|32]
   plr group    [--max-hamming N] [--identity pass|double-phash|vision] [--db PATH]
-  plr plan     [--conflict-hamming N] [--ai] [--model SOURCE] [--db PATH]
+  plr plan     [--conflict-hamming N] [--max-capture-disagreement DUR]
+               [--ai] [--model SOURCE] [--db PATH]
   plr apply    --target DIR [--dry-run] [--no-exif] [--move] [--force-conflicts] [--db PATH]
   plr build    --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr increment --dir DIR... --target DIR [scan, group, plan and apply flags]
@@ -153,6 +156,15 @@ func runScan(args []string) int {
 		defer tool.Close()
 	}
 	return runScanPhase(s, dirs, *force, *workers, *minSizeKB, tool, cfg)
+}
+
+// parseDuration parses a duration that may also be given as bare seconds
+// ("10" = "10s"), as the spec's max_capture_disagreement accepts.
+func parseDuration(s string) (time.Duration, error) {
+	if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil {
+		return time.Duration(n) * time.Second, nil
+	}
+	return time.ParseDuration(strings.TrimSpace(s))
 }
 
 // parsePhashConfig builds a phash.Config from CLI flags.
@@ -368,10 +380,16 @@ func (l storePhashLookup) Phash(sha256 string, alg phash.Alg, size phash.Size) (
 func runPlan(args []string) int {
 	fs := flag.NewFlagSet("plan", flag.ExitOnError)
 	conflictHamming := fs.Int("conflict-hamming", 2, "perceptual hashes within this distance with identical capture times mark the group as a conflict")
+	maxDisagree := fs.String("max-capture-disagreement", "10s", "largest capture-time gap within a group that still merges; a bare number is seconds")
 	ai := fs.Bool("ai", false, "settle conflict groups with the Kronk decision model")
 	modelSource := fs.String("model", kronkai.DefaultModel, "Kronk decision model source for --ai")
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	maxDisagreeDur, err := parseDuration(*maxDisagree)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "plr plan: invalid --max-capture-disagreement %q: %v\n", *maxDisagree, err)
 		return 2
 	}
 	s, err := store.Open(*db)
@@ -391,11 +409,11 @@ func runPlan(args []string) int {
 		defer close()
 		fmt.Printf("decision model %s loaded; settling conflicts\n", res.Name())
 	}
-	return runPlanPhase(s, res, *conflictHamming)
+	return runPlanPhase(s, res, *conflictHamming, maxDisagreeDur)
 }
 
 // runPlanPhase is the plan step, shared by "plr plan" and "plr build".
-func runPlanPhase(s *store.Store, res group.Resolver, conflictHamming int) int {
+func runPlanPhase(s *store.Store, res group.Resolver, conflictHamming int, maxDisagreement time.Duration) int {
 	imgs, err := s.AllImages()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr plan:", err)
@@ -427,7 +445,7 @@ func runPlanPhase(s *store.Store, res group.Resolver, conflictHamming int) int {
 	slices.Sort(ids)
 	aiSettled := 0
 	for _, id := range ids {
-		p := group.ResolveGroup(byGroup[id], res, conflictHamming)
+		p := group.ResolveGroup(byGroup[id], res, conflictHamming, maxDisagreement)
 		if p.ResolvedBy != group.Rules {
 			aiSettled++
 		}
@@ -592,6 +610,7 @@ func runPipeline(cmd string, args []string) int {
 	blockH := fs.Int("identity-block-hamming", 24, "double-phash: max blockhash-16 distance")
 	gradH := fs.Int("identity-grad-hamming", 20, "double-phash: max double-gradient-16 distance")
 	conflictHamming := fs.Int("conflict-hamming", 2, "perceptual hashes within this distance with identical capture times mark the group as a conflict")
+	maxDisagreeStr := fs.String("max-capture-disagreement", "10s", "largest capture-time gap within a group that still merges; a bare number is seconds")
 	dryRun := fs.Bool("dry-run", false, "report what would be copied without touching the target")
 	noEXIF := fs.Bool("no-exif", false, "copy files without writing merged EXIF")
 	move := fs.Bool("move", false, "delete each source file once its copy is in place in --target")
@@ -612,6 +631,11 @@ func runPipeline(cmd string, args []string) int {
 	cfg, err := parsePhashConfig(*phashAlg, *phashSize)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr "+cmd+":", err)
+		return 2
+	}
+	maxDisagreement, err := parseDuration(*maxDisagreeStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "plr %s: invalid --max-capture-disagreement %q: %v\n", cmd, *maxDisagreeStr, err)
 		return 2
 	}
 	s, err := store.Open(*db)
@@ -655,7 +679,7 @@ func runPipeline(cmd string, args []string) int {
 			}
 			return runGroupPhase(s, opts)
 		}},
-		{"plan", func() int { return runPlanPhase(s, nil, *conflictHamming) }},
+		{"plan", func() int { return runPlanPhase(s, nil, *conflictHamming, maxDisagreement) }},
 		{"commit", func() int { return runCommitPhase(s, cmd) }},
 		{"apply", func() int {
 			return runApplyPhase(s, apply.Options{
