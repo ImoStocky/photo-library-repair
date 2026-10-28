@@ -33,3 +33,6 @@ go.work.sum
 # .vscode/
 # Local test corpora (Czkawka/DedupTestSet-derived, ~200MB)
 resources/
+
+# Python
+__pycache__/

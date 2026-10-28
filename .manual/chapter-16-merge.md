@@ -4,7 +4,9 @@
 
 **Spec:** [chapter 02 §2.5](chapter-02-semantics.md).
 **Workflow:** [chapter 03 Phase 3](chapter-03-workflow.md).
-**Status:** Not implemented.
+**Status:** Core implemented (2026-10-27); S7 action marking implemented at
+apply time via the apply ledger (2026-10-28); ambiguity plan conflicts still
+deferred.
 
 ## Responsibility
 
@@ -13,13 +15,21 @@ Partition incoming connected components against library members:
 
 ## Target package
 
-`internal/domain.Partition` (+ action marking with store in S7).
+`internal/group.Partition` (+ action marking with store in S7).
 
 ## Current state
 
-`plr increment` is the former bypass as a command: scan new dir into same
-DB → regroup → replan → apply. It does **not** emit present/matched/new
-actions, name collision prefixes, or ambiguity conflicts.
+`plr increment` scans the new dirs, groups the incoming images among
+themselves, refines per `--identity`, then partitions them against the
+library (chapter-16 match table): present and matched members join their
+library group, unmatched members become new groups. Ties across groups
+join the lowest id and print an ambiguity warning instead of merging the
+library groups. It does **not** yet emit ambiguity conflicts in the plan.
+
+The present/matched/new *actions* and name-collision prefixes are realized
+at apply time: apply keeps a `group_outputs` ledger per target directory
+and reports `new` / `updated` / `renamed` / `untouched` per group (see
+below and [mvp-gaps row 14](../docs/mvp-gaps.md)).
 
 ## Match table (distance to any library member)
 

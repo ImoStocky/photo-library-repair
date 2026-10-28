@@ -98,10 +98,12 @@ Commands:
             report.json summary into --target. Conflict groups are skipped
             unless --force-conflicts is given.
   build     scan + group + plan + apply in one go.
-  increment Merge new photos into an existing library: scan the new dirs
-            into the same DB, then re-group (new near-duplicates chain into
-            existing groups under the same --max-hamming radius), re-plan
-            and re-apply. On a fresh DB it degrades to build.
+   increment Merge new photos into an existing library: scan the new dirs
+             into the same DB, then partition them against the library
+             (present = already there, joined = closest group within
+             --max-hamming, new = own group; library groups never merge
+             through incoming images), re-plan and re-apply. On a fresh
+             DB it degrades to build.
   commit    Snapshot the current plan table into the commit log with a
             summary and print the per-group diff (new, updated, removed)
             versus the previous commit. build and increment run this
@@ -247,6 +249,87 @@ func runGroupPhase(s *store.Store, opts groupPhaseOpts) int {
 	}
 	fmt.Printf("%d images -> %d groups (%d with duplicates) [identity=%s]\n",
 		len(imgs), len(groups), multi, strat.Name())
+	return 0
+}
+
+// runIncrementGroupPhase is the S6 merge partition for "plr increment":
+// incoming images are grouped among themselves and then classified
+// against the library instead of re-aggregating the whole library.
+// Present members join the group they duplicate, matched members join the
+// closest library group, and unmatched members form new groups. Library
+// groups never chain into each other through incoming images.
+func runIncrementGroupPhase(s *store.Store, opts groupPhaseOpts, before map[string]bool) int {
+	strat, err := identityStrategy(s, opts)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr increment:", err)
+		return 2
+	}
+	imgs, err := s.AllImages()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr increment:", err)
+		return 1
+	}
+	var lib []group.LibMember
+	var incoming []group.Image
+	for _, im := range imgs {
+		if before[im.ID] {
+			if im.GroupID != 0 {
+				lib = append(lib, group.LibMember{Image: toGroupImage(im), GroupID: im.GroupID})
+			}
+		} else {
+			incoming = append(incoming, toGroupImage(im))
+		}
+	}
+	if len(lib) == 0 {
+		// Nothing grouped yet (fresh or never-grouped library): build.
+		return runGroupPhase(s, opts)
+	}
+	_, comps := group.Aggregate(incoming, opts.MaxHamming)
+	refined := make([][]group.Image, 0, len(comps))
+	for _, c := range comps {
+		parts, err := strat.Refine(c)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "plr increment:", err)
+			return 1
+		}
+		refined = append(refined, parts...)
+	}
+	present, matched, unmatched := group.Partition(refined, lib, opts.MaxHamming)
+	assign := make(map[string]int64, len(incoming))
+	ambiguous := 0
+	for _, p := range present {
+		assign[p.ID] = p.GroupID
+		if p.Ambiguous {
+			ambiguous++
+		}
+	}
+	for _, m := range matched {
+		assign[m.ID] = m.GroupID
+		if m.Ambiguous {
+			ambiguous++
+		}
+	}
+	next := int64(0)
+	for _, m := range lib {
+		if m.GroupID > next {
+			next = m.GroupID
+		}
+	}
+	for _, comp := range unmatched {
+		next++
+		for _, im := range comp {
+			assign[im.ID] = next
+		}
+	}
+	if err := s.SetGroupAssignments(assign); err != nil {
+		fmt.Fprintln(os.Stderr, "plr increment:", err)
+		return 1
+	}
+	fmt.Printf("increment: %d incoming -> %d present, %d joined, %d new (%d ambiguous) [identity=%s]\n",
+		len(incoming), len(present), len(matched), len(unmatched), ambiguous, strat.Name())
+	if ambiguous > 0 {
+		fmt.Printf("warning: %d incoming images match more than one library group; joined the lowest group id\n", ambiguous)
+	}
 	return 0
 }
 
@@ -524,18 +607,36 @@ func runPipeline(cmd string, args []string) int {
 	if tool != nil {
 		defer tool.Close()
 	}
+	// "increment" partitions incoming images against the library as it
+	// was BEFORE this scan (S6 merge partition), so snapshot the ids now.
+	var libSnapshot map[string]bool
+	if cmd == "increment" {
+		imgs, err := s.AllImages()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "plr increment:", err)
+			return 1
+		}
+		libSnapshot = make(map[string]bool, len(imgs))
+		for _, im := range imgs {
+			libSnapshot[im.ID] = true
+		}
+	}
 	phases := []struct {
 		label string
 		fn    func() int
 	}{
 		{"scan", func() int { return runScanPhase(s, dirs, *force, *workers, *minSizeKB, tool, cfg) }},
 		{"group", func() int {
-			return runGroupPhase(s, groupPhaseOpts{
+			opts := groupPhaseOpts{
 				MaxHamming: *maxHamming,
 				Identity:   *identity,
 				BlockH:     *blockH,
 				GradH:      *gradH,
-			})
+			}
+			if cmd == "increment" && len(libSnapshot) > 0 {
+				return runIncrementGroupPhase(s, opts, libSnapshot)
+			}
+			return runGroupPhase(s, opts)
 		}},
 		{"plan", func() int { return runPlanPhase(s, nil, *conflictHamming) }},
 		{"commit", func() int { return runCommitPhase(s, cmd) }},
