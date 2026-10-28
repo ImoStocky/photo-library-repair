@@ -23,7 +23,8 @@ pipeline (scan → group → plan → apply/amalgamate).
 | 9 | HDBSCAN/OPTICS, `--min-cluster-size` | Intentionally omitted | Chain aggregation with `--max-hamming` is the clustering engine; tune the radius per library. |
 | 10 | Copying extra camera tags (description, artist, copyright, ...) onto the output | Implemented | Engine writes preserve **every** metadata tag in the source (title, description, artist, copyright, camera fields, ...) while overwriting the merged facts; covered by `plr selftest` check 6. |
 | 11 | `--conflict-hamming` flag | Implemented | Plan rule: a member pair whose perceptual hashes differ by 1…`--conflict-hamming` bits (default 2) and share a capture instant marks the group as a conflict ("near-identical pictures … with identical capture time"). Exact phash matches (distance 0 — normal re-encodes / duplicates) resolve via bestPixels. A negative limit disables the rule. Composes with the EXIF-disagreement conflicts, which take precedence; the AI resolver can settle the result. |
-| 12 | Alternate perceptual-hash types (Czkawka algs + sizes) | Implemented (hasher); architecture open | `internal/phash` / `--phash-alg` / `--phash-size` now cover: **dct** (legacy 16×8 default, or square 8/16/32), and Czkawka/image_hasher **mean**, **median**, **gradient**, **vert-gradient**, **double-gradient**, **blockhash** at sizes **8 / 16 / 32**. DoubleGradient packs horiz then vert comparisons on an (N/2+1)² Lanczos3 grid (40/144/544 bits). Against DedupTestSet, DCT alone still plateaus (~F1 0.875); remaining misses need the candidate/veto architecture below, not a larger radius. |
+| 12 | Alternate perceptual-hash types (Czkawka algs + sizes) | Implemented | `internal/phash` / `--phash-alg` / `--phash-size` now cover: **dct** (legacy 16×8 default, or square 8/16/32), and Czkawka/image_hasher **mean**, **median**, **gradient**, **vert-gradient**, **double-gradient**, **blockhash** at sizes **8 / 16 / 32**. DoubleGradient packs horiz then vert comparisons on an (N/2+1)² Lanczos3 grid (40/144/544 bits). Against DedupTestSet, DCT alone still plateaus (~F1 0.875); remaining misses need the candidate/identity architecture below, not a larger radius. |
+| 13 | Identity strategies: refine candidate clusters before the EXIF plan | Implemented (`vision` is a stub) | `group.Pipeline` chains Aggregate (DCT candidates) → `--identity` refine → plan. `pass` (default) keeps legacy grouping; `double-phash` unions members only when **both** secondary hashes agree (blockhash-16 ∩ double-gradient-16, radii `--identity-block-hamming` 24 / `--identity-grad-hamming` 20), with sha256 equality forcing a join; `vision` keeps the candidate intact until a real Kronk `VisionDecider` ships. Scan writes all three hashes per decode into `content_phash` keyed by **sha256** (identical bytes from different paths share one row); libraries scanned before this need `plr scan --force` once. |
 
 ## Notes
 
@@ -41,17 +42,18 @@ pipeline (scan → group → plan → apply/amalgamate).
 ## Architecture direction (phash is unreliable alone)
 
 Phash (any family) can both **miss** hard re-encodes/thumbnails and **merge**
-unrelated frames. Working heading for grouping (Strategy + Chain):
+unrelated frames. Implemented heading for grouping (Strategy + Chain):
 
-1. **Scan is sha256-first** — content digest keys `content_phash(sha256, alg,
-   size, hex)`. Same bytes from different paths share one hash row.
+1. **Scan is sha256-first** (done) — content digest keys `content_phash(sha256,
+   alg, size, hex)`. Same bytes from different paths share one hash row.
    **Candidate phash stays DCT** (`images.phash`, default legacy 16×8);
    scan also writes blockhash-16 + double-gradient-16 into `content_phash`.
-2. **Candidates** — `Aggregate` on DCT phash (`--max-hamming`) proposes
+2. **Candidates** (done) — `Aggregate` on DCT phash (`--max-hamming`) proposes
    clusters (banding index).
-3. **Identity strategies** (`--identity`): `pass` (legacy), `double-phash`
-   (intersect blockhash∩double-gradient by sha256), `vision` (Kronk stub:
-   keep candidate until a real VisionDecider returns Same).
+3. **Identity strategies** (done; `vision` stub) — `--identity`: `pass`
+   (legacy), `double-phash` (intersect blockhash∩double-gradient by sha256),
+   `vision` (Kronk stub: keep candidate until a real VisionDecider returns
+   Same).
 4. **EXIF / conflict plan** — existing `ResolveGroup` (offsets, GPS,
    near-identical); keep conflicts in the library. Apply may still skip
    conflict pixels until `--force-conflicts`.
