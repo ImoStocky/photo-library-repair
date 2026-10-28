@@ -31,3 +31,5 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+# Local test corpora (Czkawka/DedupTestSet-derived, ~200MB)
+resources/
