@@ -6,9 +6,10 @@ Status: **implemented** (2026-11-03, `internal/group/identity_exif.go` +
 perceptual hashes are the fallback. Supersedes the ≥2-EXIF spread rule
 (`--max-capture-disagreement`) and the near-identical conflict rule
 (`--conflict-hamming`). The 2026-11-03 review removed the EXIF veto
-(§1.3) and the zone inheritance, and added the camera-block check —
-the pair rule is now: sha256, *or* same instant from the same camera,
-*or* the dual-hash gate.
+(§1.3) and added the camera-block check; a corpus pass then re-enabled zone
+inheritance and switched the EXIF-less birth guess to `min(creation,
+modification)` — the pair rule is now: sha256, *or* same instant from the
+same camera, *or* the dual-hash gate.
 
 ## 1. Principles
 
@@ -73,10 +74,11 @@ closure operates on same-image edges, not on bucket membership.
 ## 3. Pair decision graph
 
 Zone resolution: every member is parsed against **its own** recorded
-offset — an unknown offset compares its wall clock (parsed as-is), no
-zone is ever borrowed from the partner. Two *known* offsets compare as
-instants directly — equal instants across zones are the same moment, so
-the "offsets differ" conflict disappears.
+offset. When exactly one side records an offset, the other inherits it — a
+missing zone is no information, and a pair was shot in one place — so their
+wall clocks compare on the same zone. Two *known* offsets compare as instants
+directly (equal instants across zones are the same moment); two unknown ones
+compare wall clocks. The "offsets differ" conflict disappears.
 
 ```mermaid
 flowchart TD
@@ -104,9 +106,11 @@ hashes pass, the pair merges and the **EXIF side donates capture time**
 
 ## 4. Formal rule (pairwise, within one bucket)
 
-Let `inst(X)` = EXIF wall clock interpreted under X's own offset ("" =
-UTC wall clock), `cam(X)` = camera block (Make + Model), `dB` = block16
-Hamming, `dG` = gradient16 Hamming.
+Let `cam(X)` = camera block (Make + Model), `dB` = block16 Hamming, `dG` =
+gradient16 Hamming. `inst(X)` is X's EXIF wall clock under offset `o(X)`; in a
+pair, an empty `o` inherits the partner's when the partner records one (zone
+inheritance), and two empty offsets both read as UTC wall clock.
+`Δt = |inst(A) − inst(B)|`.
 
 ```
 same(A,B) ≜
@@ -172,15 +176,30 @@ Resolution then runs per component (pixels/capture/GPS/name as in §2).
     equality always merges.
   - **Camera block** = EXIF Make + Model, stored per image
     (`images.exif_camera`); an empty block never vetoes.
-  - **Zone inheritance removed** — a member with an unknown offset keeps
-    its wall clock; nothing is borrowed from the partner.
+  - **Zone inheritance (re-enabled)** — a member with an unknown offset
+    inherits its partner's known zone (and the group's single known zone in
+    resolution). The review removed this, but the corpus showed four
+    identities split only for a missing `OffsetTimeOriginal`, so it is back;
+    the re-run added no false merge.
   - **Birth-time conflicts extended** — an EXIF-less member created more
-    than 5 s before the group's earliest EXIF capture time conflicts.
+    than 5 s before the group's earliest EXIF capture time conflicts. The
+    file birth guess is now `min(creation, modification)` time, so a copy
+    that keeps its original's older mtime is not credited with its later
+    copy moment.
   - **Pixel winner prefers HEIC** (original container), then most pixels,
     then larger file. Capture winner unchanged: earliest zone-resolved
     EXIF instant, else earliest creation time (flagged).
   - Increment uses the same pair rule: bucket proximity alone never
     joins a library group. The chunking flag is `--max-hamming-chunking`.
+  - **Rotation / resolution hashing (evaluated, not done).** The corpus has
+    **no** EXIF Orientation tag, so hashing after the indicated rotation
+    would change nothing (and needs no extra decode — the image is already
+    decoded fully). Pixel-rotated copies (a 90° re-save, blk 160 → 0 under a
+    manual rotate) carry no tag to honour; they now merge via zone
+    inheritance. Resolution is a non-issue: both 16×16 hashes are
+    resolution-normalised (blockhash averages whole-image blocks, gradient
+    lanczos-resizes), measured identical at 3072 px → 120 px, so a
+    smallest-common-size retry can only lose information.
 
 ## 8. Candidate generation (implemented)
 
@@ -194,5 +213,7 @@ enter a candidate index keyed by zone-resolved instant (sort + sweep,
 candidates within the window, O(n log n)), so an EXIF-rule pair whose 8×8
 hash drifted past the bucket radius is still compared. Hash buckets remain
 the candidate source only for the EXIF-less fallback, which is their
-proper role. Unknown-offset members keep their wall clock in the sweep
-(no zone borrowing); hash buckets stay the second opinion for those pairs.
+proper role. Unknown-offset members are indexed at their wall clock in the
+sweep (zone inheritance happens at comparison, and a drifted pair that misses
+the sweep is still recalled by its hash bucket); hash buckets stay the second
+opinion for those pairs.

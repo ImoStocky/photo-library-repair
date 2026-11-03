@@ -266,6 +266,13 @@ func ResolveGroup(imgs []Image, res Resolver) Plan {
 		panic("group: ResolveGroup of an empty group")
 	}
 
+	// A missing timezone offset is no information: such members inherit the
+	// group's single known offset so wall clocks compare on the same zone
+	// (matching the pair rule). Two distinct known offsets stay as they are.
+	if zone, ok := groupZone(imgs); ok && zone != "" {
+		imgs = inheritZone(imgs, zone)
+	}
+
 	plan := Plan{
 		ResolvedBy:   Rules,
 		PixelImageID: bestPixels(imgs).ID,
@@ -506,6 +513,41 @@ func containsID(imgs []Image, id string) bool {
 		}
 	}
 	return false
+}
+
+// groupZone returns the single timezone offset recorded by the group's EXIF
+// members ("" when none is), with ok false when members record distinct
+// known offsets.
+func groupZone(imgs []Image) (string, bool) {
+	zone := ""
+	for _, im := range imgs {
+		if im.ExifCapture == "" || im.ExifOffset == "" {
+			continue
+		}
+		if zone == "" {
+			zone = im.ExifOffset
+		} else if im.ExifOffset != zone {
+			return "", false
+		}
+	}
+	return zone, true
+}
+
+// inheritZone returns the images with the EXIF members' unknown timezone
+// offsets filled with zone, copying the slice only when it changes.
+func inheritZone(imgs []Image, zone string) []Image {
+	if !slices.ContainsFunc(imgs, func(im Image) bool {
+		return im.ExifCapture != "" && im.ExifOffset == ""
+	}) {
+		return imgs
+	}
+	out := slices.Clone(imgs)
+	for i := range out {
+		if out[i].ExifCapture != "" && out[i].ExifOffset == "" {
+			out[i].ExifOffset = zone
+		}
+	}
+	return out
 }
 
 // parseCapture turns an EXIF wall clock (YYYY:MM:DD HH:MM:SS) plus its

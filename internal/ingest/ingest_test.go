@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"photo-library-repair/internal/fingerprint"
 	"photo-library-repair/internal/store"
@@ -42,6 +43,34 @@ func jpegBytes() []byte {
 
 func pngBytes() []byte {
 	return append([]byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}, make([]byte, 16)...)
+}
+
+func TestScanBirthGuessIsEarliestOfBornAndMod(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "copy.jpg")
+	write(t, path, jpegBytes())
+	// A copied file keeps its original (older) modification time while its
+	// own creation time is the copy moment; the birth guess is the earlier
+	// of the two, so it lands on the modification time here.
+	old := time.Now().Add(-72 * time.Hour).Truncate(time.Second)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	s, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := Scan(s, Options{Dirs: []string{root}, Workers: 1}, fakeHasher("jpeg")); err != nil {
+		t.Fatal(err)
+	}
+	images, _ := s.AllImages()
+	if len(images) != 1 {
+		t.Fatalf("images = %d, want 1", len(images))
+	}
+	if got := images[0].CreatedAt; got != old.Unix() {
+		t.Fatalf("CreatedAt = %d, want %d (earlier mod time, not the later copy moment)", got, old.Unix())
+	}
 }
 
 func TestScanAndSkipAndForce(t *testing.T) {

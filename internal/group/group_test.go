@@ -208,13 +208,14 @@ func TestResolvePixelsPreferHEIC(t *testing.T) {
 	}
 }
 
-func TestResolveMultipleEXIFUnknownOffsetIsWallClock(t *testing.T) {
+func TestResolveMultipleEXIFUnknownOffsetInheritsZone(t *testing.T) {
 	a := im("a", "a.jpg", ha, ts(2024, 5, 1, 9, 0, 0), 640, 480, 10)
 	a.ExifCapture, a.ExifOffset = "2024:05:01 12:00:00", ""
 	b := im("b", "b.jpg", ha, ts(2024, 5, 1, 9, 0, 1), 800, 600, 20)
 	b.ExifCapture, b.ExifOffset = "2024:05:01 12:00:00", "+11:00"
-	// An unknown offset is never re-based on the partner's zone: it keeps
-	// its wall clock, so b's zone-resolved instant (01:00 UTC) is earlier.
+	// The unknown offset inherits the group's single known zone: both wall
+	// clocks become 12:00 at +11:00, one instant (01:00 UTC), and the first
+	// member supplies the kept capture on that tie.
 	p := ResolveGroup([]Image{a, b}, nil)
 	if p.Status != StatusResolved {
 		t.Fatalf("plan = %+v", p)
@@ -222,8 +223,8 @@ func TestResolveMultipleEXIFUnknownOffsetIsWallClock(t *testing.T) {
 	if want := ts(2024, 5, 1, 1, 0, 0); p.CaptureInstant != want { // 12:00 at +11:00
 		t.Fatalf("instant = %d, want %d", p.CaptureInstant, want)
 	}
-	if p.CaptureImageID != "b" {
-		t.Fatalf("capture = %s, want b (earlier zone-resolved instant)", p.CaptureImageID)
+	if p.CaptureImageID != "a" {
+		t.Fatalf("capture = %s, want a (equal inherited instants, first member)", p.CaptureImageID)
 	}
 
 	// Two unknown offsets compare their wall clocks: b now comes first.

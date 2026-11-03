@@ -171,17 +171,25 @@ func cameraConflict(a, b Image) bool {
 	return a.ExifCamera != "" && b.ExifCamera != "" && a.ExifCamera != b.ExifCamera
 }
 
-// pairInstants resolves the pair's capture instants: every member is
-// parsed against its own recorded offset — an unknown offset compares its
-// wall clock, no zone is ever borrowed from the partner — so two known
-// offsets compare as instants. ok is false unless both members carry a
-// parsable EXIF capture time.
+// pairInstants resolves the pair's capture instants. Each member is parsed
+// against its own recorded offset; when exactly one side records an offset,
+// the other inherits it (a missing zone is no information, and the pair was
+// taken in one place) so their wall clocks compare on the same zone. Two
+// distinct known offsets, and two unknown ones, are left as they are — the
+// first compare as instants, the second compare wall clocks. ok is false
+// unless both members carry a parsable EXIF capture time.
 func pairInstants(a, b Image) (int64, int64, bool) {
 	if a.ExifCapture == "" || b.ExifCapture == "" {
 		return 0, 0, false
 	}
-	ta, oka := parseCapture(a.ExifCapture, a.ExifOffset)
-	tb, okb := parseCapture(b.ExifCapture, b.ExifOffset)
+	offA, offB := a.ExifOffset, b.ExifOffset
+	if offA == "" && offB != "" {
+		offA = offB
+	} else if offB == "" && offA != "" {
+		offB = offA
+	}
+	ta, oka := parseCapture(a.ExifCapture, offA)
+	tb, okb := parseCapture(b.ExifCapture, offB)
 	if !oka || !okb {
 		return 0, 0, false
 	}

@@ -173,14 +173,14 @@ func TestExifFirstCameraBlockVetoesSameInstant(t *testing.T) {
 }
 
 func TestExifFirstZoneResolution(t *testing.T) {
-	// An unknown offset is never re-based on the partner's zone: equal
-	// wall clocks in different zones are different instants, and without
-	// hashes the pair stays split.
+	// An unknown offset inherits the partner's known zone: equal wall
+	// clocks are then the same instant, so the pair merges even without
+	// hashes.
 	a := exifImg("a", "s1", "2024:05:01 12:00:00", "")
 	b := exifImg("b", "s2", "2024:05:01 12:00:00", "+11:00")
 	parts, err := (ExifFirst{Lookup: mapLookup{}}).Refine([]Image{a, b})
-	if err != nil || len(parts) != 2 {
-		t.Fatalf("unknown offset compares its wall clock: %v err %v", parts, err)
+	if err != nil || len(parts) != 1 {
+		t.Fatalf("unknown offset must inherit the partner's zone: %v err %v", parts, err)
 	}
 
 	// Two unknown offsets compare their wall clocks: equal clocks merge.

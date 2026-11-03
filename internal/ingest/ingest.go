@@ -186,8 +186,13 @@ func collect(root string, minSize int64, seenInodes map[uint64]bool) ([]job, map
 		if err != nil {
 			return nil
 		}
+		// Best guess at the picture's birth, used only when EXIF is
+		// absent (and for the birth-time doubt). A copy carries the
+		// older modification time of its original while its own creation
+		// time is the copy moment, so the earlier of the two is closer to
+		// the real capture.
 		createdAt := fi.ModTime().Unix()
-		if bt := birthTime(path, fi.ModTime()); bt > 0 {
+		if bt := birthTime(path, fi.ModTime()); bt > 0 && bt < createdAt {
 			createdAt = bt
 		}
 		jobs = append(jobs, job{
