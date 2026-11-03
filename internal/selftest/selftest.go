@@ -26,10 +26,12 @@ import (
 	"photo-library-repair/internal/testimg"
 )
 
-// maxHamming is the grouping radius the checks use. It is wider than the CLI
-// default so quality re-encodings of the same picture always chain, which is
-// what the checks want to exercise.
-const maxHamming = 16
+// maxHamming is the grouping radius the checks use: the CLI default, so the
+// checks exercise the same candidate recall the product ships with.
+// Canonical hash rotation puts quality re-encodings of a fixture picture at
+// 16-20 bits (rotated resampling phase); the dual-16x16 gate then separates
+// different fixture seeds inside a shared bucket.
+const maxHamming = 20
 
 // Check is the outcome of one built-in check.
 type Check struct {
@@ -180,9 +182,9 @@ func planFor(plans []store.Group, members map[int64][]string, name string) (stor
 }
 
 // exifJPEG builds one member of a near-duplicate pair: the same 400x300
-// picture at quality 95 (hi) or 90 (lo). Same-seed pairs stay within 12
-// phash bits, far under maxHamming, while different seeds in one env are at
-// least 26 bits apart and the inverted picture is over 100 bits away, so
+// picture at quality 95 (hi) or 90 (lo). Same-seed pairs stay within 20
+// phash bits, under maxHamming, while different seeds in one env are at
+// least 28 bits apart and the inverted picture is over 100 bits away, so
 // unrelated pictures never chain.
 func exifJPEG(seed, quality int, capture, offset string, gps bool) []byte {
 	ex := testimg.EXIF{

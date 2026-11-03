@@ -90,10 +90,10 @@ Commands:
             (--max-hamming-chunking), then refine with --identity.
             exif-first (the approved model, see
             docs/identity-decision-graph.md): the same sha256 is the same
-            image; two EXIF capture instants within --same-image-window
-            are the same image unless both record camera blocks (Make +
-            Model) that differ; everything else needs the dual 16x16
-            block AND gradient hash gate. pass = legacy bucket
+            image; the dual 16x16 block AND gradient hash gate joins
+            every pair, and EXIF only splits one the gate joined — two
+            camera blocks (Make + Model) that differ at a capture
+            instant within --same-image-window. pass = legacy bucket
             grouping; double-phash = blockhash∩double-gradient by sha256;
             vision = Kronk stub.
   plan      Resolve every group: pixels from the HEIC member when one

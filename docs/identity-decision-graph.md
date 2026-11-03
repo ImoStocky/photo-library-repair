@@ -8,31 +8,33 @@ perceptual hashes are the fallback. Supersedes the ≥2-EXIF spread rule
 (`--conflict-hamming`). The 2026-11-03 review removed the EXIF veto
 (§1.3) and added the camera-block check; a corpus pass then re-enabled zone
 inheritance and switched the EXIF-less birth guess to `min(creation,
-modification)` — the pair rule is now: sha256, *or* same instant from the
-same camera, *or* the dual-hash gate.
+modification)`. A further corpus pass inverted the order: **the dual-hash
+gate decides every pair; EXIF only splits** — the pair rule is now:
+sha256, *or* (dual-hash gate *and not* same-instant camera conflict).
+The same pass canonicalises hash orientation (see §7).
 
 ## 1. Principles
 
 1. **Bucketing is chunking, not identity.** 8×8-DCT phash (current 128-bit
    hash) clusters candidates into small chunks; membership in a chunk says
    "worth comparing", nothing more.
-2. **EXIF is identity of first order.** Two members whose *zone-resolved*
-   capture instants differ by ≤ **1 second** captured the same moment —
-   the scene cannot meaningfully change in 1 s — so they are the *same
-   image* regardless of phash distance, unless both record *camera
-   blocks* (EXIF Make + Model) that differ: two cameras firing at one
-   instant are two pictures.
-3. **EXIF mismatch is no veto.** Two members with parsable EXIF Δt > 1 s
-   apart fall through to the dual-hash gate like any other pair: a
-   re-export that lost its EXIF and regained a shifted timestamp must
-   still be able to merge on hashes.
-4. **No EXIF → dual image identity.** When a member lacks usable EXIF,
-   identity falls back to *two* complementary 16×16 perceptual hashes —
-   a **block** hash (coarse luminance blocks) and a **gradient** hash
-   (edge/direction structure). A pair is the same image only if **both**
-   distances pass, each under its own threshold (block tolerant of color
-   and scaling; gradient tolerant of recompression; the conjunction is
-   strict).
+2. **The dual-hash gate is the join.** A pair is the same image only if
+   *both* 16×16 perceptual distances pass — a **block** hash (coarse
+   luminance blocks) and a **gradient** hash (edge/direction structure),
+   each under its own radius (block tolerant of color and scaling;
+   gradient tolerant of recompression; the conjunction is strict). A
+   shared capture second is not enough on its own: burst frames are
+   distinct pictures one second apart, and they pass the hash gate only
+   when they really look alike.
+3. **EXIF can split, never force.** Two members whose *zone-resolved*
+   capture instants differ by ≤ **1 second** *and* whose recorded *camera
+   blocks* (EXIF Make + Model) both exist and differ are two cameras
+   firing at one instant — the pair stays split even when the hashes
+   agree. Any other EXIF fact (including Δt > 1 s) is no veto: the
+   dual-hash gate decides.
+4. **Undecidable stays undecidable.** When a member lacks a decodable
+   16×16 hash, the gate has no evidence and the pair is not joined on
+   EXIF alone; it goes to the resolver / conflict path instead.
 5. **Matching is transitive.** Same-image edges get a transitive closure —
    the goal is to *collect all duplicates*, so A~B and B~C put A, B, C in
    one group even when A~C alone would fail (chain drift is accepted;
@@ -51,7 +53,7 @@ flowchart TD
     BK --> P
 
     subgraph PAIRWISE[Stage 2 · pairwise identity — decision graph §3]
-        P[for every pair inside a bucket:<br/>EXIF rule, else dual-16x16 rule] --> E[same-image edges]
+        P[for every pair inside a bucket:<br/>dual-16x16 gate, then EXIF split] --> E[same-image edges]
     end
 
     E --> C[Stage 3 · transitive closure<br/>union-find over same-image edges]
@@ -59,7 +61,7 @@ flowchart TD
 
     subgraph RESOLVE[Stage 4 · resolution per group]
         G --> R1[pixels: HEIC first, else most pixels,<br/>tie file size]
-        G --> R2[capture: earliest zone-resolved EXIF instant<br/>members are within 1s by construction<br/>all EXIF-less → birth-time fallback, flagged]
+        G --> R2[capture: earliest zone-resolved EXIF instant<br/>the group's single known zone is inherited<br/>all EXIF-less → birth-time fallback, flagged]
         G --> R3[GPS: supplementary — positions agreeing<br/>within tolerance → medioid; else conflict<br/>missing = no information, inherits]
         G --> R4[name: camera-name heuristic]
     end
@@ -84,19 +86,17 @@ compare wall clocks. The "offsets differ" conflict disappears.
 flowchart TD
     START[pair A,B in same bucket] --> Q0{same sha256 ?}
     Q0 -- yes --> SAME0[SAME IMAGE]
-    Q0 -- no --> Q1{both have parsable<br/>EXIF capture?}
-
-    Q1 -- yes --> Q2{zone-resolved<br/>Δt ≤ 1s ?}
-    Q2 -- yes --> Q5{both record a camera block<br/>and the blocks differ?}
-    Q5 -- yes --> DIFF1[NOT SAME<br/>two cameras at one instant]
-    Q5 -- no --> SAME1[SAME IMAGE<br/>merge — no phash veto]
-    Q2 -- no --> Q3{both images decodable<br/>16x16 block + gradient?}
-
-    Q1 -- "no (absent / unparsable)" --> Q3
+    Q0 -- no --> Q3{both images decodable<br/>16x16 block + gradient?}
     Q3 -- no --> UNDECIDABLE[undecidable<br/>→ conflict / resolver]
     Q3 -- yes --> Q4{block16 distance ≤ T_block<br/>AND<br/>gradient16 distance ≤ T_grad ?}
-    Q4 -- yes --> SAME2[SAME IMAGE]
     Q4 -- no --> DIFF2[NOT SAME]
+    Q4 -- yes --> Q1{both have parsable<br/>EXIF capture?}
+    Q1 -- "no (absent / unparsable)" --> SAME1[SAME IMAGE]
+    Q1 -- yes --> Q2{zone-resolved<br/>Δt ≤ 1s ?}
+    Q2 -- no --> SAME1
+    Q2 -- yes --> Q5{both record a camera block<br/>and the blocks differ?}
+    Q5 -- yes --> DIFF1[NOT SAME<br/>two cameras at one instant]
+    Q5 -- no --> SAME1
 ```
 
 Mixing cases: an EXIF member paired with an EXIF-less member takes the
@@ -115,9 +115,9 @@ inheritance), and two empty offsets both read as UTC wall clock.
 ```
 same(A,B) ≜
   sha256(A) = sha256(B) ≠ ∅          : true
-  both EXIF, Δt ≤ 1s, ¬camConflict  : true
-  both EXIF, Δt ≤ 1s, camConflict   : false
-  otherwise (incl. Δt > 1s)          : dB ≤ T_block ∧ dG ≤ T_grad
+  ¬ (dB ≤ T_block ∧ dG ≤ T_grad)     : false   (gate first, no hashes = no join)
+  both EXIF, Δt ≤ 1s, camConflict    : false   (EXIF splits)
+  otherwise                          : true
 
 camConflict(A,B) ≜ cam(A) ≠ ∅ ∧ cam(B) ≠ ∅ ∧ cam(A) ≠ cam(B)
 ```
@@ -140,10 +140,12 @@ Resolution then runs per component (pixels/capture/GPS/name as in §2).
 
 ## 6. Accepted consequences
 
-- Burst frames ≤ 1 s apart merge (scene ≈ unchanged — by definition).
+- Burst frames ≤ 1 s apart merge only while they still pass the hash gate
+  (they usually do — adjacent bursts look alike); a visible change inside
+  the second now keeps them apart, which it previously did not.
 - Two cameras firing at the same instant merge **only while at least one
   side records no camera block**; distinct recorded Make/Model split the
-  pair (§1.2).
+  pair even when the hashes agree (§1.3).
 - Transitive chains can drift: A(12:00:00.0)~B(12:00:00.8)~C(12:00:01.6)
   merges A with C although Δt(A,C) > 1s. Accepted — collecting *all*
   duplicates wins.
@@ -191,15 +193,28 @@ Resolution then runs per component (pixels/capture/GPS/name as in §2).
     EXIF instant, else earliest creation time (flagged).
   - Increment uses the same pair rule: bucket proximity alone never
     joins a library group. The chunking flag is `--max-hamming-chunking`.
-  - **Rotation / resolution hashing (evaluated, not done).** The corpus has
-    **no** EXIF Orientation tag, so hashing after the indicated rotation
-    would change nothing (and needs no extra decode — the image is already
-    decoded fully). Pixel-rotated copies (a 90° re-save, blk 160 → 0 under a
-    manual rotate) carry no tag to honour; they now merge via zone
-    inheritance. Resolution is a non-issue: both 16×16 hashes are
-    resolution-normalised (blockhash averages whole-image blocks, gradient
-    lanczos-resizes), measured identical at 3072 px → 120 px, so a
-    smallest-common-size retry can only lose information.
+  - **Rotation hashing (implemented, 2026-11-03).** The corpus has **no**
+    EXIF Orientation tag, but pixel-rotated re-saves are real (a 90°
+    re-save measures blk 160 → 0 under a manual rotate). Every stored hash
+    is therefore computed on a **canonical orientation**: the landscape
+    (width ≥ height) 90° rotation, ties broken by the lexicographically
+    smallest 16×16 blockhash (`phash.Canonical`). Orientation is stable
+    under content noise; lex-min over all four rotations was tried first
+    and flipped a crop against its original (blk 4 → 120). Mirrors are not
+    handled. Reported Width/Height stay the stored ones. Corpus: same-identity
+    pairs inside the gate 84 → 94/105, cross-identity gate hits unchanged
+    (6 pre-existing double-label artifacts). **All hashes change value —
+    a full rescan is required.** Resolution stays a non-issue: both 16×16
+    hashes are resolution-normalised (blockhash averages whole-image
+    blocks, gradient lanczos-resizes), measured identical at 3072 px →
+    120 px, so a smallest-common-size retry can only lose information.
+  - **Gate first, EXIF splits (implemented, 2026-11-03).** The corpus had
+    over-merges created by the same-instant shortcut (two identities whose
+    hashes are far apart merged on Δt ≤ 1 s alone). The order is now the
+    dual-hash gate first, EXIF only splitting a pair the gate accepted
+    (§1.2/§1.3). Corpus: over-merged 4 → 3 (remaining three are pairs of
+    files duplicated into two ground-truth folders), under-merged 12 → 10
+    (remaining: Instagram `_c` crops and the double-label artifacts).
 
 ## 8. Candidate generation (implemented)
 

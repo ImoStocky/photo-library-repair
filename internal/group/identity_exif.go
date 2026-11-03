@@ -7,8 +7,9 @@ import (
 )
 
 // DefaultSameImageWindow is the zone-resolved capture-time gap within
-// which two EXIF pictures are the same image (docs/identity-decision-graph.md
-// §1: a scene cannot meaningfully change in one second).
+// which a recorded camera-block mismatch splits a pair the hash gate
+// joined (docs/identity-decision-graph.md §1.3: two cameras firing at
+// one instant are two pictures).
 const DefaultSameImageWindow = time.Second
 
 // DefaultExifFirstHamming is the radius each 16×16 secondary hash gets in
@@ -16,13 +17,13 @@ const DefaultSameImageWindow = time.Second
 const DefaultExifFirstHamming = 10
 
 // ExifFirst is the identity strategy of docs/identity-decision-graph.md:
-// a pair whose zone-resolved EXIF capture instants differ by at most
-// SameWindow is the same image unless both files record camera blocks
-// (EXIF Make + Model) that differ — then they are two cameras firing at
-// one instant. Any other pair, including two EXIF pictures further apart
-// than the window, is decided by the dual 16×16 gate: blockhash AND
-// double-gradient must both be within their radii. sha256 matches always
-// merge. Matching is transitive.
+// the dual 16×16 gate decides every pair — blockhash AND double-gradient
+// must both be within their radii. A capture-time match alone never joins
+// a pair. EXIF can only split what the hashes joined: two files that
+// record different camera blocks (EXIF Make + Model) and zone-resolved
+// capture instants within SameWindow are two cameras firing at one
+// instant, not one picture. sha256 matches always merge. Matching is
+// transitive.
 type ExifFirst struct {
 	Lookup       ContentPhashLookup
 	SameWindow   time.Duration // default DefaultSameImageWindow
@@ -57,8 +58,8 @@ func (e ExifFirst) gradR() int {
 
 // SweepWindow implements the Pipeline candidate-recall hook: EXIF-bearing
 // members within the same-image window of each other are pulled into one
-// chunk before Refine, so the EXIF rule stays exact even when the 8×8
-// bucket radius was too tight to pair them.
+// chunk before Refine, so a pair that passes the hash gate is not lost
+// just because the 8×8 bucket radius was too tight to pair them.
 func (e ExifFirst) SweepWindow() time.Duration {
 	w := e.SameWindow
 	if w <= 0 {
@@ -143,26 +144,32 @@ func (e ExifFirst) SameFunc() SameFunc {
 	}
 }
 
-// sameImagePair is the decision graph of docs/identity-decision-graph.md §3.
+// sameImagePair is the decision graph of docs/identity-decision-graph.md §3:
+// the perceptual gate first, then EXIF may split what the hashes joined.
 func sameImagePair(a, b Image, da, db dual, winSecs int64, blockR, gradR int) bool {
 	if a.SHA256 != "" && a.SHA256 == b.SHA256 {
 		return true
 	}
+	// The phash gate comes first: visual agreement is the only way a pair
+	// joins. A shared capture second proves nothing — burst frames are
+	// different pictures taken one second apart.
+	if !(da.okBlock && db.okBlock && da.okGrad && db.okGrad &&
+		da.block.Hamming(db.block) <= blockR &&
+		da.grad.Hamming(db.grad) <= gradR) {
+		return false
+	}
+	// EXIF then vetoes what the hashes joined: two recorded cameras firing
+	// at one instant are two pictures even when they look identical.
 	if ta, tb, ok := pairInstants(a, b); ok {
 		d := ta - tb
 		if d < 0 {
 			d = -d
 		}
-		if d <= winSecs {
-			// Same moment: only recorded cameras that disagree can tell
-			// the two files apart (two cameras firing at one instant).
-			return !cameraConflict(a, b)
+		if d <= winSecs && cameraConflict(a, b) {
+			return false
 		}
-		// Further apart is no veto: the hash gate below decides.
 	}
-	return da.okBlock && db.okBlock && da.okGrad && db.okGrad &&
-		da.block.Hamming(db.block) <= blockR &&
-		da.grad.Hamming(db.grad) <= gradR
+	return true
 }
 
 // cameraConflict reports two recorded camera blocks that differ; an

@@ -100,13 +100,17 @@ func compute(path, kind string, t *exif.Tool, cfg phash.Config) (Info, error) {
 	if err != nil {
 		return info, err
 	}
+	b := img.Bounds()
+	info.Width, info.Height = b.Dx(), b.Dy()
+	// Reported dimensions are the stored pixels above; every hash below is
+	// computed on the canonical rotation so 90° re-saves of one picture
+	// hash alike (full rescan required when this changes).
+	img = phash.Canonical(img)
 	h, err := phash.ComputeWith(img, cfg)
 	if err != nil {
 		return info, fmt.Errorf("hash %s: %w", path, err)
 	}
-	b := img.Bounds()
 	info.Phash = h.Hex()
-	info.Width, info.Height = b.Dx(), b.Dy()
 	info.ExtraHashes = append(info.ExtraHashes, ExtraHash{
 		Alg: cfg.Alg, Size: cfg.Size, Hex: info.Phash,
 	})

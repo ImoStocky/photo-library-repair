@@ -93,51 +93,61 @@ func exifImg(id, sha, capture, offset string) Image {
 	return im
 }
 
-func TestExifFirstSameInstantNeedsNoHashes(t *testing.T) {
-	// Different files sharing a capture moment are the same image even
-	// with no secondary hashes at all for the pair.
+func TestExifFirstGateRunsBeforeEXIF(t *testing.T) {
+	// The gate runs first: a shared capture second without hashes is not
+	// evidence, and neither is one with a far gradient.
 	a := exifImg("a", "s1", "2024:05:01 12:00:00", "+02:00")
 	b := exifImg("b", "s2", "2024:05:01 12:00:01", "+02:00")
 	parts, err := (ExifFirst{Lookup: mapLookup{}}).Refine([]Image{a, b})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(parts) != 1 || len(parts[0]) != 2 {
-		t.Fatalf("1 s apart must merge: %v", parts)
+	if len(parts) != 2 {
+		t.Fatalf("same instant without hashes must split: %v", parts)
 	}
 
-	// Two seconds apart is no veto: the hash gate decides and identical
-	// dual hashes re-join the pair.
 	block, grad := mustHash(16), mustHash(18)
+	farGrad := make(phash.Hash, len(grad))
+	for i := range farGrad {
+		farGrad[i] = ^grad[i]
+	}
 	look := mapLookup{
 		"s1:blockhash:16": block, "s1:double-gradient:16": grad,
-		"s2:blockhash:16": block, "s2:double-gradient:16": grad,
+		"s2:blockhash:16": block, "s2:double-gradient:16": farGrad,
 	}
+	parts, err = (ExifFirst{Lookup: look}).Refine([]Image{a, b})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("far gradient must split despite a shared second: %v", parts)
+	}
+
+	// Within the gate the pair joins, at any distance in time.
+	look["s2:double-gradient:16"] = grad
 	b.ExifCapture = "2024:05:01 12:00:02"
 	parts, err = (ExifFirst{Lookup: look}).Refine([]Image{a, b})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(parts) != 1 {
-		t.Fatalf("identical hashes must merge beyond the window: %v", parts)
-	}
-
-	// Without hashes the same pair stays split.
-	parts, err = (ExifFirst{Lookup: mapLookup{}}).Refine([]Image{a, b})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(parts) != 2 {
-		t.Fatalf("beyond the window without hashes: %v", parts)
+		t.Fatalf("within the gate must merge: %v", parts)
 	}
 }
 
 func TestExifFirstCameraBlockVetoesSameInstant(t *testing.T) {
+	// Two recorded cameras firing at one instant, hashes agreeing: EXIF
+	// vetoes what the hashes joined.
+	block, grad := mustHash(16), mustHash(18)
+	look := mapLookup{
+		"s1:blockhash:16": block, "s1:double-gradient:16": grad,
+		"s2:blockhash:16": block, "s2:double-gradient:16": grad,
+	}
 	a := exifImg("a", "s1", "2024:05:01 12:00:00", "+02:00")
 	a.ExifCamera = "Canon Canon EOS"
 	b := exifImg("b", "s2", "2024:05:01 12:00:00", "+02:00")
 	b.ExifCamera = "Nikon Nikon Z6"
-	parts, err := (ExifFirst{Lookup: mapLookup{}}).Refine([]Image{a, b})
+	parts, err := (ExifFirst{Lookup: look}).Refine([]Image{a, b})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +157,7 @@ func TestExifFirstCameraBlockVetoesSameInstant(t *testing.T) {
 
 	// One unknown camera block proves nothing: the pair merges.
 	b.ExifCamera = ""
-	parts, err = (ExifFirst{Lookup: mapLookup{}}).Refine([]Image{a, b})
+	parts, err = (ExifFirst{Lookup: look}).Refine([]Image{a, b})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,13 +165,8 @@ func TestExifFirstCameraBlockVetoesSameInstant(t *testing.T) {
 		t.Fatalf("unknown camera must not veto: %v", parts)
 	}
 
-	// A camera mismatch beyond the window is no veto either: identical
+	// A camera mismatch beyond the window is no veto: identical
 	// hashes still merge the pair.
-	block, grad := mustHash(16), mustHash(18)
-	look := mapLookup{
-		"s1:blockhash:16": block, "s1:double-gradient:16": grad,
-		"s2:blockhash:16": block, "s2:double-gradient:16": grad,
-	}
 	b.ExifCamera, b.ExifCapture = "Nikon Nikon Z6", "2024:05:01 12:00:05"
 	parts, err = (ExifFirst{Lookup: look}).Refine([]Image{a, b})
 	if err != nil {
@@ -173,35 +178,48 @@ func TestExifFirstCameraBlockVetoesSameInstant(t *testing.T) {
 }
 
 func TestExifFirstZoneResolution(t *testing.T) {
-	// An unknown offset inherits the partner's known zone: equal wall
-	// clocks are then the same instant, so the pair merges even without
-	// hashes.
-	a := exifImg("a", "s1", "2024:05:01 12:00:00", "")
-	b := exifImg("b", "s2", "2024:05:01 12:00:00", "+11:00")
-	parts, err := (ExifFirst{Lookup: mapLookup{}}).Refine([]Image{a, b})
-	if err != nil || len(parts) != 1 {
-		t.Fatalf("unknown offset must inherit the partner's zone: %v err %v", parts, err)
+	// Zone resolution drives the same-instant veto: both sides pass the
+	// gate and record different cameras, so the pair splits exactly when
+	// their zone-resolved instants fall within the window.
+	block, grad := mustHash(16), mustHash(18)
+	look := mapLookup{
+		"s1:blockhash:16": block, "s1:double-gradient:16": grad,
+		"s2:blockhash:16": block, "s2:double-gradient:16": grad,
+		"s3:blockhash:16": block, "s3:double-gradient:16": grad,
+		"s4:blockhash:16": block, "s4:double-gradient:16": grad,
+	}
+	veto := func(a, b Image, want string) {
+		t.Helper()
+		a.ExifCamera, b.ExifCamera = "Canon Canon EOS", "Nikon Nikon Z6"
+		parts, err := (ExifFirst{Lookup: look}).Refine([]Image{a, b})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want == "split" && len(parts) != 2 {
+			t.Fatalf("%s: must split: %v", want, parts)
+		}
+		if want == "merge" && len(parts) != 1 {
+			t.Fatalf("%s: must merge: %v", want, parts)
+		}
 	}
 
-	// Two unknown offsets compare their wall clocks: equal clocks merge.
-	b.ExifOffset = ""
-	parts, err = (ExifFirst{Lookup: mapLookup{}}).Refine([]Image{a, b})
-	if err != nil || len(parts) != 1 {
-		t.Fatalf("equal wall clocks must merge: %v err %v", parts, err)
-	}
+	// An unknown offset inherits the partner's known zone: equal wall
+	// clocks are then the same instant, so the veto fires.
+	veto(exifImg("a", "s1", "2024:05:01 12:00:00", ""),
+		exifImg("b", "s2", "2024:05:01 12:00:00", "+11:00"), "split")
+
+	// Two unknown offsets compare their wall clocks: equal clocks are the
+	// same instant, the veto fires.
+	veto(exifImg("a", "s1", "2024:05:01 12:00:00", ""),
+		exifImg("b", "s2", "2024:05:01 12:00:00", ""), "split")
 
 	// Two known zones compare as instants: 12:00+02:00 is 10:00+00:00.
-	c := exifImg("c", "s3", "2024:05:01 12:00:00", "+02:00")
-	d := exifImg("d", "s4", "2024:05:01 10:00:00", "+00:00")
-	parts, err = (ExifFirst{Lookup: mapLookup{}}).Refine([]Image{c, d})
-	if err != nil || len(parts) != 1 {
-		t.Fatalf("equal instants must merge: %v err %v", parts, err)
-	}
-	d.ExifCapture = "2024:05:01 09:30:00"
-	parts, err = (ExifFirst{Lookup: mapLookup{}}).Refine([]Image{c, d})
-	if err != nil || len(parts) != 2 {
-		t.Fatalf("half an hour apart must split: %v err %v", parts, err)
-	}
+	veto(exifImg("c", "s3", "2024:05:01 12:00:00", "+02:00"),
+		exifImg("d", "s4", "2024:05:01 10:00:00", "+00:00"), "split")
+
+	// Half an hour apart is outside the window: no veto, the gate holds.
+	veto(exifImg("c", "s3", "2024:05:01 12:00:00", "+02:00"),
+		exifImg("d", "s4", "2024:05:01 09:30:00", "+00:00"), "merge")
 }
 
 func TestExifFirstDualHashGate(t *testing.T) {
@@ -245,17 +263,27 @@ func TestExifFirstDualHashGate(t *testing.T) {
 }
 
 func TestExifFirstTransitiveClosure(t *testing.T) {
-	// a≡b through the shared capture moment, b≡c through the dual hashes:
-	// the closure puts all three in one identity.
-	a := exifImg("a", "s1", "2024:05:01 12:00:00", "+02:00")
-	b := exifImg("b", "s2", "2024:05:01 12:00:00", "+02:00")
-	c := Image{ID: "c", SHA256: "s3"}
+	// a≡b and b≡c are within radius 1 of each other while a and c are two
+	// bits apart: the closure puts all three in one identity.
 	block, grad := mustHash(16), mustHash(18)
+	bNear, cNear := make(phash.Hash, 16), make(phash.Hash, 16)
+	copy(bNear, block)
+	copy(cNear, block)
+	bNear[0] ^= 1 // a–b distance 1
+	cNear[0] ^= 3 // a–c distance 2, b–c distance 1
 	look := mapLookup{
-		"s2:blockhash:16": block, "s2:double-gradient:16": grad,
-		"s3:blockhash:16": block, "s3:double-gradient:16": grad,
+		"s1:blockhash:16": block, "s1:double-gradient:16": grad,
+		"s2:blockhash:16": bNear, "s2:double-gradient:16": grad,
+		"s3:blockhash:16": cNear, "s3:double-gradient:16": grad,
 	}
-	parts, err := (ExifFirst{Lookup: look}).Refine([]Image{a, b, c})
+	a := Image{ID: "a", SHA256: "s1"}
+	b := Image{ID: "b", SHA256: "s2"}
+	c := Image{ID: "c", SHA256: "s3"}
+	strategy := ExifFirst{Lookup: look, BlockHamming: 1, GradHamming: 1}
+	if parts, err := strategy.Refine([]Image{a, c}); err != nil || len(parts) != 2 {
+		t.Fatalf("two bits apart must stay apart: %v err %v", parts, err)
+	}
+	parts, err := strategy.Refine([]Image{a, b, c})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,12 +296,8 @@ func TestExifFirstSameFunc(t *testing.T) {
 	same := (ExifFirst{Lookup: mapLookup{}}).SameFunc()
 	a := exifImg("a", "s1", "2024:05:01 12:00:00", "+02:00")
 	b := exifImg("b", "s2", "2024:05:01 12:00:00", "+02:00")
-	if !same(a, b) {
-		t.Fatal("same instant must pass the gate")
-	}
-	c := exifImg("c", "s3", "2024:05:01 12:00:05", "+02:00")
-	if same(a, c) {
-		t.Fatal("5 s apart must fail the gate")
+	if same(a, b) {
+		t.Fatal("same instant without hashes must fail the gate")
 	}
 	if !same(a, a) {
 		t.Fatal("identical sha256 must pass the gate")
