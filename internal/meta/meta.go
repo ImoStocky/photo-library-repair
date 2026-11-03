@@ -23,7 +23,8 @@ type Facts struct {
 	GPSLat      float64 // signed degrees, 0 when absent
 	GPSLon      float64
 	HasGPS      bool
-	Orientation int // 1-8 per EXIF, 0 when the tag is absent
+	Orientation int    // 1-8 per EXIF, 0 when the tag is absent
+	Camera      string // camera block (Make + Model), "" when both tags are absent
 }
 
 // ErrNoEXIF is returned when the file carries no readable EXIF block.
@@ -75,6 +76,8 @@ func exifTIFF(data []byte) ([]byte, error) {
 
 // TIFF tag ids.
 const (
+	tagMake             = 0x010F
+	tagModel            = 0x0110
 	tagOrientation      = 0x0112
 	tagDateTime         = 0x0132
 	tagExifPointer      = 0x8769
@@ -250,6 +253,7 @@ func fromTIFF(d []byte) (Facts, error) {
 	}
 
 	f := Facts{Orientation: ifd0.short(tagOrientation)}
+	f.Camera = CameraBlock(ifd0.ascii(tagMake), ifd0.ascii(tagModel))
 	f.Capture, f.Offset = captureTime(readIFD(d, ifd0.long(tagExifPointer), bo), ifd0)
 	f.GPSLat, f.GPSLon, f.HasGPS = gpsPosition(readIFD(d, ifd0.long(tagGPSPointer), bo))
 	return f, nil
@@ -268,6 +272,12 @@ func captureTime(exif, ifd0 entries) (string, string) {
 		return CleanTime(ts), NormalizeOffset(exif.ascii(tagOffsetTimeDig))
 	}
 	return "", ""
+}
+
+// CameraBlock renders the EXIF camera block (Make + Model, capture time
+// excluded) as one comparable string; "" when both tags are absent.
+func CameraBlock(make_, model string) string {
+	return strings.TrimSpace(strings.TrimSpace(make_) + " " + strings.TrimSpace(model))
 }
 
 // CleanTime trims the string and drops fractional seconds, which some

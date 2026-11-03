@@ -43,6 +43,7 @@ type Info struct {
 	Kind        string // jpeg|png|gif|webp|tiff|heic
 	EXIFCapture string // raw EXIF capture wall clock, e.g. "2020-05-01 12:30:00"
 	EXIFOffset  string // EXIF timezone offset, e.g. "+05:30" or "Z"; "" when unknown
+	EXIFCamera  string // camera block (EXIF Make + Model), "" when unknown
 	HasGPS      bool   // the image carries a usable GPS position
 	GPSLat      float64
 	GPSLon      float64
@@ -126,6 +127,7 @@ func compute(path, kind string, t *exif.Tool, cfg phash.Config) (Info, error) {
 		if f, ok := exifFacts(path, data, t); ok {
 			info.EXIFCapture = f.Capture
 			info.EXIFOffset = f.Offset
+			info.EXIFCamera = f.Camera
 			info.HasGPS = f.HasGPS
 			info.GPSLat = f.GPSLat
 			info.GPSLon = f.GPSLon
@@ -147,6 +149,7 @@ func exifFacts(path string, data []byte, t *exif.Tool) (meta.Facts, bool) {
 			return meta.Facts{
 				Capture:     f.Capture,
 				Offset:      f.Offset,
+				Camera:      f.Camera,
 				GPSLat:      f.GPSLat,
 				GPSLon:      f.GPSLon,
 				HasGPS:      f.HasGPS,

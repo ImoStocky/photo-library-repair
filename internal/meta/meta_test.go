@@ -10,6 +10,8 @@ import (
 func TestFromJPEGFullFacts(t *testing.T) {
 	img := testimg.Textured(64, 48, 1)
 	data := testimg.MakeEXIFJPEG(img, 90, testimg.EXIF{
+		Make:               "Canon",
+		Model:              "Canon EOS",
 		Orientation:        6,
 		DateTimeOriginal:   "2024:05:01 12:30:00",
 		OffsetTimeOriginal: "+02:00",
@@ -18,6 +20,9 @@ func TestFromJPEGFullFacts(t *testing.T) {
 	f, err := FromJPEG(data)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if f.Camera != "Canon Canon EOS" {
+		t.Fatalf("camera = %q", f.Camera)
 	}
 	if f.Capture != "2024:05:01 12:30:00" {
 		t.Fatalf("capture = %q", f.Capture)

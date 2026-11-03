@@ -27,8 +27,9 @@ type Facts struct {
 	GPSLat      float64 // signed degrees, 0 when absent
 	GPSLon      float64
 	HasGPS      bool
-	Orientation int // 1-8 per EXIF, 0 when the tag is absent
-	Tags        int // how many tags the engine read (full data)
+	Orientation int    // 1-8 per EXIF, 0 when the tag is absent
+	Camera      string // camera block (Make + Model), "" when both tags are absent
+	Tags        int    // how many tags the engine read (full data)
 }
 
 // Tool is one embedded ExifTool instance. Methods are safe for concurrent
@@ -104,6 +105,7 @@ func (t *Tool) WriteFacts(src, dst string, f Facts) error {
 // derive maps the engine's full tag set to the pipeline facts.
 func derive(m map[string]any) Facts {
 	f := Facts{Tags: len(m)}
+	f.Camera = meta.CameraBlock(strOf(m["Make"]), strOf(m["Model"]))
 	f.Capture, f.Offset = captureTime(m)
 	f.Orientation = intValue(m["Orientation"])
 	f.GPSLat, f.GPSLon, f.HasGPS = gpsPosition(m)

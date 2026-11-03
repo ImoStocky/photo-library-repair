@@ -26,6 +26,7 @@ type Image struct {
 	MTime       int64  // unix nanoseconds, file modification time (fingerprint cache key)
 	ExifCapture string // raw EXIF capture wall clock, e.g. "2020:05:01 12:30:00"
 	ExifOffset  string // EXIF timezone offset, e.g. "+05:30" or "Z"; "" when unknown
+	ExifCamera  string // camera block (EXIF Make + Model), "" when unknown
 	Width       int    // displayed width (after EXIF orientation)
 	Height      int
 	Kind        string // jpeg|png|gif|webp|tiff|heic
@@ -76,6 +77,7 @@ CREATE TABLE IF NOT EXISTS images (
   created_at INTEGER NOT NULL DEFAULT 0,
   exif_capture TEXT NOT NULL DEFAULT '',
   exif_offset TEXT NOT NULL DEFAULT '',
+  exif_camera TEXT NOT NULL DEFAULT '',
   width INTEGER NOT NULL DEFAULT 0,
   height INTEGER NOT NULL DEFAULT 0,
   kind TEXT NOT NULL DEFAULT '',
@@ -158,6 +160,7 @@ CREATE TABLE IF NOT EXISTS group_outputs (
   name TEXT NOT NULL,
   sha256 TEXT NOT NULL DEFAULT '',
   facts TEXT NOT NULL DEFAULT '',
+  conflict TEXT NOT NULL DEFAULT '',
   prefixed INTEGER NOT NULL DEFAULT 0,
   written_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (target, group_id)
@@ -202,6 +205,8 @@ func migrate(db *sql.DB) error {
 		{"groups", "pixel_phash", "TEXT NOT NULL DEFAULT ''"},
 		{"groups", "resolved_by", "TEXT NOT NULL DEFAULT 'rules'"},
 		{"images", "mtime", "INTEGER NOT NULL DEFAULT 0"},
+		{"images", "exif_camera", "TEXT NOT NULL DEFAULT ''"},
+		{"group_outputs", "conflict", "TEXT NOT NULL DEFAULT ''"},
 	} {
 		have, err := columnExists(db, add.table, add.col)
 		if err != nil {
@@ -307,12 +312,12 @@ func (s *Store) UpsertImage(img Image) (id string, created bool, err error) {
 		_, err = s.db.Exec(`
 			UPDATE images SET
 			  name = ?, sha256 = ?, phash = ?, created_at = ?,
-			  exif_capture = ?, exif_offset = ?,
+			  exif_capture = ?, exif_offset = ?, exif_camera = ?,
 			  width = ?, height = ?, kind = ?, size = ?, mtime = ?,
 			  gps_lat = ?, gps_lon = ?, has_gps = ?
 			WHERE id = ?`,
 			img.Name, img.SHA256, img.Phash, img.CreatedAt,
-			img.ExifCapture, img.ExifOffset,
+			img.ExifCapture, img.ExifOffset, img.ExifCamera,
 			img.Width, img.Height, img.Kind, img.Size, img.MTime,
 			img.GPSLat, img.GPSLon, boolInt(img.HasGPS), id)
 		return id, false, err
@@ -322,11 +327,11 @@ func (s *Store) UpsertImage(img Image) (id string, created bool, err error) {
 	}
 	_, err = s.db.Exec(`
 		INSERT INTO images (id, source_id, rel_path, name, sha256, phash, created_at,
-		                      exif_capture, exif_offset, width, height, kind, size, mtime,
+		                      exif_capture, exif_offset, exif_camera, width, height, kind, size, mtime,
 		                      gps_lat, gps_lon, has_gps, group_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		img.ID, img.SourceID, img.RelPath, img.Name, img.SHA256, img.Phash, img.CreatedAt,
-		img.ExifCapture, img.ExifOffset, img.Width, img.Height, img.Kind, img.Size, img.MTime,
+		img.ExifCapture, img.ExifOffset, img.ExifCamera, img.Width, img.Height, img.Kind, img.Size, img.MTime,
 		img.GPSLat, img.GPSLon, boolInt(img.HasGPS), img.GroupID)
 	return img.ID, true, err
 }
@@ -335,7 +340,7 @@ func (s *Store) UpsertImage(img Image) (id string, created bool, err error) {
 func (s *Store) AllImages() ([]Image, error) {
 	rows, err := s.db.Query(`
 		SELECT id, source_id, rel_path, name, sha256, phash, created_at,
-		       exif_capture, exif_offset, width, height, kind, size, mtime,
+		       exif_capture, exif_offset, exif_camera, width, height, kind, size, mtime,
 		       gps_lat, gps_lon, has_gps, group_id
 		FROM images ORDER BY source_id, rel_path`)
 	if err != nil {
@@ -347,7 +352,7 @@ func (s *Store) AllImages() ([]Image, error) {
 		var img Image
 		var hasGPS int
 		if err := rows.Scan(&img.ID, &img.SourceID, &img.RelPath, &img.Name, &img.SHA256,
-			&img.Phash, &img.CreatedAt, &img.ExifCapture, &img.ExifOffset,
+			&img.Phash, &img.CreatedAt, &img.ExifCapture, &img.ExifOffset, &img.ExifCamera,
 			&img.Width, &img.Height, &img.Kind, &img.Size, &img.MTime,
 			&img.GPSLat, &img.GPSLon, &hasGPS, &img.GroupID); err != nil {
 			return nil, err
@@ -364,7 +369,7 @@ func (s *Store) AllImages() ([]Image, error) {
 func (s *Store) ImagesBySource(sourceID int64) (map[string]Image, error) {
 	rows, err := s.db.Query(`
 		SELECT id, source_id, rel_path, name, sha256, phash, created_at,
-		       exif_capture, exif_offset, width, height, kind, size, mtime,
+		       exif_capture, exif_offset, exif_camera, width, height, kind, size, mtime,
 		       gps_lat, gps_lon, has_gps, group_id
 		FROM images WHERE source_id = ?`, sourceID)
 	if err != nil {
@@ -376,7 +381,7 @@ func (s *Store) ImagesBySource(sourceID int64) (map[string]Image, error) {
 		var img Image
 		var hasGPS int
 		if err := rows.Scan(&img.ID, &img.SourceID, &img.RelPath, &img.Name, &img.SHA256,
-			&img.Phash, &img.CreatedAt, &img.ExifCapture, &img.ExifOffset,
+			&img.Phash, &img.CreatedAt, &img.ExifCapture, &img.ExifOffset, &img.ExifCamera,
 			&img.Width, &img.Height, &img.Kind, &img.Size, &img.MTime,
 			&img.GPSLat, &img.GPSLon, &hasGPS, &img.GroupID); err != nil {
 			return nil, err
@@ -495,6 +500,7 @@ type GroupOutput struct {
 	PixelID   string // pixel image the output was written from
 	SHA256    string // sha256 of the pixel source at write time
 	Facts     string // signature of the merged EXIF facts written
+	Conflict  string // non-empty for conflict groups: why the plan is best effort
 	Prefixed  bool   // the name differs from the stored name (collision prefix)
 	WrittenAt int64  // unix seconds of the write
 }
@@ -503,7 +509,7 @@ type GroupOutput struct {
 // group id.
 func (s *Store) GroupOutputs(target string) (map[int64]GroupOutput, error) {
 	rows, err := s.db.Query(`
-		SELECT group_id, name, pixel_image_id, sha256, facts, prefixed, written_at
+		SELECT group_id, name, pixel_image_id, sha256, facts, conflict, prefixed, written_at
 		FROM group_outputs WHERE target = ?`, target)
 	if err != nil {
 		return nil, err
@@ -516,7 +522,7 @@ func (s *Store) GroupOutputs(target string) (map[int64]GroupOutput, error) {
 			row      GroupOutput
 			prefixed int
 		)
-		if err := rows.Scan(&gid, &row.Name, &row.PixelID, &row.SHA256, &row.Facts, &prefixed, &row.WrittenAt); err != nil {
+		if err := rows.Scan(&gid, &row.Name, &row.PixelID, &row.SHA256, &row.Facts, &row.Conflict, &prefixed, &row.WrittenAt); err != nil {
 			return nil, err
 		}
 		row.Prefixed = prefixed != 0
@@ -529,16 +535,17 @@ func (s *Store) GroupOutputs(target string) (map[int64]GroupOutput, error) {
 // target directory.
 func (s *Store) SaveGroupOutput(target string, groupID int64, o GroupOutput) error {
 	_, err := s.db.Exec(`
-		INSERT INTO group_outputs (target, group_id, pixel_image_id, name, sha256, facts, prefixed, written_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO group_outputs (target, group_id, pixel_image_id, name, sha256, facts, conflict, prefixed, written_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(target, group_id) DO UPDATE SET
 		  pixel_image_id = excluded.pixel_image_id,
 		  name = excluded.name,
 		  sha256 = excluded.sha256,
 		  facts = excluded.facts,
+		  conflict = excluded.conflict,
 		  prefixed = excluded.prefixed,
 		  written_at = excluded.written_at`,
-		target, groupID, o.PixelID, o.Name, o.SHA256, o.Facts, boolInt(o.Prefixed), o.WrittenAt)
+		target, groupID, o.PixelID, o.Name, o.SHA256, o.Facts, o.Conflict, boolInt(o.Prefixed), o.WrittenAt)
 	return err
 }
 

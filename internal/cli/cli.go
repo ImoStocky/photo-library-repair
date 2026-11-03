@@ -67,10 +67,10 @@ const usageText = `plr - photo library repair
 Usage:
   plr scan     --dir DIR... [--force] [--db PATH] [--workers N] [--min-size-kb N]
                [--phash-alg ALG] [--phash-size 8|16|32]
-  plr group    [--max-hamming N] [--identity pass|double-phash|vision] [--db PATH]
-  plr plan     [--conflict-hamming N] [--max-capture-disagreement DUR]
-               [--ai] [--model SOURCE] [--db PATH]
-  plr apply    --target DIR [--dry-run] [--no-exif] [--move] [--force-conflicts] [--db PATH]
+  plr group    [--max-hamming-chunking N] [--identity exif-first|pass|double-phash|vision]
+               [--same-image-window DUR] [--db PATH]
+  plr plan     [--ai] [--model SOURCE] [--db PATH]
+  plr apply    --target DIR [--dry-run] [--no-exif] [--move] [--db PATH]
   plr build    --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr increment --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr commit   [--message TEXT] [--db PATH]
@@ -86,25 +86,36 @@ Commands:
             gradient, vert-gradient, double-gradient, blockhash.
             --phash-size 8|16|32 selects a square hash. Directories already
             scanned are skipped unless --force is given.
-  group     Group images: Aggregate candidates by DCT phash (--max-hamming),
-            then refine with --identity (pass = legacy; double-phash =
-            blockhash∩double-gradient by sha256; vision = Kronk stub).
-  plan      Resolve every group: earliest EXIF capture time (timezone
-            aware; file creation time never overrides EXIF), best quality
-            pixels, GPS. Groups with near-identical pictures and identical
-            capture times are marked as conflicts. With --ai the Kronk
-            decision model settles conflict groups and marks them
-            resolved_by the model id.
+  group     Group images: Aggregate candidate buckets by DCT phash
+            (--max-hamming-chunking), then refine with --identity.
+            exif-first (the approved model, see
+            docs/identity-decision-graph.md): the same sha256 is the same
+            image; two EXIF capture instants within --same-image-window
+            are the same image unless both record camera blocks (Make +
+            Model) that differ; everything else needs the dual 16x16
+            block AND gradient hash gate. pass = legacy bucket
+            grouping; double-phash = blockhash∩double-gradient by sha256;
+            vision = Kronk stub.
+  plan      Resolve every group: pixels from the HEIC member when one
+            exists, else the highest-resolution member; earliest
+            zone-resolved EXIF capture time (file creation time as
+            flagged fallback); GPS position medoid, camera-style name.
+            Remaining conflicts (GPS positions beyond tolerance, undecodable
+            pictures without EXIF, doubtful birth times) are recorded and
+            never dropped. With --ai the Kronk decision model settles
+            conflict groups and marks them resolved_by the model id.
   apply     Copy the planned pixel files into --target and write the merged
             EXIF (capture time, offset, GPS) onto the copies. With --move the
             source file is deleted once its copy is in place. Writes a
-            report.json summary into --target. Conflict groups are skipped
-            unless --force-conflicts is given.
+            report.json summary into --target. Conflict groups materialize
+            as a plain copy of their best-effort pixels and the ledger
+            records the conflict reason.
   build     scan + group + plan + apply in one go.
    increment Merge new photos into an existing library: scan the new dirs
              into the same DB, then partition them against the library
-             (present = already there, joined = closest group within
-             --max-hamming, new = own group; library groups never merge
+             (present = already there, joined = closest group whose pair
+             rule (--identity) matches, new = own group; library groups
+             never merge
              through incoming images), re-plan and re-apply. On a fresh
              DB it degrades to build.
   commit    Snapshot the current plan table into the commit log with a
@@ -198,12 +209,18 @@ func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB 
 
 func runGroup(args []string) int {
 	fs := flag.NewFlagSet("group", flag.ExitOnError)
-	maxHamming := fs.Int("max-hamming", 12, "maximum DCT phash hamming distance for candidate groups")
-	identity := fs.String("identity", "pass", "identity strategy: pass, double-phash, or vision")
-	blockH := fs.Int("identity-block-hamming", 24, "double-phash: max blockhash-16 distance")
-	gradH := fs.Int("identity-grad-hamming", 20, "double-phash: max double-gradient-16 distance")
+	maxHamming := fs.Int("max-hamming-chunking", 20, "maximum DCT phash hamming distance for candidate buckets")
+	identity := fs.String("identity", "exif-first", "identity strategy: exif-first, pass, double-phash, or vision")
+	sameWindowStr := fs.String("same-image-window", "1s", "exif-first: zone-resolved capture-time gap that means the same image; a bare number is seconds")
+	blockH := fs.Int("identity-block-hamming", 0, "dual-hash gate: max blockhash-16 distance (0 = strategy default: 10 exif-first, 24 double-phash)")
+	gradH := fs.Int("identity-grad-hamming", 0, "dual-hash gate: max double-gradient-16 distance (0 = strategy default: 10 exif-first, 20 double-phash)")
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	sameWindow, err := parseDuration(*sameWindowStr)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "plr group: invalid --same-image-window %q: %v\n", *sameWindowStr, err)
 		return 2
 	}
 	s, err := store.Open(*db)
@@ -215,6 +232,7 @@ func runGroup(args []string) int {
 	return runGroupPhase(s, groupPhaseOpts{
 		MaxHamming: *maxHamming,
 		Identity:   *identity,
+		SameWindow: sameWindow,
 		BlockH:     *blockH,
 		GradH:      *gradH,
 	})
@@ -223,6 +241,7 @@ func runGroup(args []string) int {
 type groupPhaseOpts struct {
 	MaxHamming int
 	Identity   string
+	SameWindow time.Duration
 	BlockH     int
 	GradH      int
 }
@@ -297,6 +316,7 @@ func runIncrementGroupPhase(s *store.Store, opts groupPhaseOpts, before map[stri
 		return runGroupPhase(s, opts)
 	}
 	_, comps := group.Aggregate(incoming, opts.MaxHamming)
+	comps = group.SweepCandidates(strat, comps)
 	refined := make([][]group.Image, 0, len(comps))
 	for _, c := range comps {
 		parts, err := strat.Refine(c)
@@ -306,7 +326,7 @@ func runIncrementGroupPhase(s *store.Store, opts groupPhaseOpts, before map[stri
 		}
 		refined = append(refined, parts...)
 	}
-	present, matched, unmatched := group.Partition(refined, lib, opts.MaxHamming)
+	present, matched, unmatched := group.Partition(refined, lib, opts.MaxHamming, sameGate(strat))
 	assign := make(map[string]int64, len(incoming))
 	ambiguous := 0
 	for _, p := range present {
@@ -347,7 +367,14 @@ func runIncrementGroupPhase(s *store.Store, opts groupPhaseOpts, before map[stri
 
 func identityStrategy(s *store.Store, opts groupPhaseOpts) (group.IdentityStrategy, error) {
 	switch opts.Identity {
-	case "", "pass":
+	case "", "exif-first":
+		return group.ExifFirst{
+			Lookup:       storePhashLookup{s},
+			SameWindow:   opts.SameWindow,
+			BlockHamming: opts.BlockH,
+			GradHamming:  opts.GradH,
+		}, nil
+	case "pass":
 		return group.PassThrough{}, nil
 	case "double-phash":
 		return group.DoublePhash{
@@ -358,8 +385,18 @@ func identityStrategy(s *store.Store, opts groupPhaseOpts) (group.IdentityStrate
 	case "vision":
 		return group.DecisionModel{Decider: group.UnsureDecider{}}, nil
 	default:
-		return nil, fmt.Errorf("unknown --identity %q (want pass, double-phash, or vision)", opts.Identity)
+		return nil, fmt.Errorf("unknown --identity %q (want exif-first, pass, double-phash, or vision)", opts.Identity)
 	}
+}
+
+// sameGate exposes an identity strategy's pair rule for the incremental
+// merge (group.Partition); strategies without one keep the pure hash
+// classification.
+func sameGate(strat group.IdentityStrategy) group.SameFunc {
+	if g, ok := strat.(interface{ SameFunc() group.SameFunc }); ok {
+		return g.SameFunc()
+	}
+	return nil
 }
 
 // storePhashLookup adapts store.GetContentPhash to group.ContentPhashLookup.
@@ -379,17 +416,10 @@ func (l storePhashLookup) Phash(sha256 string, alg phash.Alg, size phash.Size) (
 
 func runPlan(args []string) int {
 	fs := flag.NewFlagSet("plan", flag.ExitOnError)
-	conflictHamming := fs.Int("conflict-hamming", 2, "perceptual hashes within this distance with identical capture times mark the group as a conflict")
-	maxDisagree := fs.String("max-capture-disagreement", "10s", "largest capture-time gap within a group that still merges; a bare number is seconds")
 	ai := fs.Bool("ai", false, "settle conflict groups with the Kronk decision model")
 	modelSource := fs.String("model", kronkai.DefaultModel, "Kronk decision model source for --ai")
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	if err := fs.Parse(args); err != nil {
-		return 2
-	}
-	maxDisagreeDur, err := parseDuration(*maxDisagree)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "plr plan: invalid --max-capture-disagreement %q: %v\n", *maxDisagree, err)
 		return 2
 	}
 	s, err := store.Open(*db)
@@ -409,11 +439,11 @@ func runPlan(args []string) int {
 		defer close()
 		fmt.Printf("decision model %s loaded; settling conflicts\n", res.Name())
 	}
-	return runPlanPhase(s, res, *conflictHamming, maxDisagreeDur)
+	return runPlanPhase(s, res)
 }
 
 // runPlanPhase is the plan step, shared by "plr plan" and "plr build".
-func runPlanPhase(s *store.Store, res group.Resolver, conflictHamming int, maxDisagreement time.Duration) int {
+func runPlanPhase(s *store.Store, res group.Resolver) int {
 	imgs, err := s.AllImages()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr plan:", err)
@@ -445,7 +475,7 @@ func runPlanPhase(s *store.Store, res group.Resolver, conflictHamming int, maxDi
 	slices.Sort(ids)
 	aiSettled := 0
 	for _, id := range ids {
-		p := group.ResolveGroup(byGroup[id], res, conflictHamming, maxDisagreement)
+		p := group.ResolveGroup(byGroup[id], res)
 		if p.ResolvedBy != group.Rules {
 			aiSettled++
 		}
@@ -490,7 +520,6 @@ func runApply(args []string) int {
 	dryRun := fs.Bool("dry-run", false, "report what would be copied without touching the target")
 	noEXIF := fs.Bool("no-exif", false, "copy files without writing merged EXIF")
 	move := fs.Bool("move", false, "delete each source file once its copy is in place in --target")
-	forceConflicts := fs.Bool("force-conflicts", false, "apply conflict groups using the best-effort plan")
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -510,12 +539,11 @@ func runApply(args []string) int {
 		defer tool.Close()
 	}
 	return runApplyPhase(s, apply.Options{
-		Target:         *target,
-		DryRun:         *dryRun,
-		NoEXIF:         *noEXIF,
-		Move:           *move,
-		ForceConflicts: *forceConflicts,
-		EXIF:           tool,
+		Target: *target,
+		DryRun: *dryRun,
+		NoEXIF: *noEXIF,
+		Move:   *move,
+		EXIF:   tool,
 	})
 }
 
@@ -536,8 +564,8 @@ func runApplyPhase(s *store.Store, opts apply.Options) int {
 	for _, e := range rep.Errors {
 		fmt.Fprintln(os.Stderr, "plr apply:", e)
 	}
-	fmt.Printf("apply: %d new, %d updated, %d renamed, %d unchanged, %d conflict group(s) skipped\n",
-		rep.Copied, rep.Updated, rep.Renamed, rep.Untouched, rep.Skipped)
+	fmt.Printf("apply: %d new, %d updated, %d renamed, %d unchanged\n",
+		rep.Copied, rep.Updated, rep.Renamed, rep.Untouched)
 	if len(rep.Errors) > 0 {
 		return 1
 	}
@@ -596,7 +624,7 @@ func runBuild(args []string) int { return runPipeline("build", args) }
 // runIncrement merges new photos into an existing library: scan the new
 // directories into the same DB (upserts keep existing ids), then re-group
 // (new near-duplicates chain into existing groups under the same
-// --max-hamming radius), re-plan and re-apply. On a fresh DB it degrades
+// --max-hamming-chunking radius), re-plan and re-apply. On a fresh DB it degrades
 // to build.
 func runIncrement(args []string) int { return runPipeline("increment", args) }
 
@@ -605,16 +633,14 @@ func runPipeline(cmd string, args []string) int {
 	dirs := multiFlag{}
 	target := fs.String("target", "", "directory that receives the final images (required)")
 	force := fs.Bool("force", false, "re-scan directories that were already scanned")
-	maxHamming := fs.Int("max-hamming", 12, "maximum DCT phash hamming distance for candidate groups")
-	identity := fs.String("identity", "pass", "identity strategy: pass, double-phash, or vision")
-	blockH := fs.Int("identity-block-hamming", 24, "double-phash: max blockhash-16 distance")
-	gradH := fs.Int("identity-grad-hamming", 20, "double-phash: max double-gradient-16 distance")
-	conflictHamming := fs.Int("conflict-hamming", 2, "perceptual hashes within this distance with identical capture times mark the group as a conflict")
-	maxDisagreeStr := fs.String("max-capture-disagreement", "10s", "largest capture-time gap within a group that still merges; a bare number is seconds")
+	maxHamming := fs.Int("max-hamming-chunking", 20, "maximum DCT phash hamming distance for candidate buckets")
+	identity := fs.String("identity", "exif-first", "identity strategy: exif-first, pass, double-phash, or vision")
+	sameWindowStr := fs.String("same-image-window", "1s", "exif-first: zone-resolved capture-time gap that means the same image; a bare number is seconds")
+	blockH := fs.Int("identity-block-hamming", 0, "dual-hash gate: max blockhash-16 distance (0 = strategy default: 10 exif-first, 24 double-phash)")
+	gradH := fs.Int("identity-grad-hamming", 0, "dual-hash gate: max double-gradient-16 distance (0 = strategy default: 10 exif-first, 20 double-phash)")
 	dryRun := fs.Bool("dry-run", false, "report what would be copied without touching the target")
 	noEXIF := fs.Bool("no-exif", false, "copy files without writing merged EXIF")
 	move := fs.Bool("move", false, "delete each source file once its copy is in place in --target")
-	forceConflicts := fs.Bool("force-conflicts", false, "apply conflict groups using the best-effort plan")
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	workers := fs.Int("workers", 4, "number of hash workers")
 	minSizeKB := fs.Int("min-size-kb", 0, "ignore images smaller than this many kilobytes")
@@ -633,9 +659,9 @@ func runPipeline(cmd string, args []string) int {
 		fmt.Fprintln(os.Stderr, "plr "+cmd+":", err)
 		return 2
 	}
-	maxDisagreement, err := parseDuration(*maxDisagreeStr)
+	sameWindow, err := parseDuration(*sameWindowStr)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "plr %s: invalid --max-capture-disagreement %q: %v\n", cmd, *maxDisagreeStr, err)
+		fmt.Fprintf(os.Stderr, "plr %s: invalid --same-image-window %q: %v\n", cmd, *sameWindowStr, err)
 		return 2
 	}
 	s, err := store.Open(*db)
@@ -671,6 +697,7 @@ func runPipeline(cmd string, args []string) int {
 			opts := groupPhaseOpts{
 				MaxHamming: *maxHamming,
 				Identity:   *identity,
+				SameWindow: sameWindow,
 				BlockH:     *blockH,
 				GradH:      *gradH,
 			}
@@ -679,16 +706,15 @@ func runPipeline(cmd string, args []string) int {
 			}
 			return runGroupPhase(s, opts)
 		}},
-		{"plan", func() int { return runPlanPhase(s, nil, *conflictHamming, maxDisagreement) }},
+		{"plan", func() int { return runPlanPhase(s, nil) }},
 		{"commit", func() int { return runCommitPhase(s, cmd) }},
 		{"apply", func() int {
 			return runApplyPhase(s, apply.Options{
-				Target:         *target,
-				DryRun:         *dryRun,
-				NoEXIF:         *noEXIF,
-				Move:           *move,
-				ForceConflicts: *forceConflicts,
-				EXIF:           tool,
+				Target: *target,
+				DryRun: *dryRun,
+				NoEXIF: *noEXIF,
+				Move:   *move,
+				EXIF:   tool,
 			})
 		}},
 	}
@@ -941,6 +967,7 @@ func toGroupImage(im store.Image) group.Image {
 		CreatedAt:   im.CreatedAt,
 		ExifCapture: im.ExifCapture,
 		ExifOffset:  im.ExifOffset,
+		ExifCamera:  im.ExifCamera,
 		Width:       im.Width,
 		Height:      im.Height,
 		Size:        im.Size,

@@ -131,7 +131,6 @@ func TestApplyWritesReportJSON(t *testing.T) {
 		Generated string `json:"generated"`
 		Target    string `json:"target"`
 		Copied    int    `json:"copied"`
-		Skipped   int    `json:"skipped"`
 		Files     []struct {
 			Source string `json:"source"`
 			Dest   string `json:"dest"`
@@ -154,11 +153,11 @@ func TestApplyWritesReportJSON(t *testing.T) {
 	if rj.Target != target {
 		t.Fatalf("target = %q, want %q", rj.Target, target)
 	}
-	if rj.Copied != 1 || rj.Skipped != 1 {
-		t.Fatalf("copied=%d skipped=%d, want 1/1", rj.Copied, rj.Skipped)
+	if rj.Copied != 2 {
+		t.Fatalf("copied=%d, want 2 (conflicts materialize too)", rj.Copied)
 	}
-	if len(rj.Files) != 1 || !rj.Files[0].EXIF {
-		t.Fatalf("files = %+v", rj.Files)
+	if len(rj.Files) != 2 || !rj.Files[0].EXIF || rj.Files[1].EXIF {
+		t.Fatalf("files = %+v (want merged EXIF then plain copy)", rj.Files)
 	}
 	if rj.Files[0].Source != filepath.Join(srcDir, "a.jpg") {
 		t.Fatalf("file source = %q", rj.Files[0].Source)
@@ -203,27 +202,36 @@ func TestApplyDryRunTouchesNothing(t *testing.T) {
 	}
 }
 
-func TestApplySkipsConflictsUnlessForced(t *testing.T) {
+func TestApplyCopiesConflictsPlainly(t *testing.T) {
 	s, srcDir, sid := newStore(t)
-	addFile(t, srcDir, "a.jpg", testimg.JPEG(testimg.Textured(32, 24, 1), 90))
+	src := addFile(t, srcDir, "a.jpg", testimg.JPEG(testimg.Textured(32, 24, 1), 90))
 	addImage(t, s, sid, "a.jpg", "a.jpg", "a", "jpeg", 100)
-	if err := s.SaveGroup(store.Group{ID: 1, Status: group.StatusConflict, PixelImageID: "a", CaptureInstant: instant, StoredName: "a.jpg"}); err != nil {
+	if err := s.SaveGroup(store.Group{ID: 1, Status: group.StatusConflict, Reason: "offsets disagree", PixelImageID: "a", CaptureInstant: instant, StoredName: "a.jpg"}); err != nil {
 		t.Fatal(err)
 	}
 
 	target := t.TempDir()
-	rep, _ := Apply(s, Options{Target: target})
-	if rep.Skipped != 1 || rep.Copied != 0 {
-		t.Fatalf("conflict must be skipped by default: %+v", rep)
+	rep, err := Apply(s, Options{Target: target})
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	target2 := t.TempDir()
-	rep, _ = Apply(s, Options{Target: target2, ForceConflicts: true})
-	if rep.Skipped != 0 || rep.Copied != 1 {
-		t.Fatalf("forced conflict must be applied: %+v", rep)
+	if rep.Copied != 1 {
+		t.Fatalf("conflict group must materialize: %+v", rep)
 	}
-	if _, err := os.Stat(filepath.Join(target2, "a.jpg")); err != nil {
-		t.Fatalf("forced copy missing: %v", err)
+	out := filepath.Join(target, "a.jpg")
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("conflict copy missing: %v", err)
+	}
+	if want, _ := os.ReadFile(src); string(data) != string(want) {
+		t.Fatal("conflict output must be a plain copy of the pixel source")
+	}
+	ledger, err := s.GroupOutputs(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ledger[1].Conflict != "offsets disagree" {
+		t.Fatalf("ledger conflict = %q, want the plan reason", ledger[1].Conflict)
 	}
 }
 

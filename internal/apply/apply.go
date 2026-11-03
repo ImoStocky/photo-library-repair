@@ -4,8 +4,9 @@
 //
 // It is the write-out half of the pipeline: scan/group/plan decide what the
 // repaired library looks like, apply materializes it. Conflict groups are
-// skipped unless Options.ForceConflicts is set, in which case their
-// best-effort plan is applied.
+// never dropped: they materialize as a plain copy of their best-effort
+// pixel source (no merged EXIF) and the conflict reason is recorded in
+// the ledger and report.
 //
 // Apply keeps a ledger of what it wrote (store.GroupOutput, keyed by
 // target directory). Re-applying an unchanged library leaves the target
@@ -36,12 +37,11 @@ import (
 
 // Options controls an apply run.
 type Options struct {
-	Target         string     // directory that receives the final images
-	DryRun         bool       // report what would be done without touching the target
-	NoEXIF         bool       // copy files without writing merged EXIF
-	ForceConflicts bool       // apply conflict groups using their best-effort plan
-	Move           bool       // delete the source file once its copy is in place
-	EXIF           *exif.Tool // full-data engine; nil uses the built-in writer
+	Target string     // directory that receives the final images
+	DryRun bool       // report what would be done without touching the target
+	NoEXIF bool       // copy files without writing merged EXIF
+	Move   bool       // delete the source file once its copy is in place
+	EXIF   *exif.Tool // full-data engine; nil uses the built-in writer
 }
 
 // Per-file actions reported by FileResult.Action.
@@ -73,7 +73,6 @@ type Report struct {
 	Moved     int // move mode: files whose source was deleted
 	Renamed   int // outputs moved to a new name (incl. first-time prefixed placements)
 	Untouched int // outputs left in place by the ledger
-	Skipped   int // conflict groups left alone because not forced
 	Errors    []string
 }
 
@@ -117,14 +116,13 @@ type reportJSON struct {
 	Untouched int          `json:"untouched,omitempty"`
 	Moved     int          `json:"moved,omitempty"`
 	Renamed   int          `json:"renamed,omitempty"`
-	Skipped   int          `json:"skipped,omitempty"`
 	Files     []FileResult `json:"files"`
 	Groups    []groupJSON  `json:"groups"`
 	Errors    []string     `json:"errors,omitempty"`
 }
 
 // writeReportJSON writes report.json into target summarizing the run and
-// every group's plan (including skipped conflicts).
+// every group's plan (conflict groups included, with their reason).
 func writeReportJSON(target string, rep Report, groups []store.Group, byID map[string]store.Image, sources map[int64]string) error {
 	rj := reportJSON{
 		Generated: time.Now().UTC().Format(time.RFC3339),
@@ -134,7 +132,6 @@ func writeReportJSON(target string, rep Report, groups []store.Group, byID map[s
 		Untouched: rep.Untouched,
 		Moved:     rep.Moved,
 		Renamed:   rep.Renamed,
-		Skipped:   rep.Skipped,
 		Files:     rep.Files,
 		Groups:    make([]groupJSON, 0, len(groups)),
 		Errors:    rep.Errors,
@@ -349,10 +346,10 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 	}
 
 	for _, g := range groups {
-		if g.Status == group.StatusConflict && !opts.ForceConflicts {
-			rep.Skipped++
-			continue
-		}
+		// Conflict groups are never dropped: the plan's best-effort
+		// pixels materialize as a plain copy and the ledger records
+		// why the plan is only best effort.
+		conflict := g.Status == group.StatusConflict
 
 		pixel, ok := byID[g.PixelImageID]
 		if !ok {
@@ -367,6 +364,9 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 		srcPath := filepath.Join(srcDir, pixel.RelPath)
 
 		writeEXIF, facts := planFacts(g, pixel, opts)
+		if conflict {
+			writeEXIF, facts = false, exifwrite.Facts{}
+		}
 		sig := factsSignature(writeEXIF, facts)
 
 		prev, hadPrev := ledger[g.ID]
@@ -466,6 +466,9 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 			Facts:     sig,
 			Prefixed:  prefixed,
 			WrittenAt: time.Now().Unix(),
+		}
+		if conflict {
+			row.Conflict = g.Reason
 		}
 		if err := s.SaveGroupOutput(key, g.ID, row); err != nil {
 			rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: save apply ledger: %v", g.ID, err))

@@ -39,12 +39,15 @@ func Textured(w, h, seed int) *image.RGBA {
 
 // EXIF describes the tags written by MakeEXIFJPEG.
 type EXIF struct {
+	Make               string // ASCII Make tag, "" = omit
+	Model              string // ASCII Model tag, "" = omit
 	Orientation        uint16 // 0 = omit the tag
 	DateTimeOriginal   string // raw EXIF string, "" = omit
 	OffsetTimeOriginal string // "" = omit
 	DateTime           string // IFD0 fallback, "" = omit
 	OffsetTime         string // IFD0 fallback, "" = omit
 	GPS                bool   // write a fixed coordinate (52.5204N, 13.4055E)
+	GPSShift           bool   // move the fixed coordinate 1" north (~30m), enough to disagree
 }
 
 // GPS values written when EXIF.GPS is set, in degrees/minutes/seconds.
@@ -161,6 +164,12 @@ func buildTIFF(ex EXIF) []byte {
 	le := binary.LittleEndian
 
 	var ifd0 []tiffEntry
+	if ex.Make != "" {
+		ifd0 = append(ifd0, tiffEntry{tag: 0x010F, typ: tASCII, ascii: ex.Make})
+	}
+	if ex.Model != "" {
+		ifd0 = append(ifd0, tiffEntry{tag: 0x0110, typ: tASCII, ascii: ex.Model})
+	}
 	if ex.Orientation > 0 {
 		ifd0 = append(ifd0, tiffEntry{tag: 0x0112, typ: tSHORT, svalue: ex.Orientation})
 	}
@@ -189,10 +198,14 @@ func buildTIFF(ex EXIF) []byte {
 
 	var gpsIFD []tiffEntry
 	if ex.GPS {
+		latN := uint32(gpsLatN)
+		if ex.GPSShift {
+			latN += 10 // one arcsecond north of the fixed position
+		}
 		gpsIFD = append(gpsIFD,
 			tiffEntry{tag: 0x0001, typ: tASCII, ascii: "N"},
 			tiffEntry{tag: 0x0002, typ: tRATIONAL, rational: [3][2]uint32{
-				{gpsLatD, 1}, {gpsLatM, 1}, {gpsLatN, gpsLatDen}}},
+				{gpsLatD, 1}, {gpsLatM, 1}, {latN, gpsLatDen}}},
 			tiffEntry{tag: 0x0003, typ: tASCII, ascii: "E"},
 			tiffEntry{tag: 0x0004, typ: tRATIONAL, rational: [3][2]uint32{
 				{gpsLonD, 1}, {gpsLonM, 1}, {gpsLonN, gpsLonDen}}},

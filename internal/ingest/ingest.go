@@ -262,6 +262,7 @@ func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time
 					CreatedAt:   j.createdAt,
 					ExifCapture: info.EXIFCapture,
 					ExifOffset:  info.EXIFOffset,
+					ExifCamera:  info.EXIFCamera,
 					Width:       info.Width,
 					Height:      info.Height,
 					Kind:        j.kind,

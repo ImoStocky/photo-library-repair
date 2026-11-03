@@ -27,7 +27,7 @@ func TestPartitionPresent(t *testing.T) {
 			{ID: "n2", SHA256: "zzz", Phash: hZero, Width: 100, Height: 100},
 		},
 	}
-	present, matched, unmatched := Partition(comps, lib, 12)
+	present, matched, unmatched := Partition(comps, lib, 12, nil)
 	if len(present) != 2 || len(matched) != 0 || len(unmatched) != 0 {
 		t.Fatalf("present=%d matched=%d unmatched=%d", len(present), len(matched), len(unmatched))
 	}
@@ -42,7 +42,7 @@ func TestPartitionPresentVsMatchedBySize(t *testing.T) {
 	comps := [][]Image{{
 		{ID: "n1", SHA256: "bbb", Phash: hZero, Width: 200, Height: 200},
 	}}
-	present, matched, unmatched := Partition(comps, lib, 12)
+	present, matched, unmatched := Partition(comps, lib, 12, nil)
 	if len(present) != 0 || len(unmatched) != 0 {
 		t.Fatalf("present=%d unmatched=%d", len(present), len(unmatched))
 	}
@@ -57,7 +57,7 @@ func TestPartitionMatchWithinRadius(t *testing.T) {
 		{ID: "n1", SHA256: "b1", Phash: hOne, Width: 100, Height: 100}, // d=1
 		{ID: "n2", SHA256: "b2", Phash: hFar, Width: 100, Height: 100}, // d=128
 	}}
-	_, matched, unmatched := Partition(comps, lib, 12)
+	_, matched, unmatched := Partition(comps, lib, 12, nil)
 	if len(matched) != 1 || matched[0].GroupID != 7 || matched[0].Distance != 1 {
 		t.Fatalf("matched=%v", matched)
 	}
@@ -74,7 +74,7 @@ func TestPartitionClosestGroupWins(t *testing.T) {
 	comps := [][]Image{{
 		{ID: "n1", SHA256: "b1", Phash: hZero, Width: 100, Height: 100},
 	}}
-	_, matched, _ := Partition(comps, lib, 12)
+	_, matched, _ := Partition(comps, lib, 12, nil)
 	if len(matched) != 1 || matched[0].GroupID != 3 || matched[0].Ambiguous {
 		t.Fatalf("want unambiguous join of group 3: %v", matched)
 	}
@@ -89,7 +89,7 @@ func TestPartitionAmbiguousTie(t *testing.T) {
 	comps := [][]Image{{
 		{ID: "n1", SHA256: "b1", Phash: hOne, Width: 100, Height: 100},
 	}}
-	_, matched, _ := Partition(comps, lib, 12)
+	_, matched, _ := Partition(comps, lib, 12, nil)
 	if len(matched) != 1 {
 		t.Fatalf("matched=%v", matched)
 	}
@@ -103,7 +103,7 @@ func TestPartitionUnhashableStaysUnmatched(t *testing.T) {
 	comps := [][]Image{{
 		{ID: "n1", SHA256: "b1", Phash: "", Width: 100, Height: 100},
 	}}
-	present, matched, unmatched := Partition(comps, lib, 12)
+	present, matched, unmatched := Partition(comps, lib, 12, nil)
 	if len(present) != 0 || len(matched) != 0 || len(unmatched) != 1 {
 		t.Fatalf("present=%d matched=%d unmatched=%d", len(present), len(matched), len(unmatched))
 	}

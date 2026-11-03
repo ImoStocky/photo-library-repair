@@ -33,7 +33,7 @@ func TestResolveWithRealModel(t *testing.T) {
 		t.Fatal("no name chosen")
 	}
 
-	p := group.ResolveGroup(c.Images, res, 2)
+	p := group.ResolveGroup(c.Images, res)
 	if p.Status != group.StatusResolved || p.ResolvedBy == "" {
 		t.Fatalf("plan = %+v", p)
 	}

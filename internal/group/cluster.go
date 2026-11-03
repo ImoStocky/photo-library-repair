@@ -29,15 +29,21 @@ func (u *unionFind) union(a, b int) {
 	}
 }
 
+// groups collects the component of every member, ordering the components
+// by their first member so group ids are stable across runs.
 func (u *unionFind) groups(imgs []Image) [][]Image {
 	byRoot := map[int][]Image{}
+	order := make([]int, 0, len(imgs))
 	for i, im := range imgs {
 		r := u.find(i)
+		if _, ok := byRoot[r]; !ok {
+			order = append(order, r)
+		}
 		byRoot[r] = append(byRoot[r], im)
 	}
-	out := make([][]Image, 0, len(byRoot))
-	for _, g := range byRoot {
-		out = append(out, g)
+	out := make([][]Image, 0, len(order))
+	for _, r := range order {
+		out = append(out, byRoot[r])
 	}
 	return out
 }

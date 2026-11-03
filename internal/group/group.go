@@ -3,29 +3,34 @@
 // pixels, which capture time the library keeps, which GPS position, and
 // which name the stored image gets.
 //
-// The rules follow the library design:
+// The rules follow docs/identity-decision-graph.md: group membership
+// already carries identity (the same sha256, EXIF capture instants within
+// one second from the same camera block, or dual 16×16 hash agreement),
+// so resolution only settles the plan fields:
 //
-//   - pixels come from the highest-resolution file, keeping that file's
-//     own perceptual hash;
-//   - the capture time is the earliest EXIF capture time when the group
-//     carries EXIF (time-zone aware), otherwise the earliest file
-//     creation time, marked as a fallback;
-//   - a single EXIF picture whose file existed more than five seconds
-//     before its own capture time is a conflict;
-//   - several EXIF pictures agree when only their capture times differ;
-//     any other EXIF disagreement (offsets, GPS) is a conflict;
-//   - two pictures whose perceptual hashes differ by at most the conflict
-//     limit (ResolveGroup's third argument) and whose capture instants
-//     are identical are a conflict; a negative limit disables the rule;
+//   - pixels come from the HEIC file when one exists, else the
+//     highest-resolution file, keeping that file's own perceptual hash;
+//   - the capture time is the earliest parsable zone-resolved EXIF
+//     capture time, otherwise the earliest file creation time, marked as
+//     a fallback;
+//   - GPS is supplementary: positions agreeing within tolerance collapse
+//     to their medoid, positions disagreeing beyond it are a conflict;
+//   - a single picture that is undecodable and carries no parsable EXIF
+//     capture time cannot be told from a duplicate by any rule and is a
+//     conflict;
+//   - a group whose only parsable EXIF picture was created more than
+//     five seconds before its own capture time, or whose EXIF-less member
+//     was created before the group's earliest EXIF capture time, is a
+//     conflict;
 //   - the stored name is the member name that most resembles an original
 //     camera file name.
 //
-// Conflicts are surfaced through the Resolver interface so a later phase
-// (Kronk SDK) can settle them without touching these rules.
+// Conflicts never drop a group: apply materializes them and records the
+// reason. Conflicts can still be settled through the Resolver interface
+// (Kronk SDK) without touching these rules.
 package group
 
 import (
-	"fmt"
 	"math"
 	"regexp"
 	"slices"
@@ -47,11 +52,6 @@ const (
 // the EXIF capture time of its own picture before the group conflicts.
 const captureTolerance = 5
 
-// DefaultMaxDisagreement is the default capture-time gap within which
-// group members may merge (see ResolveGroup's maxDisagreement): after the
-// timezone rules, members whose capture instants spread beyond it conflict.
-const DefaultMaxDisagreement = 10 * time.Second
-
 // gpsTolerance is the coordinate difference (degrees) still considered
 // the same position.
 const gpsTolerance = 1e-5
@@ -65,6 +65,7 @@ type Image struct {
 	CreatedAt   int64  // unix seconds, file birth time
 	ExifCapture string // raw EXIF wall clock, "" when absent
 	ExifOffset  string // normalized offset "+HH:MM" / "Z", "" when unknown
+	ExifCamera  string // camera block (EXIF Make + Model), "" when unknown
 	Width       int
 	Height      int
 	Size        int64
@@ -253,96 +254,60 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 	return assign, groups
 }
 
-// ResolveGroup applies the resolution rules to one group of pictures.
-// res may be nil, in which case conflicts stay unresolved.
-// conflictHamming is the phash limit (bits) of the near-identical
-// conflict rule; a negative value disables that rule.
-// maxDisagreement is the capture-time gap within which EXIF members may
-// merge (group.DefaultMaxDisagreement is the default); a wider spread
-// marks the group as a conflict. A negative value disables that rule.
-func ResolveGroup(imgs []Image, res Resolver, conflictHamming int, maxDisagreement time.Duration) Plan {
+// ResolveGroup applies the resolution rules to one identity group. The
+// members' identity was decided when the group was formed (see
+// ExifFirst), so resolution only settles the plan fields and surfaces the
+// conflicts that remain: GPS positions beyond tolerance, a lone EXIF
+// picture created long before its own capture time, and a single
+// undecodable picture without EXIF, which no rule could tell apart from
+// a duplicate. res may be nil, in which case conflicts stay unresolved.
+func ResolveGroup(imgs []Image, res Resolver) Plan {
 	if len(imgs) == 0 {
 		panic("group: ResolveGroup of an empty group")
 	}
-	if len(imgs) == 1 {
-		im := imgs[0]
-		return Plan{
-			Status:          StatusSingleton,
-			ResolvedBy:      Rules,
-			PixelImageID:    im.ID,
-			PixelPhash:      im.Phash,
-			CaptureImageID:  im.ID,
-			CaptureTime:     captureDisplay(im),
-			CaptureInstant:  captureInstant(im),
-			CaptureFallback: im.ExifCapture == "",
-			HasGPS:          im.HasGPS,
-			GPSLat:          im.GPSLat,
-			GPSLon:          im.GPSLon,
-			StoredName:      im.Name,
-		}
-	}
-
-	// A missing timezone offset is not a position, just no information:
-	// such members inherit the group's single known offset so wall clocks
-	// compare on the same zone. Two distinct known offsets are left alone
-	// for the rules below to report as a conflict.
-	if zone, ok := groupZone(imgs); ok && zone != "" {
-		imgs = inheritZone(imgs, zone)
-	}
-
-	var exif []Image
-	for _, im := range imgs {
-		if im.ExifCapture != "" {
-			exif = append(exif, im)
-		}
-	}
-
-	captureIdx, reason, conflictReason, fallback := 0, "", "", false
-	switch {
-	case len(exif) == 0:
-		captureIdx = earliestCreatedAt(imgs)
-		fallback = true
-		reason = "no EXIF capture time; earliest file creation time used"
-	case len(exif) == 1:
-		im := exif[0]
-		t, ok := parseCapture(im.ExifCapture, im.ExifOffset)
-		if !ok {
-			conflictReason = fmt.Sprintf("unparsable EXIF capture time %q", im.ExifCapture)
-			break
-		}
-		if im.CreatedAt < t.Unix()-captureTolerance {
-			conflictReason = "file creation time precedes its own EXIF capture time by more than 5 seconds"
-			break
-		}
-		captureIdx = indexof(imgs, im.ID)
-		reason = "earliest EXIF capture time"
-	default:
-		captureIdx, conflictReason = resolveMultipleEXIF(imgs, exif, maxDisagreement)
-		if conflictReason == "" {
-			reason = "earliest EXIF capture time; EXIF data agrees"
-		}
-	}
-
-	if conflictReason == "" {
-		if d, found := nearIdenticalPair(imgs, conflictHamming); found {
-			conflictReason = fmt.Sprintf("near-identical pictures (phash distance %d, limit %d) with identical capture time", d, conflictHamming)
-		}
-	}
 
 	plan := Plan{
-		Status:          StatusResolved,
-		Reason:          reason,
-		ResolvedBy:      Rules,
-		PixelImageID:    bestPixels(imgs).ID,
-		CaptureImageID:  imgs[captureIdx].ID,
-		CaptureFallback: fallback,
+		ResolvedBy:   Rules,
+		PixelImageID: bestPixels(imgs).ID,
 	}
 	plan.PixelPhash = imgs[indexof(imgs, plan.PixelImageID)].Phash
+	plan.StoredName = pickName(imgs, plan.PixelImageID)
+
+	captureIdx, fallback := pickCapture(imgs)
 	capIm := imgs[captureIdx]
+	plan.CaptureImageID = capIm.ID
 	plan.CaptureTime = captureDisplay(capIm)
 	plan.CaptureInstant = captureInstant(capIm)
-	plan.HasGPS, plan.GPSLat, plan.GPSLon = capIm.HasGPS, capIm.GPSLat, capIm.GPSLon
-	plan.StoredName = pickName(imgs, plan.PixelImageID)
+	plan.CaptureFallback = fallback
+	if fallback {
+		plan.Reason = "no EXIF capture time; earliest file creation time used"
+	} else {
+		plan.Reason = "earliest EXIF capture time"
+	}
+
+	conflictReason := ""
+	if len(imgs) == 1 {
+		im := imgs[0]
+		if im.Phash == "" && !hasEXIFInstant(im) {
+			conflictReason = "picture cannot be decoded and carries no EXIF capture time"
+		} else {
+			plan.Status = StatusSingleton
+		}
+	} else {
+		plan.Status = StatusResolved
+		conflictReason = birthTimeDoubt(imgs)
+	}
+
+	// GPS is supplementary: members without a position inherit, agreeing
+	// positions collapse to their medoid, and a position beyond tolerance
+	// of the medoid conflicts. The medoid stays the plan's best effort.
+	if g, why := gpsMedoid(imgs); g >= 0 {
+		gIm := imgs[g]
+		plan.HasGPS, plan.GPSLat, plan.GPSLon = gIm.HasGPS, gIm.GPSLat, gIm.GPSLon
+		if conflictReason == "" {
+			conflictReason = why
+		}
+	}
 
 	if conflictReason == "" {
 		return plan
@@ -375,113 +340,138 @@ func ResolveGroup(imgs []Image, res Resolver, conflictHamming int, maxDisagreeme
 	return plan
 }
 
-// resolveMultipleEXIF applies the agreement rules to several EXIF
-// pictures and returns the capture index, or a non-empty conflict reason.
-// Members with unknown timezone offsets are expected to have inherited the
-// group's zone already (see ResolveGroup); two distinct known offsets
-// conflict. Capture times must fall within maxDisagreement of each other;
-// a negative value disables that spread rule.
-func resolveMultipleEXIF(imgs, exif []Image, maxDisagreement time.Duration) (int, string) {
-	// Two distinct known offsets make the true capture instant ambiguous.
-	zone := ""
-	for _, im := range exif {
-		if im.ExifOffset == "" {
+// pickCapture returns the index of the member that provides the kept
+// capture time: the earliest parsable zone-resolved EXIF instant, or the
+// earliest file creation time (fallback true) when no EXIF parses.
+func pickCapture(imgs []Image) (int, bool) {
+	best, bestT := -1, int64(0)
+	for i, im := range imgs {
+		if im.ExifCapture == "" {
 			continue
 		}
-		if zone == "" {
-			zone = im.ExifOffset
-		} else if im.ExifOffset != zone {
-			return 0, fmt.Sprintf("EXIF timezone offsets differ (%q vs %q)", im.ExifOffset, zone)
-		}
-	}
-	type parsed struct {
-		idx     int
-		instant int64
-	}
-	var all []parsed
-	for i, im := range exif {
 		t, ok := parseCapture(im.ExifCapture, im.ExifOffset)
 		if !ok {
-			return 0, fmt.Sprintf("unparsable EXIF capture time %q", im.ExifCapture)
+			continue
 		}
-		all = append(all, parsed{idx: i, instant: t.Unix()})
-	}
-	lo, hi := all[0].instant, all[0].instant
-	for _, p := range all[1:] {
-		lo = min(lo, p.instant)
-		hi = max(hi, p.instant)
-	}
-	if maxDisagreement >= 0 {
-		if spread := time.Duration(hi-lo) * time.Second; spread > maxDisagreement {
-			return 0, fmt.Sprintf("capture times disagree (spread %s exceeds %s)", spread, maxDisagreement)
+		if best < 0 || t.Unix() < bestT {
+			best, bestT = i, t.Unix()
 		}
 	}
-	// Everything but the capture time must agree.
-	for i := 1; i < len(exif); i++ {
-		if !gpsAgree(exif[i], exif[0]) {
-			return 0, "EXIF GPS positions differ"
-		}
+	if best >= 0 {
+		return best, false
 	}
-	best := 0
-	for i := 1; i < len(all); i++ {
-		if all[i].instant < all[best].instant {
-			best = i
-		}
-	}
-	return indexof(imgs, exif[all[best].idx].ID), ""
+	return earliestCreatedAt(imgs), true
 }
 
-// nearIdenticalPair reports the first pair of members whose perceptual
-// hashes differ by at most limit bits and whose capture instants are
-// identical, with their distance. Members without a usable hash are
-// skipped; a negative limit disables the rule.
-func nearIdenticalPair(imgs []Image, limit int) (int, bool) {
-	if limit < 0 {
-		return 0, false
+// exifInstant parses the picture's own zone-resolved EXIF capture instant.
+func exifInstant(im Image) (time.Time, bool) {
+	if im.ExifCapture == "" {
+		return time.Time{}, false
 	}
-	type member struct {
-		hash    phash.Hash
-		instant int64
-		ok      bool
+	return parseCapture(im.ExifCapture, im.ExifOffset)
+}
+
+// hasEXIFInstant reports whether the picture carries a parsable EXIF
+// capture time.
+func hasEXIFInstant(im Image) bool {
+	_, ok := exifInstant(im)
+	return ok
+}
+
+// birthTimeDoubt reports the data quality conflict of a group whose file
+// creation times disagree with the EXIF capture times: the single parsable
+// EXIF picture created more than captureTolerance seconds before its own
+// capture time, or a member without any parsable EXIF capture time whose
+// file predates the group's earliest EXIF capture time.
+func birthTimeDoubt(imgs []Image) string {
+	var instants []int64
+	for _, im := range imgs {
+		if t, ok := exifInstant(im); ok {
+			instants = append(instants, t.Unix())
+		}
 	}
-	members := make([]member, len(imgs))
+	if len(instants) == 0 {
+		return ""
+	}
+	if len(instants) == 1 {
+		for _, im := range imgs {
+			if t, ok := exifInstant(im); ok && im.CreatedAt < t.Unix()-captureTolerance {
+				return "file creation time precedes its own EXIF capture time by more than 5 seconds"
+			}
+		}
+	}
+	earliest := slices.Min(instants)
+	for _, im := range imgs {
+		if _, ok := exifInstant(im); !ok && im.CreatedAt+captureTolerance < earliest {
+			return "a member without EXIF capture time predates the group's earliest EXIF capture time"
+		}
+	}
+	return ""
+}
+
+// gpsMedoid returns the index of the group's kept GPS position: the
+// medoid of the members that carry one (members without a position
+// inherit it). The reason is non-empty when some position lies farther
+// than gpsTolerance from the medoid; the medoid index is returned either
+// way as the plan's best effort. g is -1 when no member has a position.
+func gpsMedoid(imgs []Image) (int, string) {
+	gps := make([]int, 0, len(imgs))
 	for i, im := range imgs {
-		if im.Phash == "" {
-			continue
-		}
-		h, err := phash.HashFromHex(im.Phash)
-		if err != nil {
-			continue
-		}
-		members[i] = member{hash: h, instant: captureInstant(im), ok: true}
-	}
-	for i := range members {
-		if !members[i].ok {
-			continue
-		}
-		for j := i + 1; j < len(members); j++ {
-			if !members[j].ok || members[j].instant != members[i].instant {
-				continue
-			}
-			// Exact phash match (d == 0) is a normal re-encode / duplicate:
-			// bestPixels picks the winner. The rule is for suspiciously
-			// similar-but-not-identical frames that share a capture instant.
-			if d := members[i].hash.Hamming(members[j].hash); d > 0 && d <= limit {
-				return d, true
-			}
+		if im.HasGPS {
+			gps = append(gps, i)
 		}
 	}
-	return 0, false
+	if len(gps) == 0 {
+		return -1, ""
+	}
+	best, bestSum := gps[0], 0.0
+	for a := range gps {
+		sum := 0.0
+		for b := range gps {
+			sum += gpsDistance(imgs[gps[a]], imgs[gps[b]])
+		}
+		if a == 0 || sum < bestSum {
+			best, bestSum = gps[a], sum
+		}
+	}
+	for _, b := range gps {
+		if !gpsClose(imgs[best], imgs[b]) {
+			return best, "EXIF GPS positions differ"
+		}
+	}
+	return best, ""
 }
 
-// bestPixels picks the file with the most pixels, breaking ties on file
-// size, then input order.
+// gpsDistance is a plain squared coordinate distance; at these tiny
+// tolerances the projection distortion does not matter.
+func gpsDistance(a, b Image) float64 {
+	dLat, dLon := a.GPSLat-b.GPSLat, a.GPSLon-b.GPSLon
+	return dLat*dLat + dLon*dLon
+}
+
+func gpsClose(a, b Image) bool {
+	return math.Abs(a.GPSLat-b.GPSLat) < gpsTolerance && math.Abs(a.GPSLon-b.GPSLon) < gpsTolerance
+}
+
+// bestPixels picks the file that provides the pixels: an HEIC original
+// beats every other format, then the most pixels, then the larger file;
+// ties keep input order.
 func bestPixels(imgs []Image) Image {
 	best := 0
 	for i := 1; i < len(imgs); i++ {
 		a, b := imgs[best], imgs[i]
-		ca, cb := int64(a.Width)*int64(a.Height), int64(b.Width)*int64(b.Height)
-		if cb > ca || (cb == ca && b.Size > a.Size) {
+		ha, hb := a.Kind == "heic", b.Kind == "heic"
+		pa, pb := int64(a.Width)*int64(a.Height), int64(b.Width)*int64(b.Height)
+		switch {
+		case ha != hb:
+			if hb {
+				best = i
+			}
+		case pa != pb:
+			if pb > pa {
+				best = i
+			}
+		case b.Size > a.Size:
 			best = i
 		}
 	}
@@ -518,54 +508,8 @@ func containsID(imgs []Image, id string) bool {
 	return false
 }
 
-func gpsAgree(a, b Image) bool {
-	if a.HasGPS != b.HasGPS {
-		return false
-	}
-	if !a.HasGPS {
-		return true
-	}
-	return math.Abs(a.GPSLat-b.GPSLat) < gpsTolerance && math.Abs(a.GPSLon-b.GPSLon) < gpsTolerance
-}
-
 // parseCapture turns an EXIF wall clock (YYYY:MM:DD HH:MM:SS) plus its
-// normalized offset into a UTC instant. An empty offset is treated as UTC
-// (callers compare offsets for agreement separately).
-// groupZone returns the single timezone offset recorded by the group's EXIF
-// members ("" when none is), with ok false when members record distinct
-// known offsets.
-func groupZone(imgs []Image) (string, bool) {
-	zone := ""
-	for _, im := range imgs {
-		if im.ExifCapture == "" || im.ExifOffset == "" {
-			continue
-		}
-		if zone == "" {
-			zone = im.ExifOffset
-		} else if im.ExifOffset != zone {
-			return "", false
-		}
-	}
-	return zone, true
-}
-
-// inheritZone returns the images with the EXIF members' unknown timezone
-// offsets filled with zone, copying the slice only when it changes.
-func inheritZone(imgs []Image, zone string) []Image {
-	if !slices.ContainsFunc(imgs, func(im Image) bool {
-		return im.ExifCapture != "" && im.ExifOffset == ""
-	}) {
-		return imgs
-	}
-	out := slices.Clone(imgs)
-	for i := range out {
-		if out[i].ExifCapture != "" && out[i].ExifOffset == "" {
-			out[i].ExifOffset = zone
-		}
-	}
-	return out
-}
-
+// normalized offset into a UTC instant. An empty offset is treated as UTC.
 func parseCapture(wall, offset string) (time.Time, bool) {
 	t, err := time.Parse("2006:01:02 15:04:05", strings.TrimSpace(wall))
 	if err != nil {

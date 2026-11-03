@@ -18,9 +18,9 @@ go build -o plr .
 
 ```text
 plr scan  --dir PHOTO [--dir MORE] [--force] [--db plr.db]
-plr group [--max-hamming 12] [--db plr.db]
-plr plan  [--conflict-hamming 2] [--ai] [--db plr.db]
-plr apply --target RESULT [--dry-run] [--no-exif] [--move] [--force-conflicts] [--db plr.db]
+plr group [--max-hamming-chunking 12] [--db plr.db]
+plr plan  [--ai] [--db plr.db]
+plr apply --target RESULT [--dry-run] [--no-exif] [--move] [--db plr.db]
 
 # one-shot (scan → group → plan → apply/amalgamate)
 plr build --dir PHOTO --target RESULT

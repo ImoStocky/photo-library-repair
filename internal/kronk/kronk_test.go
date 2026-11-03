@@ -12,7 +12,7 @@ func testConflict() group.Conflict {
 	a := group.Image{ID: "a", Name: "IMG_0001.jpg", Kind: "jpeg", Width: 320, Height: 240, Size: 100,
 		ExifCapture: "2024:05:01 12:30:00", ExifOffset: "+02:00", HasGPS: true, GPSLat: 52.52, GPSLon: 13.40, CreatedAt: 1}
 	b := group.Image{ID: "b", Name: "IMG_0001 (1).jpg", Kind: "jpeg", Width: 320, Height: 240, Size: 80,
-		ExifCapture: "2024:05:01 12:31:00", ExifOffset: "+02:00", CreatedAt: 2}
+		ExifCapture: "2024:05:01 12:31:00", ExifOffset: "+02:00", HasGPS: true, GPSLat: 48.85, GPSLon: 2.35, CreatedAt: 2}
 	return group.Conflict{Reason: "EXIF GPS positions differ", Images: []group.Image{a, b}}
 }
 

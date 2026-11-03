@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"photo-library-repair/internal/apply"
 	"photo-library-repair/internal/exif"
@@ -26,13 +27,9 @@ import (
 )
 
 // maxHamming is the grouping radius the checks use. It is wider than the CLI
-// default (12) so quality re-encodings of the same picture always chain,
-// which is what the checks want to exercise.
+// default so quality re-encodings of the same picture always chain, which is
+// what the checks want to exercise.
 const maxHamming = 16
-
-// conflictHamming is the near-identical conflict limit the checks use; it
-// matches the CLI default for --conflict-hamming.
-const conflictHamming = 2
 
 // Check is the outcome of one built-in check.
 type Check struct {
@@ -121,6 +118,7 @@ func (e *env) groupPlan() (plans []store.Group, members map[int64][]string, err 
 			CreatedAt:   im.CreatedAt,
 			ExifCapture: im.ExifCapture,
 			ExifOffset:  im.ExifOffset,
+			ExifCamera:  im.ExifCamera,
 			Width:       im.Width,
 			Height:      im.Height,
 			Size:        im.Size,
@@ -147,7 +145,7 @@ func (e *env) groupPlan() (plans []store.Group, members map[int64][]string, err 
 				planMembers = append(planMembers, im)
 			}
 		}
-		p := group.ResolveGroup(planMembers, nil, conflictHamming, group.DefaultMaxDisagreement)
+		p := group.ResolveGroup(planMembers, nil)
 		g := store.Group{
 			ID:              id,
 			Status:          p.Status,
@@ -188,6 +186,8 @@ func planFor(plans []store.Group, members map[int64][]string, name string) (stor
 // unrelated pictures never chain.
 func exifJPEG(seed, quality int, capture, offset string, gps bool) []byte {
 	ex := testimg.EXIF{
+		Make:               "Canon",
+		Model:              "Canon EOS",
 		DateTimeOriginal:   capture,
 		OffsetTimeOriginal: offset,
 		GPS:                gps,
@@ -197,6 +197,18 @@ func exifJPEG(seed, quality int, capture, offset string, gps bool) []byte {
 
 func plainJPEG(seed, quality int) []byte {
 	return testimg.JPEG(testimg.Textured(400, 300, seed), quality)
+}
+
+// gpsShiftJPEG is exifJPEG with its GPS position moved one arcsecond off
+// the fixed coordinate, far enough to disagree with the group's medoid.
+func gpsShiftJPEG(seed, quality int, capture, offset string) []byte {
+	ex := testimg.EXIF{
+		DateTimeOriginal:   capture,
+		OffsetTimeOriginal: offset,
+		GPS:                true,
+		GPSShift:           true,
+	}
+	return testimg.MakeEXIFJPEG(testimg.Textured(400, 300, seed), quality, ex)
 }
 
 // inverted returns a JPEG of the negative of the picture in data.
@@ -364,12 +376,13 @@ func checkCaptureRules() Check {
 	return Check{Name: name, OK: true}
 }
 
-// checkConflicts verifies that disagreements the automatic rules cannot
-// settle (differing timezone offsets, one member with GPS and one without)
-// are surfaced as conflicts with a reason, while exact duplicates with the
-// same capture time resolve normally (bestPixels picks the winner).
+// checkConflicts verifies that the remaining data-quality conflicts (GPS
+// positions beyond tolerance, a lone undecodable picture without EXIF) are
+// surfaced with a reason, while capture-time disagreements no longer conflict
+// (identity is a grouping concern, not a planning one) and exact duplicates
+// with the same capture time resolve normally (bestPixels picks the winner).
 func checkConflicts() Check {
-	const name = "plan: flags offset and GPS conflicts; exact duplicates resolve"
+	const name = "plan: flags GPS and undecodable conflicts; capture-time disagreement resolves"
 	e, err := newEnv()
 	if err != nil {
 		return Check{Name: name, Detail: err.Error()}
@@ -377,12 +390,13 @@ func checkConflicts() Check {
 	defer e.close()
 
 	files := map[string][]byte{
-		"IMG_C1.jpg": exifJPEG(4, 95, "2024:05:01 12:30:00", "+02:00", false),
-		"IMG_C2.jpg": exifJPEG(4, 90, "2024:05:01 12:30:00", "+05:00", false),
-		"IMG_D1.jpg": exifJPEG(5, 95, "2024:05:01 12:30:00", "+02:00", true),
-		"IMG_D2.jpg": exifJPEG(5, 90, "2024:05:01 12:30:00", "+02:00", false),
-		"IMG_E1.jpg": exifJPEG(6, 95, "2024:05:01 12:30:00", "+02:00", true),
-		"IMG_E2.jpg": exifJPEG(6, 95, "2024:05:01 12:30:00", "+02:00", true), // byte-identical, same capture
+		"IMG_C1.jpg":  exifJPEG(4, 95, "2024:05:01 12:30:00", "+02:00", false),
+		"IMG_C2.jpg":  exifJPEG(4, 90, "2024:05:01 12:30:00", "+05:00", false), // three hours apart: resolves, no conflict
+		"IMG_D1.jpg":  exifJPEG(5, 95, "2024:05:01 12:30:00", "+02:00", true),
+		"IMG_D2.jpg":  gpsShiftJPEG(5, 90, "2024:05:01 12:30:00", "+02:00"), // GPS beyond tolerance
+		"IMG_E1.jpg":  exifJPEG(6, 95, "2024:05:01 12:30:00", "+02:00", true),
+		"IMG_E2.jpg":  exifJPEG(6, 95, "2024:05:01 12:30:00", "+02:00", true), // byte-identical, same capture
+		"orphan.webp": testimg.WebpHeader(),                                   // no decoder, no EXIF
 	}
 	for rel, data := range files {
 		if err := e.write(rel, data); err != nil {
@@ -396,33 +410,41 @@ func checkConflicts() Check {
 	if err != nil {
 		return Check{Name: name, Detail: fmt.Sprintf("group/plan: %v", err)}
 	}
-	if len(plans) != 3 {
-		return Check{Name: name, Detail: fmt.Sprintf("%d groups (want 3)", len(plans))}
+	if len(plans) != 4 {
+		return Check{Name: name, Detail: fmt.Sprintf("%d groups (want 4)", len(plans))}
 	}
 
-	offPlan, ok := planFor(plans, members, "IMG_C1.jpg") // offset group
-	if !ok || offPlan.Status != group.StatusConflict {
-		return Check{Name: name, Detail: fmt.Sprintf("offset group: status %q reason %q (want conflict)", offPlan.Status, offPlan.Reason)}
-	}
-	if offPlan.Reason == "" {
-		return Check{Name: name, Detail: "offset conflict has no reason"}
+	capPlan, ok := planFor(plans, members, "IMG_C1.jpg") // capture-time disagreement
+	if !ok || capPlan.Status != group.StatusResolved {
+		return Check{Name: name, Detail: fmt.Sprintf("capture-disagreement group: status %q reason %q (want resolved)", capPlan.Status, capPlan.Reason)}
 	}
 	gpsPlan, ok := planFor(plans, members, "IMG_D1.jpg")
 	if !ok || gpsPlan.Status != group.StatusConflict {
 		return Check{Name: name, Detail: fmt.Sprintf("GPS group: status %q reason %q (want conflict)", gpsPlan.Status, gpsPlan.Reason)}
 	}
+	if !strings.Contains(gpsPlan.Reason, "GPS") {
+		return Check{Name: name, Detail: fmt.Sprintf("GPS conflict reason %q (want a GPS complaint)", gpsPlan.Reason)}
+	}
 	dupPlan, ok := planFor(plans, members, "IMG_E1.jpg")
 	if !ok || dupPlan.Status != group.StatusResolved {
 		return Check{Name: name, Detail: fmt.Sprintf("exact-duplicate group: status %q reason %q (want resolved)", dupPlan.Status, dupPlan.Reason)}
+	}
+	orphanPlan, ok := planFor(plans, members, "orphan.webp")
+	if !ok || orphanPlan.Status != group.StatusConflict {
+		return Check{Name: name, Detail: fmt.Sprintf("undecodable group: status %q reason %q (want conflict)", orphanPlan.Status, orphanPlan.Reason)}
+	}
+	if !strings.Contains(orphanPlan.Reason, "decoded") {
+		return Check{Name: name, Detail: fmt.Sprintf("undecodable conflict reason %q (want an undecodable complaint)", orphanPlan.Reason)}
 	}
 	return Check{Name: name, OK: true}
 }
 
 // checkApply verifies that the write-out phase copies the chosen pixels with
-// merged EXIF, leaves conflict groups alone, honors --dry-run, applies
-// conflicts when forced, and renames stored names that already exist.
+// merged EXIF, materializes conflict groups as plain copies with their
+// reason in the ledger, honors --dry-run, and renames stored names that
+// already exist.
 func checkApply() Check {
-	const name = "apply: writes merged EXIF + report.json, skips conflicts, honors dry-run, moves sources, renames collisions, re-applies untouched"
+	const name = "apply: writes merged EXIF + report.json, copies conflicts plainly, honors dry-run, moves sources, renames collisions, re-applies untouched"
 	e, err := newEnv()
 	if err != nil {
 		return Check{Name: name, Detail: err.Error()}
@@ -432,8 +454,8 @@ func checkApply() Check {
 	files := map[string][]byte{
 		"IMG_A1.jpg": exifJPEG(4, 95, "2024:05:01 12:30:00", "+02:00", true),
 		"IMG_A2.jpg": exifJPEG(4, 90, "2024:05:01 12:30:05", "+02:00", true),
-		"IMG_B1.jpg": exifJPEG(5, 95, "2024:05:01 12:30:00", "+02:00", false),
-		"IMG_B2.jpg": exifJPEG(5, 90, "2024:05:01 12:30:00", "+05:00", false),
+		"IMG_B1.jpg": exifJPEG(5, 95, "2024:05:01 12:30:00", "+02:00", true),
+		"IMG_B2.jpg": gpsShiftJPEG(5, 90, "2024:05:01 12:30:00", "+02:00"), // GPS conflict group
 	}
 	for rel, data := range files {
 		if err := e.write(rel, data); err != nil {
@@ -451,6 +473,10 @@ func checkApply() Check {
 	if !ok || resolved.Status != group.StatusResolved {
 		return Check{Name: name, Detail: fmt.Sprintf("setup: resolved group missing (status %q)", resolved.Status)}
 	}
+	conflict, ok := planFor(plans, members, "IMG_B1.jpg")
+	if !ok || conflict.Status != group.StatusConflict {
+		return Check{Name: name, Detail: fmt.Sprintf("setup: conflict group missing (status %q reason %q)", conflict.Status, conflict.Reason)}
+	}
 
 	target, err := os.MkdirTemp("", "plr-selftest-target-")
 	if err != nil {
@@ -465,8 +491,8 @@ func checkApply() Check {
 	if len(rep.Errors) != 0 {
 		return Check{Name: name, Detail: fmt.Sprintf("apply errors: %v", rep.Errors)}
 	}
-	if rep.Copied != 1 || rep.Skipped != 1 {
-		return Check{Name: name, Detail: fmt.Sprintf("copied=%d skipped=%d (want 1/1)", rep.Copied, rep.Skipped)}
+	if rep.Copied != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("copied=%d (want 2)", rep.Copied)}
 	}
 	out := filepath.Join(target, resolved.StoredName)
 	facts, err := meta.FromJPEG(mustRead(out))
@@ -478,6 +504,23 @@ func checkApply() Check {
 			facts.Capture, facts.Offset, facts.HasGPS)}
 	}
 
+	// The conflict group materialized as a plain copy: byte-identical to
+	// one of its members, with the reason recorded in the ledger.
+	outConflict := filepath.Join(target, conflict.StoredName)
+	if data := mustRead(outConflict); !bytes.Equal(data, files["IMG_B1.jpg"]) && !bytes.Equal(data, files["IMG_B2.jpg"]) {
+		return Check{Name: name, Detail: "conflict output is not a plain copy of one of its members"}
+	}
+	outputs, err := e.s.GroupOutputs(target)
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("ledger: %v", err)}
+	}
+	if outputs[conflict.ID].Conflict == "" {
+		return Check{Name: name, Detail: "ledger kept no conflict reason for the conflict group"}
+	}
+	if outputs[resolved.ID].Conflict != "" {
+		return Check{Name: name, Detail: "ledger marked the resolved group as a conflict"}
+	}
+
 	data, err := os.ReadFile(filepath.Join(target, "report.json"))
 	if err != nil {
 		return Check{Name: name, Detail: fmt.Sprintf("report.json missing: %v", err)}
@@ -485,7 +528,6 @@ func checkApply() Check {
 	var rj struct {
 		Generated string `json:"generated"`
 		Copied    int    `json:"copied"`
-		Skipped   int    `json:"skipped"`
 		Files     []struct {
 			Source string `json:"source"`
 			Dest   string `json:"dest"`
@@ -498,12 +540,19 @@ func checkApply() Check {
 	if err := json.Unmarshal(data, &rj); err != nil {
 		return Check{Name: name, Detail: fmt.Sprintf("parse report.json: %v", err)}
 	}
-	if rj.Copied != 1 || rj.Skipped != 1 || len(rj.Groups) != 2 {
-		return Check{Name: name, Detail: fmt.Sprintf("report.json copied=%d skipped=%d groups=%d (want 1/1/2)",
-			rj.Copied, rj.Skipped, len(rj.Groups))}
+	if rj.Copied != 2 || len(rj.Groups) != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("report.json copied=%d groups=%d (want 2/2)",
+			rj.Copied, len(rj.Groups))}
 	}
-	if len(rj.Files) != 1 || !rj.Files[0].EXIF || rj.Files[0].Dest != out {
-		return Check{Name: name, Detail: fmt.Sprintf("report.json files = %+v", rj.Files)}
+	exifByDest := make(map[string]bool, len(rj.Files))
+	for _, f := range rj.Files {
+		exifByDest[f.Dest] = f.EXIF
+	}
+	if len(exifByDest) != 2 || !exifByDest[out] {
+		return Check{Name: name, Detail: fmt.Sprintf("report.json files = %+v (want merged EXIF on %s)", rj.Files, out)}
+	}
+	if _, ok := exifByDest[outConflict]; !ok || exifByDest[outConflict] {
+		return Check{Name: name, Detail: fmt.Sprintf("report.json files = %+v (want plain copy of %s)", rj.Files, outConflict)}
 	}
 
 	// Re-applying the same plan must leave the target untouched.
@@ -511,12 +560,12 @@ func checkApply() Check {
 	if err != nil {
 		return Check{Name: name, Detail: fmt.Sprintf("re-apply: %v", err)}
 	}
-	if rep.Copied != 0 || rep.Renamed != 0 || rep.Untouched != 1 {
-		return Check{Name: name, Detail: fmt.Sprintf("re-apply copied=%d renamed=%d untouched=%d (want 0/0/1)",
+	if rep.Copied != 0 || rep.Renamed != 0 || rep.Untouched != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("re-apply copied=%d renamed=%d untouched=%d (want 0/0/2)",
 			rep.Copied, rep.Renamed, rep.Untouched)}
 	}
-	if entries, err := os.ReadDir(target); err != nil || len(entries) != 2 {
-		return Check{Name: name, Detail: fmt.Sprintf("target entries after re-apply = %v (err %v), want 2", dirNames(entries), err)}
+	if entries, err := os.ReadDir(target); err != nil || len(entries) != 3 {
+		return Check{Name: name, Detail: fmt.Sprintf("target entries after re-apply = %v (err %v), want 3", dirNames(entries), err)}
 	}
 
 	dryTarget := filepath.Join(target, "dry") // must not be created
@@ -527,20 +576,8 @@ func checkApply() Check {
 	if _, err := os.Stat(dryTarget); !os.IsNotExist(err) {
 		return Check{Name: name, Detail: fmt.Sprintf("dry-run created target directory %s", dryTarget)}
 	}
-	if rep.Copied != 1 || rep.Skipped != 1 {
-		return Check{Name: name, Detail: fmt.Sprintf("dry-run copied=%d skipped=%d (want 1/1)", rep.Copied, rep.Skipped)}
-	}
-
-	forceTarget := filepath.Join(target, "forced")
-	rep, err = apply.Apply(e.s, apply.Options{Target: forceTarget, ForceConflicts: true})
-	if err != nil {
-		return Check{Name: name, Detail: fmt.Sprintf("force: %v", err)}
-	}
-	if len(rep.Errors) != 0 {
-		return Check{Name: name, Detail: fmt.Sprintf("force errors: %v", rep.Errors)}
-	}
-	if rep.Copied != 2 || rep.Skipped != 0 {
-		return Check{Name: name, Detail: fmt.Sprintf("force copied=%d skipped=%d (want 2/0)", rep.Copied, rep.Skipped)}
+	if rep.Copied != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("dry-run copied=%d (want 2)", rep.Copied)}
 	}
 
 	collideTarget := filepath.Join(target, "collide")
@@ -555,8 +592,8 @@ func checkApply() Check {
 		return Check{Name: name, Detail: fmt.Sprintf("collision: %v", err)}
 	}
 	want := fmt.Sprintf("%06d_%s", resolved.ID, resolved.StoredName)
-	if rep.Renamed != 1 {
-		return Check{Name: name, Detail: fmt.Sprintf("renamed=%d (want 1)", rep.Renamed)}
+	if rep.Renamed != 1 || rep.Copied != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("collision renamed=%d copied=%d (want 1/2)", rep.Renamed, rep.Copied)}
 	}
 	if _, err := os.Stat(filepath.Join(collideTarget, want)); err != nil {
 		return Check{Name: name, Detail: fmt.Sprintf("renamed output missing: %v", err)}
@@ -567,14 +604,14 @@ func checkApply() Check {
 	if err != nil {
 		return Check{Name: name, Detail: fmt.Sprintf("collide re-apply: %v", err)}
 	}
-	if rep.Copied != 0 || rep.Renamed != 0 || rep.Untouched != 1 {
-		return Check{Name: name, Detail: fmt.Sprintf("collide re-apply copied=%d renamed=%d untouched=%d (want 0/0/1)",
+	if rep.Copied != 0 || rep.Renamed != 0 || rep.Untouched != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("collide re-apply copied=%d renamed=%d untouched=%d (want 0/0/2)",
 			rep.Copied, rep.Renamed, rep.Untouched)}
 	}
 	if entries, err := os.ReadDir(collideTarget); err != nil {
 		return Check{Name: name, Detail: fmt.Sprintf("read collide target: %v", err)}
-	} else if len(entries) != 3 { // occupied name, prefixed output, report.json
-		return Check{Name: name, Detail: fmt.Sprintf("collide target entries = %v, want 3", dirNames(entries))}
+	} else if len(entries) != 4 { // occupied name, prefixed output, conflict copy, report.json
+		return Check{Name: name, Detail: fmt.Sprintf("collide target entries = %v, want 4", dirNames(entries))}
 	}
 
 	moveTarget := filepath.Join(target, "moved")
@@ -585,8 +622,8 @@ func checkApply() Check {
 	if len(rep.Errors) != 0 {
 		return Check{Name: name, Detail: fmt.Sprintf("move errors: %v", rep.Errors)}
 	}
-	if rep.Copied != 1 || rep.Moved != 1 {
-		return Check{Name: name, Detail: fmt.Sprintf("move copied=%d moved=%d (want 1/1)", rep.Copied, rep.Moved)}
+	if rep.Copied != 2 || rep.Moved != 2 {
+		return Check{Name: name, Detail: fmt.Sprintf("move copied=%d moved=%d (want 2/2)", rep.Copied, rep.Moved)}
 	}
 	if _, err := os.Stat(filepath.Join(moveTarget, resolved.StoredName)); err != nil {
 		return Check{Name: name, Detail: fmt.Sprintf("moved output missing: %v", err)}
@@ -594,8 +631,12 @@ func checkApply() Check {
 	if _, err := os.Stat(filepath.Join(e.dir, "IMG_A1.jpg")); !os.IsNotExist(err) {
 		return Check{Name: name, Detail: "move mode kept the source file"}
 	}
-	if _, err := os.Stat(filepath.Join(e.dir, "IMG_B1.jpg")); err != nil {
-		return Check{Name: name, Detail: "move mode touched a skipped conflict group"}
+	// The conflict group moves its best-effort pixel source; the other
+	// member stays untouched.
+	_, b1Err := os.Stat(filepath.Join(e.dir, "IMG_B1.jpg"))
+	_, b2Err := os.Stat(filepath.Join(e.dir, "IMG_B2.jpg"))
+	if os.IsNotExist(b1Err) == os.IsNotExist(b2Err) {
+		return Check{Name: name, Detail: "move mode should move exactly one source of the conflict group"}
 	}
 
 	moveDryTarget := filepath.Join(target, "moved-dry")
@@ -603,8 +644,8 @@ func checkApply() Check {
 	if err != nil {
 		return Check{Name: name, Detail: fmt.Sprintf("dry-run move: %v", err)}
 	}
-	if rep.Copied != 1 || rep.Moved != 0 {
-		return Check{Name: name, Detail: fmt.Sprintf("dry-run move copied=%d moved=%d (want 1/0)", rep.Copied, rep.Moved)}
+	if rep.Copied != 2 || rep.Moved != 0 {
+		return Check{Name: name, Detail: fmt.Sprintf("dry-run move copied=%d moved=%d (want 2/0)", rep.Copied, rep.Moved)}
 	}
 	if _, err := os.Stat(moveDryTarget); !os.IsNotExist(err) {
 		return Check{Name: name, Detail: "dry-run move created the target directory"}
@@ -687,8 +728,8 @@ func checkCommitRollback() Check {
 	files := map[string][]byte{
 		"IMG_A1.jpg": exifJPEG(4, 95, "2024:05:01 12:30:00", "+02:00", true),
 		"IMG_A2.jpg": exifJPEG(4, 90, "2024:05:01 12:30:05", "+02:00", true),
-		"IMG_B1.jpg": exifJPEG(5, 95, "2024:05:01 12:30:00", "+02:00", false),
-		"IMG_B2.jpg": exifJPEG(5, 90, "2024:05:01 12:30:00", "+05:00", false),
+		"IMG_B1.jpg": exifJPEG(5, 95, "2024:05:01 12:30:00", "+02:00", true),
+		"IMG_B2.jpg": gpsShiftJPEG(5, 90, "2024:05:01 12:30:00", "+02:00"), // GPS conflict group
 	}
 	for rel, data := range files {
 		if err := e.write(rel, data); err != nil {
@@ -835,6 +876,9 @@ func checkEXIFEngine() Check {
 	}
 	if f.Capture != "2024:05:01 12:30:00" || f.Offset != "+02:00" {
 		return Check{Name: name, Detail: fmt.Sprintf("facts %q %q (want 2024:05:01 12:30:00 +02:00)", f.Capture, f.Offset)}
+	}
+	if f.Camera != "Canon Canon EOS" {
+		return Check{Name: name, Detail: fmt.Sprintf("camera = %q (want %q)", f.Camera, "Canon Canon EOS")}
 	}
 	if !f.HasGPS || math.Abs(f.GPSLat-52.5204) > 1e-3 || math.Abs(f.GPSLon-13.4055) > 1e-3 {
 		return Check{Name: name, Detail: fmt.Sprintf("gps %v %v,%v (want 52.5204, 13.4055)", f.HasGPS, f.GPSLat, f.GPSLon)}

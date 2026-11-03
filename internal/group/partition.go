@@ -23,6 +23,10 @@ type Match struct {
 	Ambiguous bool
 }
 
+// SameFunc reports whether two pictures are the same image under an
+// identity strategy (see ExifFirst.SameFunc).
+type SameFunc func(a, b Image) bool
+
 // Partition classifies incoming connected components (already grouped
 // among themselves, e.g. by Aggregate) against the library, per the merge
 // spec (chapter 16):
@@ -36,7 +40,12 @@ type Match struct {
 // Ties across library groups resolve to the smallest distance; equal
 // distances pick the lowest group id and flag the match ambiguous. Library
 // groups never merge through an incoming member.
-func Partition(components [][]Image, lib []LibMember, maxHamming int) (present, matched []Match, unmatched [][]Image) {
+//
+// same is an optional identity gate: a library member only takes part in
+// the classification when the pair passes the identity rule (a close hash
+// alone is not identity, see docs/identity-decision-graph.md). A nil same
+// keeps the pure hash classification.
+func Partition(components [][]Image, lib []LibMember, maxHamming int, same SameFunc) (present, matched []Match, unmatched [][]Image) {
 	libHashes := make([]phash.Hash, len(lib))
 	for i := range lib {
 		if lib[i].Phash == "" {
@@ -48,7 +57,7 @@ func Partition(components [][]Image, lib []LibMember, maxHamming int) (present, 
 		var rest []Image
 		for _, im := range comp {
 			h := parsePhash(im.Phash)
-			m, kind := classify(im, h, lib, libHashes, maxHamming)
+			m, kind := classify(im, h, lib, libHashes, maxHamming, same)
 			switch kind {
 			case classPresent:
 				present = append(present, m)
@@ -73,11 +82,14 @@ const (
 
 // classify sorts one member into present / matched / unmatched. Library
 // members are walked in order so ties keep the lowest group id.
-func classify(im Image, h phash.Hash, lib []LibMember, libHashes []phash.Hash, maxHamming int) (Match, int) {
+func classify(im Image, h phash.Hash, lib []LibMember, libHashes []phash.Hash, maxHamming int, same SameFunc) (Match, int) {
 	best := Match{Image: im}
 	seen := false
 	exact := false // best distance is an exact (present) hit
 	for i := range lib {
+		if same != nil && !same(im, lib[i].Image) {
+			continue // hash-proximate but not the same image under the identity rule
+		}
 		exactHit := im.SHA256 != "" && im.SHA256 == lib[i].SHA256
 		if !exactHit && h != nil && libHashes[i] != nil {
 			exactHit = h.Hamming(libHashes[i]) == 0 && sameSize(im, lib[i].Image)
