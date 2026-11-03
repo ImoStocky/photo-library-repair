@@ -220,8 +220,10 @@ func TestKind(t *testing.T) {
 }
 
 func heicBytes(brand string) []byte {
-	b := make([]byte, 16)
-	b[0], b[1], b[2], b[3] = 0, 0, 0, 32
+	// ftyp box size varies with the compatible-brands list (the corpus
+	// files carry 0x34); sniffing must depend on the brand, not the size.
+	b := make([]byte, 20)
+	b[0], b[1], b[2], b[3] = 0, 0, 0, 0x34
 	copy(b[4:8], "ftyp")
 	copy(b[8:12], brand)
 	return b

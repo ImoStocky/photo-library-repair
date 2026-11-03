@@ -14,7 +14,6 @@ package ingest
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -387,8 +386,7 @@ func Kind(header []byte) string {
 		return "webp"
 	case len(header) >= 4 && (bytes.Equal(header[:4], []byte{0x49, 0x49, 0x2A, 0x00}) || bytes.Equal(header[:4], []byte{0x4D, 0x4D, 0x00, 0x2A})):
 		return "tiff"
-	case len(header) >= 12 && binary.BigEndian.Uint32(header[0:4]) == 0x00000020 &&
-		bytes.Equal(header[4:8], []byte("ftyp")):
+	case len(header) >= 12 && bytes.Equal(header[4:8], []byte("ftyp")):
 		switch string(header[8:12]) {
 		case "heic", "heif", "heim", "heis", "hevc", "hevx", "mif1":
 			return "heic"
