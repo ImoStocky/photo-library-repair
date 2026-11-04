@@ -33,6 +33,9 @@ Owner: [chapter 12 — Hash](chapter-12-hash.md).
   suffix.
 - `--min-size` (KB); default 0.
 - Resolved path once; **hard link** same inode decoded once, still listed.
+- sha256 already in the library (and no row for this path) → **already
+  processed**: not recorded, never re-hashed (`plr scan` counts it as
+  `already-known`).
 - De-dup key: **same phash AND same file size** → keep **earliest**
   `(mtime, path)`; later copies **dropped** (on disk, recorded, not clustered).
 - Same phash, **different size** → keep (aggregation may prefer larger pixels).

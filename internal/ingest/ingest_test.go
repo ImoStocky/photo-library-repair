@@ -73,6 +73,45 @@ func TestScanBirthGuessIsEarliestOfBornAndMod(t *testing.T) {
 	}
 }
 
+// A byte-identical copy arriving at a new path is already-processed
+// content: the scan neither records it nor spends a hash on it.
+func TestScanSkipsKnownContent(t *testing.T) {
+	src := t.TempDir()
+	write(t, filepath.Join(src, "a.jpg"), jpegBytes())
+	inc := t.TempDir()
+	write(t, filepath.Join(inc, "a_copy.jpg"), jpegBytes())
+	write(t, filepath.Join(inc, "b.jpg"), append(jpegBytes(), 0x01))
+
+	hashed := &atomic.Int64{}
+	inner := fakeHasher("jpeg")
+	hash := func(path, kind string) (fingerprint.Info, error) {
+		hashed.Add(1)
+		return inner(path, kind)
+	}
+	s, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := Scan(s, Options{Dirs: []string{src}, Workers: 1}, hash); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := Scan(s, Options{Dirs: []string{inc}, Workers: 1}, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.ImagesSkipped != 1 || rep.ImagesAdded != 1 {
+		t.Fatalf("incoming scan: skipped=%d added=%d, want 1/1", rep.ImagesSkipped, rep.ImagesAdded)
+	}
+	if got := hashed.Load(); got != 2 { // a.jpg, b.jpg; never a_copy.jpg
+		t.Fatalf("hasher calls = %d, want 2 (skipped files must not hash)", got)
+	}
+	images, _ := s.AllImages()
+	if len(images) != 2 {
+		t.Fatalf("images = %d, want 2 (copy must not be recorded)", len(images))
+	}
+}
+
 func TestScanAndSkipAndForce(t *testing.T) {
 	root := t.TempDir()
 	write(t, filepath.Join(root, "a.jpg"), jpegBytes())

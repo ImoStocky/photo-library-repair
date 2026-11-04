@@ -245,7 +245,7 @@ func inverted(data []byte) []byte {
 // unrelated picture stays apart, and that a forced re-scan of unchanged
 // files reuses the stored fingerprints.
 func checkScanAndGroup() Check {
-	const name = "scan: records images, counts fakes, groups exact and near copies, caches unchanged re-scans"
+	const name = "scan: records images, counts fakes, groups exact and near copies, caches unchanged re-scans, skips known content"
 	e, err := newEnv()
 	if err != nil {
 		return Check{Name: name, Detail: err.Error()}
@@ -286,6 +286,21 @@ func checkScanAndGroup() Check {
 		return Check{Name: name, Detail: fmt.Sprintf(
 			"rescan report: seen=%d cached=%d added=%d (want 4/4/0)",
 			rep2.FilesSeen, rep2.ImagesCached, rep2.ImagesAdded)}
+	}
+
+	// A new path holding already-known content is processed: the scan
+	// neither records it nor re-hashes it (sha256 identifies content).
+	if err := e.write("copy_again.jpg", base); err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("write copy_again: %v", err)}
+	}
+	rep3, err := e.scanForce()
+	if err != nil {
+		return Check{Name: name, Detail: fmt.Sprintf("rescan known content: %v", err)}
+	}
+	if rep3.ImagesAdded != 0 || rep3.ImagesSkipped != 1 {
+		return Check{Name: name, Detail: fmt.Sprintf(
+			"rescan known content: added=%d skipped=%d (want 0/1)",
+			rep3.ImagesAdded, rep3.ImagesSkipped)}
 	}
 
 	plans, members, err := e.groupPlan()

@@ -336,6 +336,26 @@ func (s *Store) UpsertImage(img Image) (id string, created bool, err error) {
 	return img.ID, true, err
 }
 
+// KnownSHA256s returns every content hash recorded so far. Scan uses it to
+// treat a file whose content is already in the library as processed: it is
+// neither recorded nor re-hashed.
+func (s *Store) KnownSHA256s() (map[string]bool, error) {
+	rows, err := s.db.Query(`SELECT DISTINCT sha256 FROM images WHERE sha256 <> ''`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var sha string
+		if err := rows.Scan(&sha); err != nil {
+			return nil, err
+		}
+		out[sha] = true
+	}
+	return out, rows.Err()
+}
+
 // AllImages returns every recorded image.
 func (s *Store) AllImages() ([]Image, error) {
 	rows, err := s.db.Query(`

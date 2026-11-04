@@ -48,6 +48,7 @@ type Report struct {
 	ImagesAdded   int
 	ImagesUpdated int
 	ImagesCached  int // fingerprints reused from the store (size+mtime unchanged)
+	ImagesSkipped int // sha256 already in the library: content already processed
 	NonImage      int
 	Errors        int
 }
@@ -119,6 +120,14 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 		}
 		rep.DirsScanned++
 
+		// Forced re-scan: drop vanished rows before snapshotting content,
+		// so a moved file is not mistaken for an already-known picture.
+		if opts.Force {
+			if err := dropMissing(s, sourceID, seen); err != nil {
+				return rep, fmt.Errorf("scan %q: %w", dir, err)
+			}
+		}
+
 		// Fingerprint cache: stored rows of a known source, so unchanged
 		// files skip the re-hash on a forced re-scan.
 		facts := map[string]store.Image{}
@@ -129,14 +138,15 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 			}
 		}
 
-		if err := hashAll(s, jobs, opts.Workers, hash, runStart, &seq, rep, facts); err != nil {
+		// sha256 identifies processed content: files whose sha256 is in
+		// this snapshot join no new row. The snapshot is per source dir.
+		known, err := s.KnownSHA256s()
+		if err != nil {
 			return rep, fmt.Errorf("scan %q: %w", dir, err)
 		}
 
-		if opts.Force {
-			if err := dropMissing(s, sourceID, seen); err != nil {
-				return rep, fmt.Errorf("scan %q: %w", dir, err)
-			}
+		if err := hashAll(s, jobs, opts.Workers, hash, runStart, &seq, rep, facts, known); err != nil {
+			return rep, fmt.Errorf("scan %q: %w", dir, err)
 		}
 	}
 	return rep, nil
@@ -213,7 +223,7 @@ func collect(root string, minSize int64, seenInodes map[uint64]bool) ([]job, map
 // hashAll runs sha256 + fingerprint over the jobs with a worker pool and
 // upserts the results. Files whose (size, mtime) match the stored facts
 // (the cache, keyed per source) are not re-read or re-hashed.
-func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time.Time, seq *atomic.Int64, rep *Report, facts map[string]store.Image) error {
+func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time.Time, seq *atomic.Int64, rep *Report, facts map[string]store.Image, known map[string]bool) error {
 	jobsCh := make(chan job)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -250,6 +260,17 @@ func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time
 					}
 					mu.Unlock()
 					continue
+				}
+				// Content already in the library: this file counts as
+				// processed and is not recorded. A path that already has
+				// its own row still refreshes normally (changed content).
+				if sum != "" && known[sum] {
+					if _, hadRow := facts[j.relPath]; !hadRow {
+						mu.Lock()
+						rep.ImagesSkipped++
+						mu.Unlock()
+						continue
+					}
 				}
 				info := fingerprint.Info{Kind: j.kind}
 				if info, err = hash(j.fullPath, j.kind); err != nil {
