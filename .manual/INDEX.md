@@ -1,11 +1,12 @@
 # Photo Library Repair — design chapters
 
 **Current heading:** local CLI — ingest metadata, crunch groups, resolve
-collisions, amalgamate on demand, grow the SQLite library incrementally.
+collisions, materialize on demand, grow the SQLite library incrementally.
 Start at [chapter 01](chapter-01-goals-and-status.md).
 
-**apply ≡ amalgamate:** product verb is *amalgamate*; CLI/package stay
-`apply` until an explicit rename. See [chapter 18](chapter-18-apply.md).
+**apply ≡ materialize:** product verb is *materialize*; CLI/package stay
+`apply` (the verb was renamed from *amalgamate* 2026-11-04). See
+[chapter 18](chapter-18-apply.md).
 
 Older client/server draft split lives below for reference (not the
 target). Full text: [`_archive/go-design-draft.md`](_archive/go-design-draft.md).
@@ -25,7 +26,7 @@ target). Full text: [`_archive/go-design-draft.md`](_archive/go-design-draft.md)
 | Plan / collision resolution | [15 — Aggregate (S5)](chapter-15-aggregate.md) |
 | Incremental merge into a library | [16 — Merge (S6)](chapter-16-merge.md) |
 | SQLite schema / commit model | [17 — Store (S7)](chapter-17-store.md) |
-| Materialize (`apply` / amalgamate) | [18 — Apply / amalgamate](chapter-18-apply.md) |
+| Materialize (`apply`) | [18 — Apply / materialize](chapter-18-apply.md) |
 | gRPC / jobs / thin CLI (old draft) | [19 — Server/Client (S9)](chapter-19-server-client.md) |
 
 [`chapter-20-developer-guide.md`](chapter-20-developer-guide.md) is Kronk

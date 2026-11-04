@@ -1,12 +1,13 @@
-# Chapter 18: Apply / amalgamate (S8)
+# Chapter 18: Apply / materialize (S8)
 
 **Read when:** changing materialization, `--move`, rename ordering, or
 result reports.
 
-**Names:** **amalgamate** is the product verb (plan → files in `--target`,
-on demand). **apply** is the current CLI command and Go package for that
-same step. Keep both names in docs; **do not rename the CLI while other
-agents are working**. Sources and the SQLite library are not consumed.
+**Names:** **materialize** is the product verb (plan → files in
+`--target`, on demand). **apply** is the CLI command and Go package for
+that same step. The former doc name *amalgamate* was renamed to
+*materialize* (2026-11-04); the CLI command name is not renamed. Sources
+and the SQLite library are not consumed.
 
 **Status:** Partial — copy + `--move` + EXIF write + `report.json`; no
 rename-vacate. Old-draft rename/commit actions are optional later.
@@ -72,5 +73,6 @@ func Apply(ctx context.Context, s *Store, resultDir string, move, dryRun bool) e
 plr apply --target DIR [--dry-run] [--no-exif] [--move] [--force-conflicts] [--db PATH]
 ```
 
-Documented alias name: **amalgamate** (same behavior; not wired as a
-subcommand yet). `plr build` runs scan → group → plan → apply/amalgamate.
+Product verb: **materialize** (the CLI stays `plr apply`; *amalgamate*
+was the old doc name, renamed 2026-11-04). `plr build` runs
+scan → group → plan → apply.

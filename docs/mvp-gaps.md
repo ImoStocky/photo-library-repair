@@ -5,10 +5,10 @@ What the `plr` MVP deliberately leaves out of the simpler product heading
 [chapter 01](../.manual/chapter-01-goals-and-status.md)), and how to work
 around it for now.
 
-**Naming:** *amalgamate* = materialize the plan into `--target`. The CLI
-command for that step is still `plr apply` (same meaning). Do not rename
-while other agents are mid-flight. `plr build` is the one-shot full
-pipeline (scan → group → plan → apply/amalgamate).
+**Naming:** *materialize* = write the plan as files into `--target`
+(former doc name *amalgamate*, renamed 2026-11-04). The CLI command for
+that step stays `plr apply`. `plr build` is the one-shot full pipeline
+(scan → group → plan → apply).
 
 | # | Missing feature | Status | Bypass |
 |---|-----------------|--------|--------|

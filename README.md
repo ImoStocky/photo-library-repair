@@ -2,7 +2,7 @@
 
 `plr` is a Go CLI that builds a photo library from directories: ingest
 metadata into SQLite, group near-duplicates, resolve which pixels and
-EXIF to keep, then **amalgamate** (CLI: `apply`) chosen images into a
+EXIF to keep, then **materialize** (CLI: `apply`) chosen images into a
 target folder. Sources stay on disk; the library lives in `plr.db`.
 
 ## Setup
@@ -22,7 +22,7 @@ plr group [--max-hamming-chunking 12] [--db plr.db]
 plr plan  [--ai] [--db plr.db]
 plr apply --target RESULT [--dry-run] [--no-exif] [--move] [--db plr.db]
 
-# one-shot (scan → group → plan → apply/amalgamate)
+# one-shot (scan → group → plan → materialize)
 plr build --dir PHOTO --target RESULT
 
 # grow an existing library (scan new dirs into the same DB, then the same pipeline)
@@ -35,7 +35,7 @@ plr increment --dir NEW_PHOTOS --target RESULT --db plr.db
 | `scan` | Walk dirs; record sha256, 16-byte perceptual hash, EXIF into SQLite. Skips already-scanned dirs unless `--force`. |
 | `group` | Exact sha256 + Hamming-near phash → groups |
 | `plan` | Per group: best pixels, earliest capture, GPS; mark conflicts |
-| `apply` | **Amalgamate:** copy (or `--move`) planned files to `--target`, write merged EXIF and `report.json` |
+| `apply` | **Materialize:** copy (or `--move`) planned files to `--target`, write merged EXIF and `report.json` |
 | `build` | Full pipeline in one go |
 | `increment` | Grow an existing library: scan new dirs into the same DB, then re-group / re-plan / re-apply |
 | `report` | Summarize library / groups / plans |
@@ -48,8 +48,8 @@ cannot start, `plr` warns and falls back to the built-in minimal
 JPEG reader/writer. Apply writes preserve every metadata tag in the
 source. Details: [`docs/dependencies.md`](docs/dependencies.md).
 
-**Naming:** *amalgamate* is the product verb for materializing the plan;
-the CLI command is still `apply`. See
+**Naming:** *materialize* is the product verb for the `apply` step
+(renamed from *amalgamate*); the CLI command stays `apply`. See
 [`.manual/chapter-01-goals-and-status.md`](.manual/chapter-01-goals-and-status.md).
 
 ## Incremental growth

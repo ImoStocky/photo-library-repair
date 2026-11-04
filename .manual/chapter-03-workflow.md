@@ -10,14 +10,14 @@ only. Shortcuts: [`docs/mvp-gaps.md`](../docs/mvp-gaps.md),
 plr scan  --dir PHOTOS [--force]     # ingest metadata into plr.db
 plr group [--max-hamming N]          # crunch near-duplicates
 plr plan                             # collision resolution → groups plan
-plr apply --target RESULT            # amalgamate: copy + write EXIF
+plr apply --target RESULT            # materialize: copy + write EXIF
 # or one-shot:
 plr build --dir PHOTOS --target RESULT
 plr increment --dir NEW_PHOTOS --target RESULT   # grow an existing library
 ```
 
-`apply` and **amalgamate** mean the same step (CLI name stays `apply`).
-Conflicts skipped on amalgamate unless `--force-conflicts`.
+`apply` and **materialize** mean the same step (CLI name stays `apply`).
+Conflicts skipped on materialize unless `--force-conflicts`.
 
 ## Phase 1 — Build the seed (old draft)
 
@@ -28,8 +28,8 @@ BuildSeed()             -> cluster (Hamming CC) + PlanGroup per cluster
                           -> working plan with conflicts surfaced
 review Conflicts()      -> operator inspects capture/GPS conflicts
 Commit()                -> atomic snapshot = library v1
-Apply/amalgamate(dry_run=true) -> sanity check
-Apply/amalgamate()      -> materialize into RESULT/
+Apply/materialize(dry_run=true) -> sanity check
+Apply/materialize()      -> files land in RESULT/
 ```
 
 **MVP today:** `plr build` or `scan` → `group` → `plan` → `apply`. No
@@ -39,7 +39,7 @@ after the plan phase; `plr commit` / `plr rollback` are the manual commands.
 ## Phase 2 — Commit
 
 Commit is the barrier between “planned” and “library”. Nothing in `RESULT/`
-changes until apply/amalgamate, which only realizes a **committed** plan.
+changes until apply/materialize, which only realizes a **committed** plan.
 
 **MVP today:** plan rows live in `groups`; `plr commit` (and the automatic
 commit after the plan phase in `build`/`increment`) snapshots them into
@@ -60,7 +60,7 @@ Merge(backup)           ->
     5. PlanGroup over (existing members + joined members)
     6. plan actions: new / renamed / updated / untouched
 Commit()                -> library v2 (diff vs v1 recorded)
-Apply/amalgamate()      -> copy new files, rename/update changed ones
+Apply/materialize()      -> copy new files, rename/update changed ones
 ```
 
 “Better” falls out of re-running `PlanGroup` over the union — larger
@@ -80,7 +80,7 @@ for snap in sorted(backup_snapshots):
     RegisterSource(kind=backup, path=snap)
     Merge(snap)
     Commit()
-Apply/amalgamate()   # once at the end
+Apply/materialize()   # once at the end
 ```
 
 Invariants T1–T4 ([chapter 02 §2.6](chapter-02-semantics.md)) ensure a

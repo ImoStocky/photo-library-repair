@@ -4,12 +4,13 @@ Guidance for coding agents working in **photo-library-repair** (`plr`).
 
 ## Product heading
 
-Local Go CLI: scan → group → plan → apply/amalgamate, SQLite library,
+Local Go CLI: scan → group → plan → apply (materialize), SQLite library,
 incremental re-scan. Read [`.manual/chapter-01-goals-and-status.md`](.manual/chapter-01-goals-and-status.md)
 first. Chapter index: [`.manual/INDEX.md`](.manual/INDEX.md).
 
-- **apply ≡ amalgamate** — same step; CLI stays `plr apply` until an
-  explicit rename. Do not rename while other agents may be mid-flight.
+- **apply ≡ materialize** — same step; the product verb is
+  *materialize* (renamed from *amalgamate* 2026-11-04), the CLI stays
+  `plr apply`.
 - The archived client/server draft
   ([`.manual/_archive/go-design-draft.md`](.manual/_archive/go-design-draft.md))
   is **not** the current target.
@@ -39,7 +40,7 @@ internal/meta/          # JPEG EXIF read (fallback)
 internal/exif/          # full-data EXIF engine (embedded ExifTool, WASM)
 internal/exifwrite/     # JPEG EXIF write (fallback)
 internal/store/         # SQLite sources/images/groups
-internal/apply/         # amalgamate (copy + write EXIF)
+internal/apply/         # materialize (copy + write EXIF)
 internal/selftest/      # plr selftest
 ```
 
@@ -47,7 +48,7 @@ internal/selftest/      # plr selftest
 
 - Reintroduce the Python prototype or treat README Python history as current
 - Wire gRPC / commit-log / ExifTool as required for the MVP heading
-- Rename `apply` → `amalgamate` without an explicit user request
+- Rename the `apply` CLI command without an explicit user request
 
 ## graphify
 

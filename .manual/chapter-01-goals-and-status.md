@@ -16,26 +16,26 @@ model) is not the current target.
 2. **Crunch** — exact `sha256` + perceptual-hash Hamming groups (`group`).
 3. **Resolve collisions** — best pixels + earliest capture / GPS; hard
    conflicts left for later human/model review (`plan`).
-4. **Amalgamate on demand** — copy planned images into a target dir and
+4. **Materialize on demand** — copy planned images into a target dir and
    write merged EXIF onto the copies. Sources and the DB stay put.
 5. **Grow the library incrementally** — scan more dirs into the same DB,
-   re-group / re-plan, amalgamate again (`increment`).
+   re-group / re-plan, materialize again (`increment`).
 
-One-shot: `build` = scan → group → plan → amalgamate.
+One-shot: `build` = scan → group → plan → materialize.
 Incremental: `increment` = the same pipeline into an existing library.
 
-## Naming: `apply` and `amalgamate`
+## Naming: `apply` and `materialize`
 
 | Term | Meaning |
 | --- | --- |
-| **amalgamate** | Product verb: materialize the plan into `--target` |
-| **apply** | Current CLI / package name for the same step |
+| **materialize** | Product verb: write the plan as files into `--target` |
+| **apply** | CLI command / Go package name for the same step |
 
-**Do not rename the CLI yet** (other agents may be mid-flight). Document
-both; code and flags stay `plr apply` / `internal/apply` until an
-explicit rename pass.
+**The CLI stays `plr apply`.** Code and flags are `plr apply` /
+`internal/apply`; the product verb was renamed from *amalgamate* to
+*materialize* (2026-11-04).
 
-`build` = full pipeline. It is not a synonym of amalgamate.
+`build` = full pipeline. It is not a synonym of materialize.
 
 ## Non-goals (for now)
 
@@ -49,7 +49,7 @@ explicit rename pass.
 plr scan | group | plan | apply | build | increment | report | selftest
 ```
 
-(`apply` ≡ amalgamate; see above.)
+(`apply` ≡ materialize; see above.)
 
 SQLite `plr.db`: `sources` / `images` / `groups`. Local CLI only.
 
@@ -60,7 +60,7 @@ SQLite `plr.db`: `sources` / `images` / `groups`. Local CLI only.
 | Group | `internal/group.Aggregate` | Done — sha256 + Hamming CC |
 | Plan / conflicts | `internal/group.ResolveGroup` | Done — rules per phase-5 brief; `Resolver` stub for Kronk |
 | Metadata engine | `internal/exif` | Done — embedded ExifTool 13.59 (WebAssembly, pure Go): reads every available tag, writes merged facts, preserves all other tags; built-in minimal reader/writer as fallback |
-| Amalgamate / apply | `internal/apply` | Done — copy + merged EXIF via the engine (all other tags preserved); `--move` deletes the source after a successful copy; writes `report.json` |
+| Materialize / apply | `internal/apply` | Done — copy + merged EXIF via the engine (all other tags preserved); `--move` deletes the source after a successful copy; writes `report.json` |
 | One-shot | `plr build` | Done |
 | Incremental growth | `plr increment` | Done — scan + group + plan + apply into the existing DB; S6 partition actions (present/matched/new) remain out of scope |
 | Kronk conflict resolve | `internal/kronk` | Done — opt-in `plr plan --ai` (Kronk decision model); rules remain the default |
