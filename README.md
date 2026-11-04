@@ -18,7 +18,7 @@ go build -o plr .
 
 ```text
 plr scan  --dir PHOTO [--dir MORE] [--force] [--db plr.db]
-plr group [--max-hamming-chunking 12] [--db plr.db]
+plr group [--max-hamming-chunking 20] [--db plr.db]
 plr plan  [--ai] [--db plr.db]
 plr apply --target RESULT [--dry-run] [--no-exif] [--move] [--db plr.db]
 
@@ -64,7 +64,8 @@ plr plan --db plr.db
 plr apply --target RESULT --db plr.db
 ```
 
-Gaps and bypasses: [`docs/mvp-gaps.md`](docs/mvp-gaps.md).
+Gaps and bypasses: [`docs/mvp-gaps.md`](docs/mvp-gaps.md). Every tunable
+and its default: [`docs/defaults.md`](docs/defaults.md).
 
 ## Design notes for agents
 

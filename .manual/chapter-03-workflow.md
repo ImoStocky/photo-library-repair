@@ -17,7 +17,8 @@ plr increment --dir NEW_PHOTOS --target RESULT   # grow an existing library
 ```
 
 `apply` and **materialize** mean the same step (CLI name stays `apply`).
-Conflicts skipped on materialize unless `--force-conflicts`.
+Conflict groups materialize as a plain copy of the best-effort pixels
+(reason recorded in `report.json`).
 
 ## Phase 1 — Build the seed (old draft)
 

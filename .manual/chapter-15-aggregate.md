@@ -33,7 +33,7 @@ same package. Conflicts surface via optional `Resolver` (used by
 | GPS pick | Smallest lat then lon | Agreement only; pick not “smallest” |
 | Name | Shortest basename, case-fold | Camera-like `nameScore` |
 | Pixel tie-break | Encoding rank then size | Resolution / size path |
-| Conflict apply | Never skip materialize | Apply skips conflicts unless `--force-conflicts` |
+| Conflict apply | Never skip materialize | Aligned: conflicts materialize as plain copy |
 
 ## Domain types (target)
 

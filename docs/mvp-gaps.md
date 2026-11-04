@@ -1,5 +1,7 @@
 # MVP gaps
 
+Defaults for every flag/constant mentioned here: [`defaults.md`](defaults.md).
+
 What the `plr` MVP deliberately leaves out of the simpler product heading
 ([`.manual/` chapters](../.manual/INDEX.md); status in
 [chapter 01](../.manual/chapter-01-goals-and-status.md)), and how to work
@@ -59,8 +61,9 @@ unrelated frames. Implemented heading for grouping (Strategy + Chain):
    `vision` (Kronk stub: keep candidate until a real VisionDecider returns
    Same).
 4. **EXIF / conflict plan** — existing `ResolveGroup` (offsets, GPS,
-   near-identical); keep conflicts in the library. Apply may still skip
-   conflict pixels until `--force-conflicts`.
+   near-identical); keep conflicts in the library. Apply never skips
+   them: conflict groups materialize as a plain copy (reason in
+   `report.json`).
 5. **Vision fallback** — Kronk pairwise identity later; conflict `--ai`
    resolver already exists.
 

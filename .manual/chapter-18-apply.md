@@ -24,8 +24,8 @@ directory, write chosen metadata onto the copies, emit report. I/O.
 - `--move` relocates pixel source only.
 - **new** refuses overwrite; **updated** overwrites; **renamed** moves
   existing library file (vacate / park-and-swap for cycles).
-- Conflict never blocks materialize in the design (MVP skips conflicts
-  unless `--force-conflicts`).
+- Conflict never blocks materialize: conflict groups are copied
+  best-effort (no merged EXIF winner set), the reason lands in the report.
 
 ## Target package
 
@@ -36,14 +36,15 @@ directory, write chosen metadata onto the copies, emit report. I/O.
 
 `internal/apply.Apply(store, Options)`:
 
-- Options: target dir, dry-run, no-exif, force-conflicts, move, EXIF engine.
+- Options: target dir, dry-run, no-exif, move, EXIF engine.
 - Copies planned pixel images; unique-name helper on collision.
 - Writes EXIF via the full-data engine (built-in writer as fallback).
 - `Move` deletes the source file once its copy is fully in place. Duplicates
   inside a group and skipped conflict groups stay; a failed removal is
   reported (both files remain); a true dest == src is never followed by a
   deletion (same-file guard).
-- Skips `StatusConflict` groups unless forced.
+- Conflict groups are never dropped: they materialize as a plain copy,
+  and `report.json` records why the plan is only best effort.
 - Writes `report.json` into the target after a non-dry-run: run summary
   (files, counts, errors) plus every group's plan.
 - No rename-vacate graph.
@@ -70,7 +71,7 @@ func Apply(ctx context.Context, s *Store, resultDir string, move, dryRun bool) e
 ## CLI
 
 ```text
-plr apply --target DIR [--dry-run] [--no-exif] [--move] [--force-conflicts] [--db PATH]
+plr apply --target DIR [--dry-run] [--no-exif] [--move] [--db PATH]
 ```
 
 Product verb: **materialize** (the CLI stays `plr apply`; *amalgamate*

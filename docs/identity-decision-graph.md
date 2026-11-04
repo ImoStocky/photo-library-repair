@@ -1,5 +1,7 @@
 # Decision Graph — duplicate identity & group resolution
 
+Radii/slack values live in [`defaults.md`](defaults.md).
+
 Status: **implemented** (2026-11-03, `internal/group/identity_exif.go` +
 `group.go`). Approved spec drift from `.manual/chapter-02-semantics.md`
 §2.3/§4.5: EXIF capture time is the first-order identity of a duplicate;
