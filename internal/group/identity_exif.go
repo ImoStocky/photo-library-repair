@@ -16,6 +16,21 @@ const DefaultSameImageWindow = time.Second
 // the EXIF-less fallback gate (block AND gradient must both pass).
 const DefaultExifFirstHamming = 10
 
+// slackBlockhash / slackGradient are added to the configured secondary
+// radii because the hashes are compared min-rotation between pictures of
+// any size. Measured same-picture noise (corpus + scratch harness): a
+// downscaled re-save moves blockhash ≤6 and double-gradient ≤27 bits; a
+// rotated, re-encoded, re-sized save moves blockhash ≤90 (its band medians
+// shift under the turn) while double-gradient stays ≤6. The gate is an
+// AND, and exports CROPPED from one photo measure 29–30 gradient bits, so
+// the gradient radius stops at 28 — it carries the separation (unrelated
+// pictures are ≥62 gradient bits apart) and blockhash only vetoes gross
+// disagreement.
+const (
+	slackBlockhash = 86
+	slackGradient  = 18
+)
+
 // ExifFirst is the identity strategy of docs/identity-decision-graph.md:
 // the dual 16×16 gate decides every pair — blockhash AND double-gradient
 // must both be within their radii. A capture-time match alone never joins
@@ -152,10 +167,13 @@ func sameImagePair(a, b Image, da, db dual, winSecs int64, blockR, gradR int) bo
 	}
 	// The phash gate comes first: visual agreement is the only way a pair
 	// joins. A shared capture second proves nothing — burst frames are
-	// different pictures taken one second apart.
+	// different pictures taken one second apart. Min-rotation distances
+	// with the documented slack make the gate tolerate 90° re-saves and
+	// resolution changes; unrelated pictures stay far outside even the
+	// slackened gradient radius.
 	if !(da.okBlock && db.okBlock && da.okGrad && db.okGrad &&
-		da.block.Hamming(db.block) <= blockR &&
-		da.grad.Hamming(db.grad) <= gradR) {
+		phash.MinRotDistance(da.block, db.block, phash.AlgBlockhash) <= blockR+slackBlockhash &&
+		phash.MinRotDistance(da.grad, db.grad, phash.AlgDoubleGradient) <= gradR+slackGradient) {
 		return false
 	}
 	// EXIF then vetoes what the hashes joined: two recorded cameras firing

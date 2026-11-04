@@ -11,7 +11,7 @@ inheritance and switched the EXIF-less birth guess to `min(creation,
 modification)`. A further corpus pass inverted the order: **the dual-hash
 gate decides every pair; EXIF only splits** — the pair rule is now:
 sha256, *or* (dual-hash gate *and not* same-instant camera conflict).
-The same pass canonicalises hash orientation (see §7).
+The same pass made matching rotation-tolerant (see §7).
 
 ## 1. Principles
 
@@ -193,21 +193,30 @@ Resolution then runs per component (pixels/capture/GPS/name as in §2).
     EXIF instant, else earliest creation time (flagged).
   - Increment uses the same pair rule: bucket proximity alone never
     joins a library group. The chunking flag is `--max-hamming-chunking`.
-  - **Rotation hashing (implemented, 2026-11-03).** The corpus has **no**
-    EXIF Orientation tag, but pixel-rotated re-saves are real (a 90°
-    re-save measures blk 160 → 0 under a manual rotate). Every stored hash
-    is therefore computed on a **canonical orientation**: the landscape
-    (width ≥ height) 90° rotation, ties broken by the lexicographically
-    smallest 16×16 blockhash (`phash.Canonical`). Orientation is stable
-    under content noise; lex-min over all four rotations was tried first
-    and flipped a crop against its original (blk 4 → 120). Mirrors are not
-    handled. Reported Width/Height stay the stored ones. Corpus: same-identity
-    pairs inside the gate 84 → 94/105, cross-identity gate hits unchanged
-    (6 pre-existing double-label artifacts). **All hashes change value —
-    a full rescan is required.** Resolution stays a non-issue: both 16×16
-    hashes are resolution-normalised (blockhash averages whole-image
-    blocks, gradient lanczos-resizes), measured identical at 3072 px →
-    120 px, so a smallest-common-size retry can only lose information.
+  - **Rotation hashing (superseded, 2026-11-03).** Lex-min canonical
+    rotation (`phash.Canonical`) was implemented and then removed the same
+    week in favour of min-rotation matching (below): a canonical form can
+    flip a crop against its original and hides which rotation matched.
+  - **Rotation-tolerant matching (implemented, 2026-11-04).** The corpus
+    has **no** EXIF Orientation tag, but pixel-rotated re-saves are real.
+    One hash per algorithm is stored — on the **stored pixels**, no
+    canonical form — and compared under `phash.MinRotDistance`, which
+    transforms the hash *bits* through each 90° turn instead of the
+    pixels: blockhash rotates its 16×16 bit grid (180° bit-exact; 90°
+    shifts the 4-row band medians, ≤90 bits of noise together with
+    thumbnail resampling), double-gradient permutes H↔V and negates one
+    half (a turn reverses one comparison order; ≤6 bits on rotated
+    re-saves). The legacy 16×8 DCT has no rotation (coefficients negate,
+    not permute) — it stays a bucket key only. Gate radii grow by
+    `slackBlockhash`/`slackGradient` (identity_exif.go): effective 96/28
+    at the 10/10 defaults; the gradient carries the separation (crops of
+    one photo measure 29–30 gradient bits, unrelated pictures ≥62).
+    Corpus score (over/under): 2/7 → **2/1** (overs are pixel-identical
+    double-label artifacts; the remaining under is a seed-stage thumbnail
+    with no EXIF whose candidate recall never meets its group — see §8).
+    **Hash values change (canonical → stored pixels) — rescan with
+    `plr scan --force` after upgrading from the canonical build.**
+    Mirrors are not handled. Reported Width/Height stay the stored ones.
   - **Gate first, EXIF splits (implemented, 2026-11-03).** The corpus had
     over-merges created by the same-instant shortcut (two identities whose
     hashes are far apart merged on Δt ≤ 1 s alone). The order is now the
@@ -232,3 +241,12 @@ proper role. Unknown-offset members are indexed at their wall clock in the
 sweep (zone inheritance happens at comparison, and a drifted pair that misses
 the sweep is still recalled by its hash bucket); hash buckets stay the second
 opinion for those pairs.
+
+**Known recall gap (open).** A member with **no** EXIF capture time whose
+primary hash has drifted far past the bucket radius — a heavily re-encoded
+rotated thumbnail (corpus case: 270×360 vs 3072×2304, DCT 64 bits apart,
+while the dual-hash gate says blk 90 / grd 6, i.e. same picture) — reaches
+neither candidate path: too far for the hash bucket, absent from the
+timestamp sweep. It needs a secondary-hash candidate path (recall by
+min-rotation blockhash/gradient neighbours, which the sweep would key
+instead of by instant) before the gate's own radii get any use.

@@ -100,7 +100,11 @@ func classify(im Image, h phash.Hash, lib []LibMember, libHashes []phash.Hash, m
 		} else if h != nil && libHashes[i] != nil {
 			d = h.Hamming(libHashes[i])
 		}
-		if d > maxHamming {
+		if d > maxHamming && same == nil {
+			// Pure-hash mode: the primary radius is the only identity
+			// evidence. With a gate, pairs that passed it above stay
+			// candidates — a 90° re-save sits far outside the primary
+			// bucket yet is the same picture.
 			continue
 		}
 		if !seen || d < best.Distance {

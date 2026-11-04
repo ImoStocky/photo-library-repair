@@ -263,14 +263,20 @@ func TestExifFirstDualHashGate(t *testing.T) {
 }
 
 func TestExifFirstTransitiveClosure(t *testing.T) {
-	// a≡b and b≡c are within radius 1 of each other while a and c are two
-	// bits apart: the closure puts all three in one identity.
+	// The gate is min-rotation with radius+slack (1+86 for blockhash):
+	// a–b and b–c sit inside it while a–c stays outside; the closure
+	// still puts all three in one identity.
 	block, grad := mustHash(16), mustHash(18)
 	bNear, cNear := make(phash.Hash, 16), make(phash.Hash, 16)
 	copy(bNear, block)
 	copy(cNear, block)
-	bNear[0] ^= 1 // a–b distance 1
-	cNear[0] ^= 3 // a–c distance 2, b–c distance 1
+	flip := func(h phash.Hash, from, to int) { // XOR bits [from,to)
+		for i := from; i < to; i++ {
+			h[i/8] ^= 1 << (i % 8)
+		}
+	}
+	flip(bNear, 0, 70)  // a–b distance 70, within 1+86
+	flip(cNear, 0, 100) // a–c distance 100, beyond 1+86; b–c distance 30
 	look := mapLookup{
 		"s1:blockhash:16": block, "s1:double-gradient:16": grad,
 		"s2:blockhash:16": bNear, "s2:double-gradient:16": grad,

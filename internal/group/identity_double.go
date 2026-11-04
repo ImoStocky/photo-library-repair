@@ -68,7 +68,10 @@ func (d DoublePhash) Refine(candidates []Image) ([][]Image, error) {
 			if !a.okBlock || !b.okBlock || !a.okGrad || !b.okGrad {
 				continue
 			}
-			if a.block.Hamming(b.block) <= blockR && a.grad.Hamming(b.grad) <= gradR {
+			// Min-rotation distances tolerate 90° re-saves and other
+			// sizes (slack constants documented in identity_exif.go).
+			if phash.MinRotDistance(a.block, b.block, phash.AlgBlockhash) <= blockR+slackBlockhash &&
+				phash.MinRotDistance(a.grad, b.grad, phash.AlgDoubleGradient) <= gradR+slackGradient {
 				uf.union(i, j)
 			}
 		}

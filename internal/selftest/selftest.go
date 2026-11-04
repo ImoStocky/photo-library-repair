@@ -28,9 +28,9 @@ import (
 
 // maxHamming is the grouping radius the checks use: the CLI default, so the
 // checks exercise the same candidate recall the product ships with.
-// Canonical hash rotation puts quality re-encodings of a fixture picture at
-// 16-20 bits (rotated resampling phase); the dual-16x16 gate then separates
-// different fixture seeds inside a shared bucket.
+// Quality re-encodings of a fixture picture land at 0–16 bits (resampling
+// noise); the dual-16x16 gate then separates different fixture seeds inside
+// a shared bucket, under every 90° rotation.
 const maxHamming = 20
 
 // Check is the outcome of one built-in check.
