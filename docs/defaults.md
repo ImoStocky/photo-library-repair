@@ -10,11 +10,11 @@ changes.
 | Flag (command) | Default | Meaning |
 | --- | --- | --- |
 | `--db` (all) | `plr.db` | SQLite library path |
-| `--force` (scan, build, increment) | off | re-scan already-scanned dirs (also re-hashes; needed after a hash-definition change) |
-| `--workers` (scan) | `4` | parallel hash workers |
-| `--min-size-kb` (scan) | `0` (off) | ignore smaller images |
-| `--phash-alg` (scan) | `dct` | primary (candidate) hash algorithm; the secondary gate hashes are stored regardless (see constants) |
-| `--phash-size` (scan) | `0` = legacy 16×8 DCT (128 bits) | square hash size 8/16/32 |
+| `--force` (scan, build, increment) | off | re-scan already-scanned dirs; unchanged files (size+mtime) keep their stored hashes, so after a hash-definition change re-build on a fresh `--db` |
+| `--workers` (scan, build, increment) | `4` | parallel hash workers |
+| `--min-size-kb` (scan, build, increment) | `0` (off) | ignore smaller images |
+| `--phash-alg` (scan, build, increment) | `dct` | primary (candidate) hash algorithm; the secondary gate hashes are stored regardless (see constants) |
+| `--phash-size` (scan, build, increment) | `0` = legacy 16×8 DCT (128 bits) | square hash size 8/16/32 |
 | `--max-hamming-chunking` (group, build, increment) | `20` | candidate bucket radius on the primary hash — **chunking only, never identity** |
 | `--identity` (group, build, increment) | `exif-first` | identity strategy (`pass`, `double-phash`, `vision` also exist) |
 | `--same-image-window` (group, build, increment) | `1s` | zone-resolved capture gap meaning "same instant": drives the camera-block split veto **and** the timestamp candidate sweep |
@@ -23,7 +23,7 @@ changes.
 | `--ai` (plan) | off | settle conflict groups with the Kronk decision model |
 | `--model` (plan) | `chaoliangUNSW/Jev-Style-0.8B-Decision-v3-Q8_0` | Kronk decision model source |
 | `--target` (apply, build, increment) | — (required) | materialize destination |
-| `--dry-run` / `--no-exif` / `--move` (apply) | off | report-only / skip EXIF write / delete source after copy |
+| `--dry-run` / `--no-exif` / `--move` (apply, build, increment) | off | report-only / skip EXIF write / delete source after copy |
 | `--message` (commit) | `plan` | commit summary |
 | `--to` (rollback) | latest commit | commit id to restore |
 

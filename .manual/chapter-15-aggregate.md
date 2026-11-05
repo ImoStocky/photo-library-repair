@@ -99,10 +99,8 @@ func chooseName(ms []Member) string {
 ## CLI
 
 `plr plan` — writes into `groups` status/reason/pixel/capture/gps/name.
-`--conflict-hamming` (default 2) drives the near-identical conflict rule in
-`group.ResolveGroup`: a member pair at distance 1…limit with identical
-capture instants turns the group into a conflict. Exact matches (distance 0)
-resolve normally.
+The removed `--conflict-hamming` near-identical rule is superseded by the
+identity decision graph (`docs/identity-decision-graph.md`).
 
 ## When fixing parity
 

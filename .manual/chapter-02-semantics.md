@@ -76,10 +76,9 @@ IPTC, or file creation time. Stored value = local wall clock
   length, focal length 35 mm, F-number, exposure time, ISO, exposure program,
   exposure compensation, flash, metering mode, white balance, serial number.
   Any of these → **camera file**.
-- `max_capture_disagreement` default **`10s`** in the Go CLI
-  (`--max-capture-disagreement`; `12h`, `90s`, or bare seconds accepted.
-  The client/server draft said `1d` = 86400 s; 10 s matches what duplicate
-  encoders actually produce).
+- `max_capture_disagreement` was replaced in the Go CLI by
+  `--same-image-window` (default `1s`, zone-resolved); see
+  `docs/identity-decision-graph.md`.
 
 | Situation | Result |
 | --- | --- |
