@@ -28,8 +28,6 @@ import (
 
 	"photo-library-repair/internal/fingerprint"
 	"photo-library-repair/internal/store"
-
-	"golang.org/x/sys/unix"
 )
 
 // Options controls a scan.
@@ -402,16 +400,6 @@ func dropMissing(s *store.Store, sourceID int64, seen map[string]bool) error {
 		return err
 	}
 	return tx.Commit()
-}
-
-// birthTime returns the file birth time in unix seconds, or 0 when the
-// filesystem does not report one (callers fall back to mtime).
-func birthTime(path string, fallback time.Time) int64 {
-	var stx unix.Statx_t
-	if err := unix.Statx(unix.AT_FDCWD, path, 0, unix.STATX_BTIME, &stx); err == nil {
-		return stx.Btime.Sec
-	}
-	return 0
 }
 
 func sha256File(path string) (string, error) {

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
+	"runtime/pprof"
 	"slices"
 	"sort"
 	"strconv"
@@ -26,6 +28,25 @@ import (
 
 // Run executes the plr command line and returns a process exit code.
 func Run(args []string) int {
+	fs := flag.NewFlagSet("plr", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	cpuProfile := fs.String("cpuprofile", "", "write CPU profile to file")
+	memProfile := fs.String("memprofile", "", "write memory profile to file")
+	if err := fs.Parse(args); err != nil {
+		if err == flag.ErrHelp {
+			usage(os.Stdout)
+			return 0
+		}
+		return 2
+	}
+	args = fs.Args()
+	stopProfile, err := startProfiles(*cpuProfile, *memProfile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr:", err)
+		return 1
+	}
+	defer stopProfile()
+
 	if len(args) == 0 {
 		usage(os.Stderr)
 		return 2
@@ -65,6 +86,8 @@ func Run(args []string) int {
 const usageText = `plr - photo library repair
 
 Usage:
+  plr [-cpuprofile FILE] [-memprofile FILE] <command> ...
+
   plr scan     --dir DIR... [--force] [--db PATH] [--workers N] [--min-size-kb N]
                [--photoslibrary-all] [--phash-alg ALG] [--phash-size 8|16|32]
   plr group    [--max-hamming-chunking N] [--identity exif-first|pass|double-phash|vision]
@@ -983,6 +1006,42 @@ func toGroupImage(im store.Image) group.Image {
 		GPSLat:      im.GPSLat,
 		GPSLon:      im.GPSLon,
 	}
+}
+
+// startProfiles enables optional CPU and heap profiles. The returned
+// stop function flushes both; it is safe to call when neither path was set.
+func startProfiles(cpuPath, memPath string) (func(), error) {
+	var cpuFile *os.File
+	if cpuPath != "" {
+		f, err := os.Create(cpuPath)
+		if err != nil {
+			return nil, fmt.Errorf("cpuprofile: %w", err)
+		}
+		if err := pprof.StartCPUProfile(f); err != nil {
+			f.Close()
+			return nil, fmt.Errorf("cpuprofile: %w", err)
+		}
+		cpuFile = f
+	}
+	return func() {
+		if cpuFile != nil {
+			pprof.StopCPUProfile()
+			cpuFile.Close()
+		}
+		if memPath == "" {
+			return
+		}
+		f, err := os.Create(memPath)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "plr: memprofile:", err)
+			return
+		}
+		defer f.Close()
+		runtime.GC()
+		if err := pprof.WriteHeapProfile(f); err != nil {
+			fmt.Fprintln(os.Stderr, "plr: memprofile:", err)
+		}
+	}, nil
 }
 
 // multiFlag collects repeated occurrences of a string flag.
