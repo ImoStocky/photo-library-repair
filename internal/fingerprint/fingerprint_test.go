@@ -98,3 +98,33 @@ func TestComputeCorruptJPEGIsError(t *testing.T) {
 		t.Fatal("corrupt jpeg must be an error")
 	}
 }
+
+// A real HEIC (32x24 fixture encoded with pillow-heif) must hash like the
+// standard-library formats.
+func TestComputeHEIC(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "fixture.heic"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := Compute(writeFile(t, "a.heic", data), "heic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Phash == "" || info.Width != 32 || info.Height != 24 {
+		t.Fatalf("heic must be hashable, got %+v", info)
+	}
+}
+
+// A HEIC the decoder rejects degrades to an EXIF-only row like a format
+// without a decoder, not a file error.
+func TestComputeUnreadableHEICDegradesToNoPhash(t *testing.T) {
+	b := make([]byte, 64)
+	copy(b, "ftypheic")
+	info, err := Compute(writeFile(t, "b.heic", b), "heic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Phash != "" || info.Width != 0 {
+		t.Fatalf("unreadable heic must be unhashable, got %+v", info)
+	}
+}

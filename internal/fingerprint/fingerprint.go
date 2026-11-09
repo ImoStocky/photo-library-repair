@@ -1,11 +1,11 @@
 // Package fingerprint computes the per-file facts recorded while scanning:
 // the perceptual hash, the displayed dimensions, and the EXIF capture facts.
 //
-// JPEG, PNG and GIF are decoded with the standard library. WebP, TIFF and
-// HEIF have no pure-Go decoder in this prototype, so files of those kinds
-// are recorded without a perceptual hash and end up in singleton groups.
-// When libheif development headers are available, HEIF decoding can be
-// added behind a build tag without changing this interface.
+// JPEG, PNG and GIF are decoded with the standard library. HEIC is decoded
+// with gen2brain/heic (Rust decoder as embedded WASM, CGO-free; a system
+// libheif is used automatically when present). WebP and TIFF have no
+// decoder in this prototype, so files of those kinds are recorded without a
+// perceptual hash and end up in singleton groups.
 package fingerprint
 
 import (
@@ -17,6 +17,8 @@ import (
 	"image/jpeg"
 	"image/png"
 	"os"
+
+	"github.com/gen2brain/heic"
 
 	"photo-library-repair/internal/exif"
 	"photo-library-repair/internal/meta"
@@ -51,9 +53,9 @@ type Info struct {
 
 // Compute reads path and derives its fingerprint with the built-in
 // decoders, the minimal JPEG EXIF reader, and the default (legacy 16×8
-// DCT) perceptual hash. Formats without a decoder (webp, tiff, heic)
-// yield an Info with an empty Phash and no error; corrupt pictures of
-// decodable formats are an error.
+// DCT) perceptual hash. Formats without a decoder (webp, tiff) and HEIC
+// files the HEIC decoder rejects yield an Info with an empty Phash and no
+// error; corrupt pictures of decodable formats are an error.
 func Compute(path, kind string) (Info, error) {
 	return compute(path, kind, nil, phash.Config{})
 }
@@ -126,7 +128,10 @@ func compute(path, kind string, t *exif.Tool, cfg phash.Config) (Info, error) {
 		})
 	}
 
-	if kind == "jpeg" {
+	// EXIF facts need the full-data engine for HEIC; without it the
+	// built-in reader (JPEG-only) below simply fails and the file keeps
+	// no capture facts, which is the correct degradation.
+	if kind == "jpeg" || kind == "heic" {
 		if f, ok := exifFacts(path, data, t); ok {
 			info.EXIFCapture = f.Capture
 			info.EXIFOffset = f.Offset
@@ -173,6 +178,15 @@ func decode(data []byte, kind string) (image.Image, error) {
 		return png.Decode(bytes.NewReader(data))
 	case "gif":
 		return gif.Decode(bytes.NewReader(data))
+	case "heic":
+		// Decode failures degrade to EXIF-only rows (errNoDecoder): the
+		// young WASM decoder does not cover every HEIF variant, and one
+		// unreadable HEIC must not error its file out of the library.
+		img, err := heic.Decode(bytes.NewReader(data))
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", errNoDecoder, err)
+		}
+		return img, nil
 	default:
 		return nil, errNoDecoder
 	}

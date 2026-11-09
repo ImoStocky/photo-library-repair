@@ -16,16 +16,18 @@ the choices below are for **metadata (EXIF)** and **HEIC decode**.
   (`internal/exifwrite`) stay in the tree as the **fallback** path: if the
   engine fails to start, `plr` warns and continues with the minimal
   tags-only read/write.
-- HEIC is recognized by kind sniff and recorded, but has **no decoder**:
-  `internal/fingerprint` yields an empty phash for HEIC files, so they cannot
-  be clustered or plan-resolved by pixels today.
+- HEIC is decoded by `gen2brain/heic` (Rust `heic` crate compiled to WASM,
+  run under wazero; a system libheif is used automatically via purego when
+  installed): `internal/fingerprint` computes a real phash for HEIC files
+  and reads their EXIF through the engine. HEIC files the decoder rejects
+  degrade to EXIF-only rows rather than file errors.
 
 ## Decisions
 
 | Concern | Library | Why |
 | --- | --- | --- |
 | EXIF read + write | **`yashikota/exiftool-go` v1.2.0** (pure Go, no cgo) | Embeds the real ExifTool 13.59 as WebAssembly (zeroperl on wazero): full tag parity (EXIF, IPTC, XMP, maker notes), read *and* write, single binary, zero system dependencies. One shared instance is safe across worker goroutines (internal mutex). |
-| HEIC decode | **`vegidio/heif-go`** (pure Go) | Only fully native option: HEIF/HEIC encode/decode with no CGO and no system libraries. Keeps the build trivial, consistent with the dependency-free phash engine. |
+| HEIC decode | **`gen2brain/heic`** (CGO-free, embedded WASM) | Rust `heic` decoder compiled to WASM under wazero — the same engine pattern as ExifTool: builds with plain `go build`, no C toolchain, no system libraries, and auto-uses a local libheif when present. Young decoder, so decode failures degrade to EXIF-only rows. Chosen 2026-11-09 over `vegidio/heif-go` after that entry was corrected (see below); performance to be re-checked on the real corpus. |
 
 **ExifTool write details:**
 
@@ -45,9 +47,10 @@ the choices below are for **metadata (EXIF)** and **HEIC decode**.
   switch to a native exiftool (there are no maintained libexiftool C-API
   bindings; an exec wrapper with `-stay_open` would be the shape of it).
 - HEIC: first pick, not final. Re-evaluate once HEIC scan/decode
-  performance is measured on a real library — the pure-Go decode cost per
-  file in the scan phase is the open question (every HEIC is fully decoded
-  for its phash).
+  performance is measured on a real library — the WASM decode cost per file
+  in the scan phase is the open question (every HEIC is fully decoded for
+  its phash). If it is too slow, `vegidio/heif-go` (below) is the fallback
+  once CGO is acceptable.
 
 ## Considered, deferred
 
@@ -60,7 +63,8 @@ the choices below are for **metadata (EXIF)** and **HEIC decode**.
 | EXIF | `mschilli/go-exif`, `imclaren/go-exif`, `krak3n/go-exif` | no | Forks of the dsoprea line; no reason to prefer a fork. |
 | EXIF | `mostlygeek/goexif` | no | Spec-based pure-Go decode, read-only; the same limited-tags story as the hand-rolled reader. |
 | EXIF | libexif CGO bindings (`martinheidegger/exif`, `xiam/exif`, …) | yes | Basic tag set through libexif, CGO, unmaintained; and no maintained libexiftool C-API bindings exist. |
-| HEIC | `strukturag/libheif` Go bindings | yes | Battle-tested (libde265) but CGO + build-toolchain burden; the fallback if `vegidio/heif-go` proves too slow or format-limited. |
+| HEIC | `vegidio/heif-go` | yes | **Correction (2026-11-09): this is a CGO library**, not pure Go — the earlier decision for it rested on a misreading of its README. It statically bundles libheif (fast, no runtime system deps) but needs `CGO_ENABLED=1` and a C toolchain to build plr, which the pure-Go build so far deliberately avoids. The fallback if the WASM decode proves too slow. |
+| HEIC | `strukturag/libheif` Go bindings | yes | Battle-tested (libde265) but CGO + build-toolchain burden; the fallback if `gen2brain/heic` proves too slow or format-limited. |
 | HEIC | `klippa-app/go-libheif` | yes | `go get`-table libheif wrapper (HEIC/HEIF/AVIF); same CGO trade-off, less proven than the upstream bindings. |
 | HEIC | `xo/heif` | yes | Go wrapper around libheif, encode + decode for any libheif-supported format; same CGO trade-off. |
 | HEIC | `f0reth/go-heic` | no (purego) | CGO-free, but loads `libheif`/`libde265` shared libraries at runtime — pushes the dependency onto the user's machine. |

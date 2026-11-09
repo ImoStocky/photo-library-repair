@@ -4,6 +4,7 @@ go 1.27.0
 
 require (
 	github.com/ardanlabs/kronk v1.32.9
+	github.com/gen2brain/heic v0.7.2
 	github.com/yashikota/exiftool-go v1.2.0
 	golang.org/x/sys v0.48.0
 	modernc.org/sqlite v1.60.1
