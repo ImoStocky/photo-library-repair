@@ -38,6 +38,10 @@ type Options struct {
 	Force   bool
 	Workers int
 	MinSize int64 // bytes; 0 accepts everything
+	// PhotosLibraryAll scans whole .photoslibrary bundles instead of the
+	// default: only their originals/ subdirectory, skipping the thumbnails
+	// and edited derivatives under resources/ and the database files.
+	PhotosLibraryAll bool
 }
 
 // Report summarizes a scan.
@@ -56,6 +60,10 @@ type Report struct {
 // Hasher computes the fingerprint of one file. It is injected so tests do
 // not need real images.
 type Hasher func(path string, kind string) (fingerprint.Info, error)
+
+// imageSeq numbers image ids process-wide: ids are (millisecond, seq), so a
+// per-Scan sequence would collide when two scans start in one millisecond.
+var imageSeq atomic.Int64
 
 type job struct {
 	sourceID  int64
@@ -78,7 +86,6 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 	}
 	rep := &Report{}
 	runStart := time.Now()
-	var seq atomic.Int64
 
 	seenInodes := map[uint64]bool{} // (dev, inode) already recorded this run
 
@@ -110,7 +117,7 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 			}
 		}
 
-		jobs, seen, nonImage, err := collect(abs, opts.MinSize, seenInodes)
+		jobs, seen, nonImage, err := collect(abs, opts.MinSize, opts.PhotosLibraryAll, seenInodes)
 		if err != nil {
 			return rep, fmt.Errorf("scan %q: %w", dir, err)
 		}
@@ -145,28 +152,31 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 			return rep, fmt.Errorf("scan %q: %w", dir, err)
 		}
 
-		if err := hashAll(s, jobs, opts.Workers, hash, runStart, &seq, rep, facts, known); err != nil {
+		if err := hashAll(s, jobs, opts.Workers, hash, runStart, &imageSeq, rep, facts, known); err != nil {
 			return rep, fmt.Errorf("scan %q: %w", dir, err)
 		}
 	}
 	return rep, nil
 }
 
-// collect walks root and returns the image jobs, the set of relative paths
-// that exist, and how many files with an image extension failed the magic
-// sniff. Files whose (dev, inode) was already seen in this run (nested
-// sources, hard links) are skipped.
-func collect(root string, minSize int64, seenInodes map[uint64]bool) ([]job, map[string]bool, int, error) {
+// collect walks root and returns the image jobs, the set of paths relative
+// to root that exist, and how many files with an image extension failed the
+// magic sniff. Files whose (dev, inode) was already seen in this run
+// (nested sources, hard links) are skipped.
+//
+// Apple Photos library bundles (directories with a .photoslibrary suffix)
+// switch the walk to specialised mode: unless scanAll is set, the outer
+// walk never descends into a bundle, only its originals/ subdirectory is
+// walked (the canonical home of the master files since macOS 5); the
+// thumbnails and edited derivatives under resources/ and the SQLite files
+// under database/ are never image sources. A bundle without originals/ is
+// an error rather than a silent (or thumbnail-filled) empty scan.
+func collect(root string, minSize int64, scanAll bool, seenInodes map[uint64]bool) ([]job, map[string]bool, int, error) {
 	var jobs []job
 	seen := map[string]bool{}
 	nonImage := 0
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if d.IsDir() {
-			return nil
-		}
+
+	add := func(path string, d fs.DirEntry) error {
 		if !hasImageExt(d.Name()) {
 			return nil
 		}
@@ -216,8 +226,39 @@ func collect(root string, minSize int64, seenInodes map[uint64]bool) ([]job, map
 		})
 		seen[rel] = true
 		return nil
+	}
+
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			if scanAll || !strings.EqualFold(filepath.Ext(d.Name()), ".photoslibrary") {
+				return nil
+			}
+			if err := collectOriginals(path, add); err != nil {
+				return err
+			}
+			return filepath.SkipDir
+		}
+		return add(path, d)
 	})
 	return jobs, seen, nonImage, err
+}
+
+// collectOriginals walks the originals/ subdirectory of the Photos library
+// bundle, feeding files to add.
+func collectOriginals(bundle string, add func(path string, d fs.DirEntry) error) error {
+	orig := filepath.Join(bundle, "originals")
+	if info, err := os.Stat(orig); err != nil || !info.IsDir() {
+		return fmt.Errorf("%s: no originals/ subdirectory; pass --photoslibrary-all to scan the bundle as-is", bundle)
+	}
+	return filepath.WalkDir(orig, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil || d.IsDir() {
+			return walkErr
+		}
+		return add(path, d)
+	})
 }
 
 // hashAll runs sha256 + fingerprint over the jobs with a worker pool and

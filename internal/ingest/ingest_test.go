@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -295,4 +296,89 @@ func heicBytes(brand string) []byte {
 	copy(b[4:8], "ftyp")
 	copy(b[8:12], brand)
 	return b
+}
+
+// An Apple Photos bundle (.photoslibrary directory) is walked only inside
+// originals/: thumbnails and edited derivatives elsewhere in the bundle are
+// never recorded, while the source stays registered under the bundle path.
+func TestScanPhotosLibraryWalksOnlyOriginals(t *testing.T) {
+	bundle := filepath.Join(t.TempDir(), "Photos Library.photoslibrary")
+	write(t, filepath.Join(bundle, "originals", "D", "master.jpg"), jpegBytes())
+	write(t, filepath.Join(bundle, "resources", "derivatives", "thumb.jpg"), jpegBytes())
+	write(t, filepath.Join(bundle, "database", "Photos.sqlite"), []byte("not an image"))
+	s, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := Scan(s, Options{Dirs: []string{bundle}, Workers: 1}, fakeHasher("jpeg")); err != nil {
+		t.Fatal(err)
+	}
+	images, _ := s.AllImages()
+	if len(images) != 1 || images[0].RelPath != filepath.Join("originals", "D", "master.jpg") {
+		t.Fatalf("images = %+v, want only originals/D/master.jpg", images)
+	}
+	if _, ok, err := s.FindSource(bundle); err != nil || !ok {
+		t.Fatalf("source %q registered = %v, want true", bundle, ok)
+	}
+}
+
+// The exact location of a bundle need not be known: scanning any directory
+// that contains one discovers it and switches only that subtree to
+// originals-only mode; loose images elsewhere in the tree scan normally.
+func TestScanDiscoversNestedPhotosLibrary(t *testing.T) {
+	search := t.TempDir()
+	bundle := filepath.Join(search, "winter", "Photos Library.photoslibrary")
+	write(t, filepath.Join(bundle, "originals", "D", "master.jpg"), jpegBytes())
+	write(t, filepath.Join(bundle, "resources", "derivatives", "thumb.jpg"), jpegBytes())
+	jpeg := jpegBytes()
+	jpeg[3] = 0x2C // loose photo, distinct content
+	write(t, filepath.Join(search, "loose.jpg"), jpeg)
+	s, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := Scan(s, Options{Dirs: []string{search}, Workers: 1}, fakeHasher("jpeg")); err != nil {
+		t.Fatal(err)
+	}
+	images, _ := s.AllImages()
+	if len(images) != 2 {
+		t.Fatalf("images = %d, want 2 (loose + bundle originals only)", len(images))
+	}
+	for _, im := range images {
+		switch im.RelPath {
+		case "loose.jpg", filepath.Join("winter", "Photos Library.photoslibrary", "originals", "D", "master.jpg"):
+		default:
+			t.Errorf("unexpected rel path %q", im.RelPath)
+		}
+	}
+}
+
+// A bundle without originals/ is an error rather than a silent scan of
+// thumbnails; --photoslibrary-all (PhotosLibraryAll) scans it as-is.
+func TestScanPhotosLibraryRequiresOriginals(t *testing.T) {
+	bundle := filepath.Join(t.TempDir(), "Empty.photoslibrary")
+	write(t, filepath.Join(bundle, "resources", "thumb.jpg"), jpegBytes())
+	s, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if _, err := Scan(s, Options{Dirs: []string{bundle}, Workers: 1}, fakeHasher("jpeg")); err == nil ||
+		!strings.Contains(err.Error(), "originals") {
+		t.Fatalf("Scan error = %v, want one mentioning originals/", err)
+	}
+	s2, err := store.Open(":memory:") // fresh store: the failed scan registered the source
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	if _, err := Scan(s2, Options{Dirs: []string{bundle}, Workers: 1, PhotosLibraryAll: true}, fakeHasher("jpeg")); err != nil {
+		t.Fatal(err)
+	}
+	images, _ := s2.AllImages()
+	if len(images) != 1 {
+		t.Fatalf("images = %d, want 1 (whole-bundle scan)", len(images))
+	}
 }

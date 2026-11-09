@@ -66,7 +66,7 @@ const usageText = `plr - photo library repair
 
 Usage:
   plr scan     --dir DIR... [--force] [--db PATH] [--workers N] [--min-size-kb N]
-               [--phash-alg ALG] [--phash-size 8|16|32]
+               [--photoslibrary-all] [--phash-alg ALG] [--phash-size 8|16|32]
   plr group    [--max-hamming-chunking N] [--identity exif-first|pass|double-phash|vision]
                [--same-image-window DUR] [--db PATH]
   plr plan     [--ai] [--model SOURCE] [--db PATH]
@@ -85,7 +85,11 @@ Commands:
             omitted), or a Czkawka/image_hasher algorithm — mean, median,
             gradient, vert-gradient, double-gradient, blockhash.
             --phash-size 8|16|32 selects a square hash. Directories already
-            scanned are skipped unless --force is given.
+            scanned are skipped unless --force is given. A .photoslibrary
+            directory (Apple Photos bundle) anywhere in the tree is scanned
+            only inside its originals/ subdirectory, skipping the
+            thumbnails and edited derivatives under resources/;
+            --photoslibrary-all scans bundles as-is.
   group     Group images: Aggregate candidate buckets by DCT phash
             (--max-hamming-chunking), then refine with --identity.
             exif-first (the approved model, see
@@ -141,6 +145,7 @@ func runScan(args []string) int {
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	workers := fs.Int("workers", 4, "number of hash workers")
 	minSizeKB := fs.Int("min-size-kb", 0, "ignore images smaller than this many kilobytes")
+	photosLibraryAll := fs.Bool("photoslibrary-all", false, ".photoslibrary bundles (Apple Photos) anywhere in the tree: scan whole bundles instead of only originals/")
 	phashAlg := fs.String("phash-alg", "dct", "perceptual hash: dct|mean|median|gradient|vert-gradient|double-gradient|blockhash")
 	phashSize := fs.Int("phash-size", 0, "square hash size 8, 16, or 32 (0 = legacy 16x8 DCT)")
 	fs.Var(&dirs, "dir", "directory to scan (repeatable)")
@@ -166,7 +171,7 @@ func runScan(args []string) int {
 	if tool != nil {
 		defer tool.Close()
 	}
-	return runScanPhase(s, dirs, *force, *workers, *minSizeKB, tool, cfg)
+	return runScanPhase(s, dirs, *force, *workers, *minSizeKB, *photosLibraryAll, tool, cfg)
 }
 
 // parseDuration parses a duration that may also be given as bare seconds
@@ -189,13 +194,14 @@ func parsePhashConfig(alg string, size int) (phash.Config, error) {
 }
 
 // runScanPhase is the scan step, shared by "plr scan" and "plr build".
-func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB int, tool *exif.Tool, cfg phash.Config) int {
+func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB int, photosLibraryAll bool, tool *exif.Tool, cfg phash.Config) int {
 	hasher := fingerprint.Hasher(cfg, tool)
 	rep, err := ingest.Scan(s, ingest.Options{
-		Dirs:    dirs,
-		Force:   force,
-		Workers: workers,
-		MinSize: int64(minSizeKB) * 1024,
+		Dirs:             dirs,
+		Force:            force,
+		Workers:          workers,
+		MinSize:          int64(minSizeKB) * 1024,
+		PhotosLibraryAll: photosLibraryAll,
 	}, hasher)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr scan:", err)
@@ -644,6 +650,7 @@ func runPipeline(cmd string, args []string) int {
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	workers := fs.Int("workers", 4, "number of hash workers")
 	minSizeKB := fs.Int("min-size-kb", 0, "ignore images smaller than this many kilobytes")
+	photosLibraryAll := fs.Bool("photoslibrary-all", false, ".photoslibrary bundles (Apple Photos) anywhere in the tree: scan whole bundles instead of only originals/")
 	phashAlg := fs.String("phash-alg", "dct", "candidate perceptual hash (default dct)")
 	phashSize := fs.Int("phash-size", 0, "square DCT size 8, 16, or 32 (0 = legacy 16x8 DCT)")
 	fs.Var(&dirs, "dir", "directory to scan (repeatable)")
@@ -692,7 +699,7 @@ func runPipeline(cmd string, args []string) int {
 		label string
 		fn    func() int
 	}{
-		{"scan", func() int { return runScanPhase(s, dirs, *force, *workers, *minSizeKB, tool, cfg) }},
+		{"scan", func() int { return runScanPhase(s, dirs, *force, *workers, *minSizeKB, *photosLibraryAll, tool, cfg) }},
 		{"group", func() int {
 			opts := groupPhaseOpts{
 				MaxHamming: *maxHamming,
