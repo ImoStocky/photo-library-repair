@@ -33,9 +33,12 @@ package group
 import (
 	"math"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"photo-library-repair/internal/phash"
@@ -129,23 +132,7 @@ type Resolver interface {
 // images in one library are assumed to share the same hash length.
 func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 	n := len(imgs)
-	parent := make([]int, n)
-	for i := range parent {
-		parent[i] = i
-	}
-	find := func(x int) int {
-		for parent[x] != x {
-			parent[x] = parent[parent[x]]
-			x = parent[x]
-		}
-		return x
-	}
-	union := func(a, b int) {
-		ra, rb := find(a), find(b)
-		if ra != rb {
-			parent[rb] = ra
-		}
-	}
+	uf := newUnionFind(n)
 
 	// Identical sha256 always groups.
 	bySha := map[string]int{}
@@ -154,7 +141,7 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 			continue
 		}
 		if first, ok := bySha[im.SHA256]; ok {
-			union(first, i)
+			uf.union(first, i)
 		} else {
 			bySha[im.SHA256] = i
 		}
@@ -167,19 +154,19 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 			continue
 		}
 		if first, ok := byPhash[im.Phash]; ok {
-			union(first, i)
+			uf.union(first, i)
 		} else {
 			byPhash[im.Phash] = i
 		}
 	}
 
-	var hashes []phash.Hash
+	hashes := make([]phash.Hash, 0, n)
 	bitLen := 0
 	for _, im := range imgs {
 		h, _ := phash.HashFromHex(im.Phash) // "" fails; hash stays nil
 		hashes = append(hashes, h)
-		if n := h.BitLen(); n > bitLen {
-			bitLen = n
+		if bl := h.BitLen(); bl > bitLen {
+			bitLen = bl
 		}
 	}
 	if maxHamming >= 0 && n > 1 && bitLen > 0 {
@@ -200,56 +187,59 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 				buckets[key] = append(buckets[key], i)
 			}
 		}
-		seen := map[int64]bool{}
+		// Hamming is pure: workers emit edges per bucket, caller unions
+		// serially. Same pair may appear in several bands — duplicate
+		// unions are fine, so no cross-band seen map.
+		bucketList := make([][]int, 0, len(buckets))
 		for _, idxs := range buckets {
-			for a := range idxs {
-				for c := a + 1; c < len(idxs); c++ {
-					i, j := idxs[a], idxs[c]
-					if i > j {
-						i, j = j, i
+			if len(idxs) >= 2 {
+				bucketList = append(bucketList, idxs)
+			}
+		}
+		if len(bucketList) > 0 {
+			type edge struct{ i, j int }
+			edges := make([][]edge, len(bucketList))
+			workers := min(runtime.GOMAXPROCS(0), len(bucketList))
+			var next atomic.Int64
+			var wg sync.WaitGroup
+			wg.Add(workers)
+			for range workers {
+				go func() {
+					defer wg.Done()
+					for {
+						k := int(next.Add(1) - 1)
+						if k >= len(bucketList) {
+							return
+						}
+						idxs := bucketList[k]
+						var local []edge
+						for a := range idxs {
+							for c := a + 1; c < len(idxs); c++ {
+								i, j := idxs[a], idxs[c]
+								if hashes[i].Hamming(hashes[j]) <= maxHamming {
+									local = append(local, edge{i, j})
+								}
+							}
+						}
+						edges[k] = local
 					}
-					pair := int64(i)*int64(n) + int64(j)
-					if seen[pair] {
-						continue
-					}
-					seen[pair] = true
-					if hashes[i].Hamming(hashes[j]) <= maxHamming {
-						union(i, j)
-					}
+				}()
+			}
+			wg.Wait()
+			for _, es := range edges {
+				for _, e := range es {
+					uf.union(e.i, e.j)
 				}
 			}
 		}
 	}
 
-	firstSeen := map[int]int{} // root -> index of first member
-	for i := range n {
-		r := find(i)
-		if _, ok := firstSeen[r]; !ok {
-			firstSeen[r] = i
-		}
-	}
-	roots := make([]int, 0, len(firstSeen))
-	for r := range firstSeen {
-		roots = append(roots, r)
-	}
-	// Stable group ids: order roots by the first member's position.
-	for i := 1; i < len(roots); i++ {
-		for j := i; j > 0 && firstSeen[roots[j-1]] > firstSeen[roots[j]]; j-- {
-			roots[j-1], roots[j] = roots[j], roots[j-1]
-		}
-	}
-
+	groups := uf.groups(imgs)
 	assign := make(map[string]int64, n)
-	groups := make([][]Image, 0, len(roots))
-	for gid, r := range roots {
-		members := []Image{}
-		for i := range n {
-			if find(i) == r {
-				members = append(members, imgs[i])
-				assign[imgs[i].ID] = int64(gid + 1)
-			}
+	for gid, members := range groups {
+		for _, im := range members {
+			assign[im.ID] = int64(gid + 1)
 		}
-		groups = append(groups, members)
 	}
 	return assign, groups
 }

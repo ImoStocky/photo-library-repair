@@ -473,3 +473,31 @@ func TestAggregateBandingMatchesBruteForce(t *testing.T) {
 		}
 	}
 }
+
+// Parallel bucket workers must not change membership across runs.
+func TestAggregateParallelDeterministic(t *testing.T) {
+	rng := rand.New(rand.NewPCG(3, 7))
+	imgs := make([]Image, 400)
+	for i := range imgs {
+		h := make([]byte, 16)
+		binary.BigEndian.PutUint64(h[:8], rng.Uint64())
+		binary.BigEndian.PutUint64(h[8:], rng.Uint64())
+		imgs[i] = Image{
+			ID: fmt.Sprintf("i%03d", i), Name: fmt.Sprintf("i%03d.jpg", i),
+			Phash: hex.EncodeToString(h), SHA256: fmt.Sprintf("sha-%d", i),
+			CreatedAt: int64(i), Width: 1, Height: 1, Size: 1,
+		}
+	}
+	var first map[string][]string
+	for round := range 8 {
+		_, groups := Aggregate(imgs, 8)
+		got := memberSets(groups)
+		if round == 0 {
+			first = got
+			continue
+		}
+		if !reflect.DeepEqual(got, first) {
+			t.Fatal("parallel Aggregate produced different membership across runs")
+		}
+	}
+}
