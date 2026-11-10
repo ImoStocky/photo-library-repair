@@ -292,11 +292,14 @@ func runGroupPhase(s *store.Store, opts groupPhaseOpts) int {
 		return 2
 	}
 	pipe := group.Pipeline{CandidateRadius: opts.MaxHamming, Identity: strat}
+	t0 := time.Now()
 	assign, groups, err := pipe.Run(toGroupImages(imgs))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr group:", err)
 		return 1
 	}
+	fmt.Fprintf(os.Stderr, "plr: group Pipeline %s (%d images)\n",
+		time.Since(t0).Round(time.Millisecond), len(imgs))
 	if err := s.SetGroupAssignments(assign); err != nil {
 		fmt.Fprintln(os.Stderr, "plr group:", err)
 		return 1
@@ -344,8 +347,12 @@ func runIncrementGroupPhase(s *store.Store, opts groupPhaseOpts, before map[stri
 		// Nothing grouped yet (fresh or never-grouped library): build.
 		return runGroupPhase(s, opts)
 	}
+	tAgg := time.Now()
 	_, comps := group.Aggregate(incoming, opts.MaxHamming)
+	fmt.Fprintf(os.Stderr, "plr: increment Aggregate %s (%d incoming)\n",
+		time.Since(tAgg).Round(time.Millisecond), len(incoming))
 	comps = group.SweepCandidates(strat, comps)
+	tRef := time.Now()
 	refined := make([][]group.Image, 0, len(comps))
 	for _, c := range comps {
 		parts, err := strat.Refine(c)
@@ -355,7 +362,14 @@ func runIncrementGroupPhase(s *store.Store, opts groupPhaseOpts, before map[stri
 		}
 		refined = append(refined, parts...)
 	}
-	present, matched, unmatched := group.Partition(refined, lib, opts.MaxHamming, sameGate(strat))
+	fmt.Fprintf(os.Stderr, "plr: increment Refine %s (%d components)\n",
+		time.Since(tRef).Round(time.Millisecond), len(comps))
+	var pstats group.PartitionStats
+	tPart := time.Now()
+	present, matched, unmatched := group.PartitionWithStats(refined, lib, opts.MaxHamming, sameGate(strat), &pstats)
+	fmt.Fprintf(os.Stderr, "plr: increment Partition %s (incoming=%d sha_hits=%d candidates=%d same_calls=%d lib=%d)\n",
+		time.Since(tPart).Round(time.Millisecond),
+		pstats.Incoming, pstats.SHAHits, pstats.Candidates, pstats.SameCalls, pstats.LibMembers)
 	assign := make(map[string]int64, len(incoming))
 	ambiguous := 0
 	for _, p := range present {
@@ -750,10 +764,12 @@ func runPipeline(cmd string, args []string) int {
 	}
 	for _, p := range phases {
 		fmt.Printf("== %s\n", p.label)
+		start := time.Now()
 		if code := p.fn(); code != 0 {
 			fmt.Fprintf(os.Stderr, "plr %s: %s phase failed\n", cmd, p.label)
 			return code
 		}
+		fmt.Fprintf(os.Stderr, "plr: %s phase %s\n", p.label, time.Since(start).Round(time.Millisecond))
 	}
 	return 0
 }

@@ -69,6 +69,11 @@ func Partition(components [][]Image, lib []LibMember, maxHamming int, same SameF
 	return partition(components, lib, maxHamming, same, nil)
 }
 
+// PartitionWithStats is Partition, also filling stats when non-nil.
+func PartitionWithStats(components [][]Image, lib []LibMember, maxHamming int, same SameFunc, stats *PartitionStats) (present, matched []Match, unmatched [][]Image) {
+	return partition(components, lib, maxHamming, same, stats)
+}
+
 const partitionParallelMin = 64
 
 func partition(components [][]Image, lib []LibMember, maxHamming int, same SameFunc, stats *PartitionStats) (present, matched []Match, unmatched [][]Image) {
