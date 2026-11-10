@@ -335,12 +335,17 @@ func runIncrementGroupPhase(s *store.Store, opts groupPhaseOpts, before map[stri
 	var lib []group.LibMember
 	var incoming []group.Image
 	for _, im := range imgs {
-		if before[im.ID] {
-			if im.GroupID != 0 {
-				lib = append(lib, group.LibMember{Image: toGroupImage(im), GroupID: im.GroupID})
-			}
-		} else {
+		switch {
+		case !before[im.ID]:
+			// Added by this scan.
 			incoming = append(incoming, toGroupImage(im))
+		case im.GroupID == 0:
+			// Already in the library but never grouped (e.g. a prior
+			// increment crashed after scan). Treat as incoming so a
+			// retry finishes the merge instead of dropping them.
+			incoming = append(incoming, toGroupImage(im))
+		default:
+			lib = append(lib, group.LibMember{Image: toGroupImage(im), GroupID: im.GroupID})
 		}
 	}
 	if len(lib) == 0 {
