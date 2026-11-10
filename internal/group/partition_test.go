@@ -109,6 +109,48 @@ func TestPartitionUnhashableStaysUnmatched(t *testing.T) {
 	}
 }
 
+func TestPartitionParallelMatchesSerial(t *testing.T) {
+	lib := []LibMember{libm(1, "aaa", hZero, 100, 100)}
+	var comps [][]Image
+	for i := 0; i < partitionParallelMin+8; i++ {
+		sha := "n" + string(rune('a'+i%26)) + string(rune('0'+i/26))
+		ph := hOne
+		if i%5 == 0 {
+			ph = hFar
+		}
+		comps = append(comps, []Image{{
+			ID: sha, SHA256: sha, Phash: ph, Width: 100, Height: 100,
+		}})
+	}
+	// Force both paths via the unexported helpers.
+	idx := buildLibIndex(lib, 12)
+	var serialPresent, serialMatched []Match
+	var serialUnmatched [][]Image
+	for _, comp := range comps {
+		var rest []Image
+		for _, im := range comp {
+			m, kind := classifyIndexed(im, parsePhash(im.Phash), idx, 12, nil, nil)
+			switch kind {
+			case classPresent:
+				serialPresent = append(serialPresent, m)
+			case classMatched:
+				serialMatched = append(serialMatched, m)
+			default:
+				rest = append(rest, im)
+			}
+		}
+		if len(rest) > 0 {
+			serialUnmatched = append(serialUnmatched, rest)
+		}
+	}
+	pPresent, pMatched, pUnmatched := partitionParallel(comps, idx, 12, nil, nil)
+	if len(pPresent) != len(serialPresent) || len(pMatched) != len(serialMatched) || len(pUnmatched) != len(serialUnmatched) {
+		t.Fatalf("parallel present=%d matched=%d unmatched=%d; serial %d/%d/%d",
+			len(pPresent), len(pMatched), len(pUnmatched),
+			len(serialPresent), len(serialMatched), len(serialUnmatched))
+	}
+}
+
 func TestPartitionSHAShortCircuitSkipsGate(t *testing.T) {
 	lib := make([]LibMember, 0, 64)
 	lib = append(lib, libm(1, "hit", hZero, 100, 100))

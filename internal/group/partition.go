@@ -1,6 +1,10 @@
 package group
 
 import (
+	"runtime"
+	"sync"
+	"sync/atomic"
+
 	"photo-library-repair/internal/phash"
 )
 
@@ -65,10 +69,19 @@ func Partition(components [][]Image, lib []LibMember, maxHamming int, same SameF
 	return partition(components, lib, maxHamming, same, nil)
 }
 
+const partitionParallelMin = 64
+
 func partition(components [][]Image, lib []LibMember, maxHamming int, same SameFunc, stats *PartitionStats) (present, matched []Match, unmatched [][]Image) {
 	idx := buildLibIndex(lib, maxHamming)
 	if stats != nil {
 		stats.LibMembers = len(lib)
+	}
+	nImg := 0
+	for _, c := range components {
+		nImg += len(c)
+	}
+	if nImg >= partitionParallelMin {
+		return partitionParallel(components, idx, maxHamming, same, stats)
 	}
 	for _, comp := range components {
 		var rest []Image
@@ -84,6 +97,74 @@ func partition(components [][]Image, lib []LibMember, maxHamming int, same SameF
 				rest = append(rest, im)
 			}
 		}
+		if len(rest) > 0 {
+			unmatched = append(unmatched, rest)
+		}
+	}
+	return present, matched, unmatched
+}
+
+func partitionParallel(components [][]Image, idx *libIndex, maxHamming int, same SameFunc, stats *PartitionStats) (present, matched []Match, unmatched [][]Image) {
+	type item struct {
+		comp int
+		im   Image
+	}
+	items := make([]item, 0, 256)
+	for ci, comp := range components {
+		for _, im := range comp {
+			items = append(items, item{ci, im})
+		}
+	}
+	type result struct {
+		kind int
+		m    Match
+		comp int
+		im   Image
+	}
+	results := make([]result, len(items))
+	workers := min(runtime.GOMAXPROCS(0), len(items))
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	var statsMu sync.Mutex
+	wg.Add(workers)
+	for range workers {
+		go func() {
+			defer wg.Done()
+			var local PartitionStats
+			for {
+				k := int(next.Add(1) - 1)
+				if k >= len(items) {
+					break
+				}
+				h := parsePhash(items[k].im.Phash)
+				m, kind := classifyIndexed(items[k].im, h, idx, maxHamming, same, &local)
+				results[k] = result{kind: kind, m: m, comp: items[k].comp, im: items[k].im}
+			}
+			if stats != nil {
+				statsMu.Lock()
+				stats.Incoming += local.Incoming
+				stats.SHAHits += local.SHAHits
+				stats.Candidates += local.Candidates
+				stats.SameCalls += local.SameCalls
+				stats.BandLookups += local.BandLookups
+				statsMu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+
+	restByComp := make([][]Image, len(components))
+	for _, r := range results {
+		switch r.kind {
+		case classPresent:
+			present = append(present, r.m)
+		case classMatched:
+			matched = append(matched, r.m)
+		default:
+			restByComp[r.comp] = append(restByComp[r.comp], r.im)
+		}
+	}
+	for _, rest := range restByComp {
 		if len(rest) > 0 {
 			unmatched = append(unmatched, rest)
 		}

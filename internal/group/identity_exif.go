@@ -1,6 +1,9 @@
 package group
 
 import (
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"photo-library-repair/internal/phash"
@@ -131,16 +134,63 @@ func (e ExifFirst) Refine(candidates []Image) ([][]Image, error) {
 		}
 		hashes[i] = d
 	}
-	uf := newUnionFind(n)
 	win, blockR, gradR := e.winSecs(), e.blockR(), e.gradR()
-	for i := range n {
-		for j := i + 1; j < n; j++ {
-			if sameImagePair(candidates[i], candidates[j], hashes[i], hashes[j], win, blockR, gradR) {
-				uf.union(i, j)
+	uf := newUnionFind(n)
+	if n >= refineParallelMin {
+		unionEdges(uf, parallelSameEdges(candidates, hashes, win, blockR, gradR))
+	} else {
+		for i := range n {
+			for j := i + 1; j < n; j++ {
+				if sameImagePair(candidates[i], candidates[j], hashes[i], hashes[j], win, blockR, gradR) {
+					uf.union(i, j)
+				}
 			}
 		}
 	}
 	return uf.groups(candidates), nil
+}
+
+const refineParallelMin = 48
+
+type pairEdge struct{ i, j int }
+
+func parallelSameEdges(candidates []Image, hashes []dual, winSecs int64, blockR, gradR int) []pairEdge {
+	n := len(candidates)
+	workers := min(runtime.GOMAXPROCS(0), n)
+	edges := make([][]pairEdge, workers)
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for w := range workers {
+		go func(w int) {
+			defer wg.Done()
+			var local []pairEdge
+			for {
+				i := int(next.Add(1) - 1)
+				if i >= n {
+					break
+				}
+				for j := i + 1; j < n; j++ {
+					if sameImagePair(candidates[i], candidates[j], hashes[i], hashes[j], winSecs, blockR, gradR) {
+						local = append(local, pairEdge{i, j})
+					}
+				}
+			}
+			edges[w] = local
+		}(w)
+	}
+	wg.Wait()
+	var all []pairEdge
+	for _, es := range edges {
+		all = append(all, es...)
+	}
+	return all
+}
+
+func unionEdges(uf *unionFind, edges []pairEdge) {
+	for _, e := range edges {
+		uf.union(e.i, e.j)
+	}
 }
 
 // SameFunc returns the pair rule for the incremental merge (Partition):

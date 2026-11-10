@@ -1,6 +1,10 @@
 package group
 
 import (
+	"runtime"
+	"sync"
+	"sync/atomic"
+
 	"photo-library-repair/internal/phash"
 )
 
@@ -61,21 +65,51 @@ func (d DoublePhash) Refine(candidates []Image) ([][]Image, error) {
 	}
 
 	uf := newUnionFind(n)
-	for i := range n {
-		for j := i + 1; j < n; j++ {
-			if candidates[i].SHA256 != "" && candidates[i].SHA256 == candidates[j].SHA256 {
-				uf.union(i, j)
-				continue
-			}
-			a, b := hashes[i], hashes[j]
-			if !a.okBlock || !b.okBlock || !a.okGrad || !b.okGrad {
-				continue
-			}
-			// Min-rotation distances tolerate 90° re-saves and other
-			// sizes (slack constants documented in identity_exif.go).
-			if phash.MinRotDistanceRots(a.block, b.blockRots) <= blockR+slackBlockhash &&
-				phash.MinRotDistanceRots(a.grad, b.gradRots) <= gradR+slackGradient {
-				uf.union(i, j)
+	pairOK := func(i, j int) bool {
+		if candidates[i].SHA256 != "" && candidates[i].SHA256 == candidates[j].SHA256 {
+			return true
+		}
+		a, b := hashes[i], hashes[j]
+		if !a.okBlock || !b.okBlock || !a.okGrad || !b.okGrad {
+			return false
+		}
+		return phash.MinRotDistanceRots(a.block, b.blockRots) <= blockR+slackBlockhash &&
+			phash.MinRotDistanceRots(a.grad, b.gradRots) <= gradR+slackGradient
+	}
+	if n >= refineParallelMin {
+		workers := min(runtime.GOMAXPROCS(0), n)
+		edges := make([][]pairEdge, workers)
+		var next atomic.Int64
+		var wg sync.WaitGroup
+		wg.Add(workers)
+		for w := range workers {
+			go func(w int) {
+				defer wg.Done()
+				var local []pairEdge
+				for {
+					i := int(next.Add(1) - 1)
+					if i >= n {
+						break
+					}
+					for j := i + 1; j < n; j++ {
+						if pairOK(i, j) {
+							local = append(local, pairEdge{i, j})
+						}
+					}
+				}
+				edges[w] = local
+			}(w)
+		}
+		wg.Wait()
+		for _, es := range edges {
+			unionEdges(uf, es)
+		}
+	} else {
+		for i := range n {
+			for j := i + 1; j < n; j++ {
+				if pairOK(i, j) {
+					uf.union(i, j)
+				}
 			}
 		}
 	}
