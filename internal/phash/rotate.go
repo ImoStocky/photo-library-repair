@@ -51,8 +51,18 @@ func Rotations(h Hash, alg Alg) []Hash {
 // rotation of b under alg (a and b lie in the same orientation space).
 // Hashes of different lengths are maximally different, as in Hamming.
 func MinRotDistance(a, b Hash, alg Alg) int {
-	best := a.Hamming(b)
-	for _, r := range Rotations(b, alg)[1:] {
+	return MinRotDistanceRots(a, Rotations(b, alg))
+}
+
+// MinRotDistanceRots is the smallest Hamming distance between a and any
+// hash in rots (typically the result of Rotations). Callers that reuse the
+// same b across many comparisons should precompute Rotations(b) once.
+func MinRotDistanceRots(a Hash, rots []Hash) int {
+	if len(rots) == 0 {
+		return a.BitLen() + 1
+	}
+	best := a.Hamming(rots[0])
+	for _, r := range rots[1:] {
 		if d := a.Hamming(r); d < best {
 			best = d
 		}
@@ -62,7 +72,8 @@ func MinRotDistance(a, b Hash, alg Alg) int {
 
 // rotChain applies one step successively: [h, s(h), s(s(h)), s(s(s(h)))].
 func rotChain(h Hash, step func(Hash) Hash) []Hash {
-	out := []Hash{h}
+	out := make([]Hash, 0, 4)
+	out = append(out, h)
 	for range 3 {
 		out = append(out, step(out[len(out)-1]))
 	}

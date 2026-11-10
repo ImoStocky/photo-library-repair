@@ -36,9 +36,10 @@ func (d DoublePhash) Refine(candidates []Image) ([][]Image, error) {
 	}
 
 	type pair struct {
-		block, grad phash.Hash
-		okBlock     bool
-		okGrad      bool
+		block, grad         phash.Hash
+		blockRots, gradRots []phash.Hash
+		okBlock             bool
+		okGrad              bool
 	}
 	hashes := make([]pair, n)
 	for i, im := range candidates {
@@ -49,11 +50,13 @@ func (d DoublePhash) Refine(candidates []Image) ([][]Image, error) {
 			return nil, err
 		} else if ok {
 			hashes[i].block, hashes[i].okBlock = h, true
+			hashes[i].blockRots = phash.Rotations(h, phash.AlgBlockhash)
 		}
 		if h, ok, err := d.Lookup.Phash(im.SHA256, phash.AlgDoubleGradient, phash.Size16); err != nil {
 			return nil, err
 		} else if ok {
 			hashes[i].grad, hashes[i].okGrad = h, true
+			hashes[i].gradRots = phash.Rotations(h, phash.AlgDoubleGradient)
 		}
 	}
 
@@ -70,8 +73,8 @@ func (d DoublePhash) Refine(candidates []Image) ([][]Image, error) {
 			}
 			// Min-rotation distances tolerate 90° re-saves and other
 			// sizes (slack constants documented in identity_exif.go).
-			if phash.MinRotDistance(a.block, b.block, phash.AlgBlockhash) <= blockR+slackBlockhash &&
-				phash.MinRotDistance(a.grad, b.grad, phash.AlgDoubleGradient) <= gradR+slackGradient {
+			if phash.MinRotDistanceRots(a.block, b.blockRots) <= blockR+slackBlockhash &&
+				phash.MinRotDistanceRots(a.grad, b.gradRots) <= gradR+slackGradient {
 				uf.union(i, j)
 			}
 		}

@@ -83,11 +83,14 @@ func (e ExifFirst) SweepWindow() time.Duration {
 	return w
 }
 
-// dual holds the two 16×16 secondary hashes of one picture.
+// dual holds the two 16×16 secondary hashes of one picture, plus their
+// precomputed bit-layout rotations so MinRotDistance does not reallocate
+// rotBlockhash90 / rotDoubleGradient90 on every pair.
 type dual struct {
-	block, grad phash.Hash
-	okBlock     bool
-	okGrad      bool
+	block, grad         phash.Hash
+	blockRots, gradRots []phash.Hash
+	okBlock             bool
+	okGrad              bool
 }
 
 func (e ExifFirst) load(sha256 string) (dual, error) {
@@ -99,11 +102,13 @@ func (e ExifFirst) load(sha256 string) (dual, error) {
 		return d, err
 	} else if ok {
 		d.block, d.okBlock = h, true
+		d.blockRots = phash.Rotations(h, phash.AlgBlockhash)
 	}
 	if h, ok, err := e.Lookup.Phash(sha256, phash.AlgDoubleGradient, phash.Size16); err != nil {
 		return d, err
 	} else if ok {
 		d.grad, d.okGrad = h, true
+		d.gradRots = phash.Rotations(h, phash.AlgDoubleGradient)
 	}
 	return d, nil
 }
@@ -172,8 +177,8 @@ func sameImagePair(a, b Image, da, db dual, winSecs int64, blockR, gradR int) bo
 	// resolution changes; unrelated pictures stay far outside even the
 	// slackened gradient radius.
 	if !(da.okBlock && db.okBlock && da.okGrad && db.okGrad &&
-		phash.MinRotDistance(da.block, db.block, phash.AlgBlockhash) <= blockR+slackBlockhash &&
-		phash.MinRotDistance(da.grad, db.grad, phash.AlgDoubleGradient) <= gradR+slackGradient) {
+		phash.MinRotDistanceRots(da.block, db.blockRots) <= blockR+slackBlockhash &&
+		phash.MinRotDistanceRots(da.grad, db.gradRots) <= gradR+slackGradient) {
 		return false
 	}
 	// EXIF then vetoes what the hashes joined: two recorded cameras firing
