@@ -108,3 +108,52 @@ func TestPartitionUnhashableStaysUnmatched(t *testing.T) {
 		t.Fatalf("present=%d matched=%d unmatched=%d", len(present), len(matched), len(unmatched))
 	}
 }
+
+func TestPartitionSHAShortCircuitSkipsGate(t *testing.T) {
+	lib := make([]LibMember, 0, 64)
+	lib = append(lib, libm(1, "hit", hZero, 100, 100))
+	for i := 2; i < 64; i++ {
+		// Far hashes fill the library; a naive scan would call the gate
+		// on each. sha256 must short-circuit without invoking same.
+		lib = append(lib, libm(int64(i), "x"+hFar, hFar, 100, 100))
+	}
+	calls := 0
+	same := func(a, b Image) bool {
+		calls++
+		return true
+	}
+	comps := [][]Image{{
+		{ID: "n1", SHA256: "hit", Phash: hFar, Width: 50, Height: 50},
+	}}
+	present, matched, unmatched := Partition(comps, lib, 12, same)
+	if len(present) != 1 || present[0].GroupID != 1 || len(matched) != 0 || len(unmatched) != 0 {
+		t.Fatalf("present=%v matched=%v unmatched=%v", present, matched, unmatched)
+	}
+	if calls != 0 {
+		t.Fatalf("SameFunc calls = %d, want 0 on sha256 present", calls)
+	}
+}
+
+func TestPartitionSameGateOnlyOnBandCandidates(t *testing.T) {
+	lib := []LibMember{
+		libm(1, "near", hZero, 100, 100),
+		libm(2, "far", hFar, 100, 100),
+	}
+	var seen []string
+	same := func(a, b Image) bool {
+		seen = append(seen, b.SHA256)
+		return true
+	}
+	comps := [][]Image{{
+		{ID: "n1", SHA256: "in", Phash: hOne, Width: 100, Height: 100},
+	}}
+	_, matched, _ := Partition(comps, lib, 12, same)
+	if len(matched) != 1 || matched[0].GroupID != 1 {
+		t.Fatalf("matched=%v", matched)
+	}
+	for _, sha := range seen {
+		if sha == "far" {
+			t.Fatalf("SameFunc must not run on primary-far library members: %v", seen)
+		}
+	}
+}
