@@ -74,6 +74,40 @@ func TestScanBirthGuessIsEarliestOfBornAndMod(t *testing.T) {
 	}
 }
 
+// Two byte-identical files in the same scan: the first is recorded and
+// joins the known-sha256 index; the second is pruned without fingerprinting.
+func TestScanPrunesDuplicateWithinSameWalk(t *testing.T) {
+	root := t.TempDir()
+	write(t, filepath.Join(root, "a.jpg"), jpegBytes())
+	write(t, filepath.Join(root, "copy", "a.jpg"), jpegBytes())
+
+	hashed := &atomic.Int64{}
+	inner := fakeHasher("jpeg")
+	hash := func(path, kind string) (fingerprint.Info, error) {
+		hashed.Add(1)
+		return inner(path, kind)
+	}
+	s, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	rep, err := Scan(s, Options{Dirs: []string{root}, Workers: 1}, hash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.ImagesAdded != 1 || rep.ImagesSkipped != 1 {
+		t.Fatalf("same-walk: added=%d skipped=%d, want 1/1", rep.ImagesAdded, rep.ImagesSkipped)
+	}
+	if got := hashed.Load(); got != 1 {
+		t.Fatalf("hasher calls = %d, want 1 (second copy must not fingerprint)", got)
+	}
+	images, _ := s.AllImages()
+	if len(images) != 1 {
+		t.Fatalf("images = %d, want 1", len(images))
+	}
+}
+
 // A byte-identical copy arriving at a new path is already-processed
 // content: the scan neither records it nor spends a hash on it.
 func TestScanSkipsKnownContent(t *testing.T) {
@@ -244,8 +278,10 @@ func TestScanForceReusesUnchangedFingerprints(t *testing.T) {
 
 func TestScanNestedDirsDedupeByInode(t *testing.T) {
 	root := t.TempDir()
+	// Distinct content so sha256-pruning is not what collapses the pair;
+	// the nested source must be stopped by the shared inode set instead.
 	write(t, filepath.Join(root, "a.jpg"), jpegBytes())
-	write(t, filepath.Join(root, "sub", "b.jpg"), jpegBytes())
+	write(t, filepath.Join(root, "sub", "b.jpg"), append(jpegBytes(), 0x01))
 	// A nested source pointing at the same tree must not double-record.
 	s, err := store.Open(":memory:")
 	if err != nil {
@@ -261,6 +297,10 @@ func TestScanNestedDirsDedupeByInode(t *testing.T) {
 	}
 	if rep.ImagesAdded != 2 {
 		t.Fatalf("nested scan added %d images, want 2 (report %+v)", rep.ImagesAdded, rep)
+	}
+	images, _ := s.AllImages()
+	if len(images) != 2 {
+		t.Fatalf("images = %d, want 2", len(images))
 	}
 }
 

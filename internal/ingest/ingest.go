@@ -143,8 +143,10 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 			}
 		}
 
-		// sha256 identifies processed content: files whose sha256 is in
-		// this snapshot join no new row. The snapshot is per source dir.
+		// sha256 identifies processed content: a file whose digest is
+		// already known is not recorded and not fingerprinted. The set
+		// starts from the library and grows as this scan adds new
+		// digests, so later copies in the same walk are pruned too.
 		known, err := s.KnownSHA256s()
 		if err != nil {
 			return rep, fmt.Errorf("scan %q: %w", dir, err)
@@ -300,16 +302,24 @@ func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time
 					mu.Unlock()
 					continue
 				}
-				// Content already in the library: this file counts as
-				// processed and is not recorded. A path that already has
-				// its own row still refreshes normally (changed content).
-				if sum != "" && known[sum] {
-					if _, hadRow := facts[j.relPath]; !hadRow {
-						mu.Lock()
-						rep.ImagesSkipped++
-						mu.Unlock()
-						continue
+				// Content already known (library or earlier in this scan):
+				// count as processed and do not fingerprint. A path that
+				// already has its own row still refreshes (changed content).
+				_, hadRow := facts[j.relPath]
+				if sum != "" {
+					mu.Lock()
+					if known[sum] {
+						if !hadRow {
+							rep.ImagesSkipped++
+							mu.Unlock()
+							continue
+						}
+					} else {
+						// Claim the digest so parallel workers and later
+						// jobs in this walk skip the expensive fingerprint.
+						known[sum] = true
 					}
+					mu.Unlock()
 				}
 				info := fingerprint.Info{Kind: j.kind}
 				if info, err = hash(j.fullPath, j.kind); err != nil {
