@@ -22,6 +22,7 @@ import (
 	"photo-library-repair/internal/ingest"
 	kronkai "photo-library-repair/internal/kronk"
 	"photo-library-repair/internal/phash"
+	"photo-library-repair/internal/progress"
 	"photo-library-repair/internal/selftest"
 	"photo-library-repair/internal/store"
 )
@@ -219,17 +220,21 @@ func parsePhashConfig(alg string, size int) (phash.Config, error) {
 // runScanPhase is the scan step, shared by "plr scan" and "plr build".
 func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB int, photosLibraryAll bool, tool *exif.Tool, cfg phash.Config) int {
 	hasher := fingerprint.Hasher(cfg, tool)
+	prog := progress.New("scan")
+	defer prog.Stop()
 	rep, err := ingest.Scan(s, ingest.Options{
 		Dirs:             dirs,
 		Force:            force,
 		Workers:          workers,
 		MinSize:          int64(minSizeKB) * 1024,
 		PhotosLibraryAll: photosLibraryAll,
+		OnProgress:       func(done, total int64) { prog.SetTotal(total); prog.Add(1) },
 	}, hasher)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr scan:", err)
 		return 1
 	}
+	prog.Stop()
 	fmt.Printf("scanned %d dir(s), skipped %d already scanned\n", rep.DirsScanned, rep.DirsSkipped)
 	fmt.Printf("files seen %d: %d added, %d updated, %d cached, %d already-known, %d non-image, %d errors\n",
 		rep.FilesSeen, rep.ImagesAdded, rep.ImagesUpdated, rep.ImagesCached, rep.ImagesSkipped, rep.NonImage, rep.Errors)
@@ -521,6 +526,9 @@ func runPlanPhase(s *store.Store, res group.Resolver) int {
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
+	prog := progress.New("plan")
+	prog.SetTotal(int64(len(ids)))
+	defer prog.Stop()
 	aiSettled := 0
 	for _, id := range ids {
 		p := group.ResolveGroup(byGroup[id], res)
@@ -548,6 +556,7 @@ func runPlanPhase(s *store.Store, res group.Resolver) int {
 			return 1
 		}
 		counts[p.Status]++
+		prog.Add(1)
 	}
 	// Re-apply the assignments: ClearGroups above zeroes images.group_id.
 	if err := s.SetGroupAssignments(assign); err != nil {
@@ -597,11 +606,15 @@ func runApply(args []string) int {
 
 // runApplyPhase is the apply step, shared by "plr apply" and "plr build".
 func runApplyPhase(s *store.Store, opts apply.Options) int {
+	prog := progress.New("apply")
+	defer prog.Stop()
+	opts.OnProgress = func(done, total int64) { prog.SetTotal(total); prog.Add(1) }
 	rep, err := apply.Apply(s, opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr apply:", err)
 		return 1
 	}
+	prog.Stop()
 	for _, f := range rep.Files {
 		line := fmt.Sprintf("%s %s -> %s", applyVerb(f.Action, opts), f.Source, f.Dest)
 		if f.EXIF {

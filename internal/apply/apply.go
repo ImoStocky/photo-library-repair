@@ -42,6 +42,8 @@ type Options struct {
 	NoEXIF bool       // copy files without writing merged EXIF
 	Move   bool       // delete the source file once its copy is in place
 	EXIF   *exif.Tool // full-data engine; nil uses the built-in writer
+	// OnProgress reports (done, total) as each group is processed.
+	OnProgress func(done, total int64)
 }
 
 // Per-file actions reported by FileResult.Action.
@@ -345,7 +347,10 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 		return err == nil
 	}
 
-	for _, g := range groups {
+	for i, g := range groups {
+		if opts.OnProgress != nil {
+			opts.OnProgress(int64(i+1), int64(len(groups)))
+		}
 		// Conflict groups are never dropped: the plan's best-effort
 		// pixels materialize as a plain copy and the ledger records
 		// why the plan is only best effort.

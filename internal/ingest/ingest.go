@@ -40,6 +40,10 @@ type Options struct {
 	// default: only their originals/ subdirectory, skipping the thumbnails
 	// and edited derivatives under resources/ and the database files.
 	PhotosLibraryAll bool
+	// OnProgress reports (done, total) as files are processed; total is
+	// the number of files collected from the current source directory.
+	// It may be called concurrently.
+	OnProgress func(done, total int64)
 }
 
 // Report summarizes a scan.
@@ -152,7 +156,7 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 			return rep, fmt.Errorf("scan %q: %w", dir, err)
 		}
 
-		if err := hashAll(s, jobs, opts.Workers, hash, runStart, &imageSeq, rep, facts, known); err != nil {
+		if err := hashAll(s, jobs, opts.Workers, hash, runStart, &imageSeq, rep, facts, known, opts.OnProgress); err != nil {
 			return rep, fmt.Errorf("scan %q: %w", dir, err)
 		}
 	}
@@ -264,16 +268,20 @@ func collectOriginals(bundle string, add func(path string, d fs.DirEntry) error)
 // hashAll runs sha256 + fingerprint over the jobs with a worker pool and
 // upserts the results. Files whose (size, mtime) match the stored facts
 // (the cache, keyed per source) are not re-read or re-hashed.
-func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time.Time, seq *atomic.Int64, rep *Report, facts map[string]store.Image, known map[string]bool) error {
+func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time.Time, seq *atomic.Int64, rep *Report, facts map[string]store.Image, known map[string]bool, onProgress func(done, total int64)) error {
 	jobsCh := make(chan job)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	var done atomic.Int64
 	firstErr := error(nil)
 
 	for range workers {
 		wg.Go(func() {
 			for j := range jobsCh {
-				rep.FilesSeen++
+				done.Add(1)
+				if onProgress != nil {
+					onProgress(done.Load(), int64(len(jobs)))
+				}
 				if stored, ok := facts[j.relPath]; ok && stored.Size == j.size && stored.MTime == j.mtime {
 					// Unchanged since the last scan: reuse the stored
 					// sha256/phash/EXIF facts and only refresh the row.
@@ -385,6 +393,7 @@ func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time
 	}
 	close(jobsCh)
 	wg.Wait()
+	rep.FilesSeen = int(done.Load())
 	return firstErr
 }
 
