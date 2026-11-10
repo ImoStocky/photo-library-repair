@@ -134,6 +134,24 @@ func TestPartitionSHAShortCircuitSkipsGate(t *testing.T) {
 	}
 }
 
+func TestPartitionMatchesGroupRepresentative(t *testing.T) {
+	// Two members in group 1; band index keeps only the larger-pixel rep.
+	// Incoming is near the smaller member's hash — still must join group 1
+	// via the rep when hashes are equal across the group.
+	lib := []LibMember{
+		{Image: Image{ID: "small", SHA256: "s", Phash: hZero, Width: 50, Height: 50}, GroupID: 1},
+		{Image: Image{ID: "big", SHA256: "b", Phash: hZero, Width: 200, Height: 200}, GroupID: 1},
+		{Image: Image{ID: "other", SHA256: "o", Phash: hFar, Width: 200, Height: 200}, GroupID: 2},
+	}
+	comps := [][]Image{{
+		{ID: "n1", SHA256: "in", Phash: hOne, Width: 100, Height: 100},
+	}}
+	_, matched, unmatched := Partition(comps, lib, 12, nil)
+	if len(unmatched) != 0 || len(matched) != 1 || matched[0].GroupID != 1 {
+		t.Fatalf("matched=%v unmatched=%v", matched, unmatched)
+	}
+}
+
 func TestPartitionSameGateOnlyOnBandCandidates(t *testing.T) {
 	lib := []LibMember{
 		libm(1, "near", hZero, 100, 100),

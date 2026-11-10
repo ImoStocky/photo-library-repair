@@ -150,7 +150,11 @@ func buildLibIndex(lib []LibMember, maxHamming int) *libIndex {
 	if idx.width <= 0 || maxHamming < 0 {
 		return idx
 	}
-	for i, h := range idx.hashes {
+	// Band near-dupe search uses one representative per group (largest
+	// pixels) so |candidates| tracks group count, not member count.
+	// sha256 present hits still see every member via bySHA.
+	for _, i := range groupRepresentatives(lib) {
+		h := idx.hashes[i]
 		if h == nil {
 			continue
 		}
@@ -160,6 +164,37 @@ func buildLibIndex(lib []LibMember, maxHamming int) *libIndex {
 		}
 	}
 	return idx
+}
+
+// groupRepresentatives returns one lib index per GroupID: the member with
+// the largest pixel area (then stable sha256 / id ties).
+func groupRepresentatives(lib []LibMember) []int {
+	best := map[int64]int{}
+	for i, m := range lib {
+		if m.GroupID == 0 {
+			continue
+		}
+		j, ok := best[m.GroupID]
+		if !ok || betterRep(m, lib[j]) {
+			best[m.GroupID] = i
+		}
+	}
+	out := make([]int, 0, len(best))
+	for _, i := range best {
+		out = append(out, i)
+	}
+	return out
+}
+
+func betterRep(a, b LibMember) bool {
+	aa, bb := a.Width*a.Height, b.Width*b.Height
+	if aa != bb {
+		return aa > bb
+	}
+	if a.SHA256 != b.SHA256 {
+		return a.SHA256 < b.SHA256
+	}
+	return a.ID < b.ID
 }
 
 // candidates returns unique library indices that share a phash band with h
