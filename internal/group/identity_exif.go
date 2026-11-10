@@ -200,12 +200,25 @@ func unionEdges(uf *unionFind, edges []pairEdge) {
 // pair apart rather than merging on weak evidence.
 func (e ExifFirst) SameFunc() SameFunc {
 	cache := map[string]dual{}
+	var mu sync.Mutex
 	get := func(sha256 string) dual {
+		mu.Lock()
 		if d, ok := cache[sha256]; ok {
+			mu.Unlock()
 			return d
 		}
+		mu.Unlock()
+		// Load outside the lock: content_phash lookups dominate, and
+		// duplicate loads under contention are cheaper than serializing
+		// every Partition worker on I/O.
 		d, _ := e.load(sha256)
-		cache[sha256] = d
+		mu.Lock()
+		if cached, ok := cache[sha256]; ok {
+			d = cached
+		} else {
+			cache[sha256] = d
+		}
+		mu.Unlock()
 		return d
 	}
 	win, blockR, gradR := e.winSecs(), e.blockR(), e.gradR()
