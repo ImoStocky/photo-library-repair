@@ -95,6 +95,7 @@ func TestApplyCopiesJPEGWithEXIF(t *testing.T) {
 	if !f.HasGPS || f.GPSLat < 52.52 || f.GPSLon < 13.40 {
 		t.Fatalf("gps = %v %v %v", f.HasGPS, f.GPSLat, f.GPSLon)
 	}
+	assertCaptureMtime(t, out, instant)
 }
 
 func TestApplyWritesReportJSON(t *testing.T) {
@@ -302,6 +303,19 @@ func TestApplyPNGCopiedWithoutEXIF(t *testing.T) {
 	dst, _ := os.ReadFile(filepath.Join(target, "p.png"))
 	if string(src) != string(dst) {
 		t.Fatal("PNG copy must be byte-identical")
+	}
+	assertCaptureMtime(t, filepath.Join(target, "p.png"), instant)
+}
+
+func assertCaptureMtime(t *testing.T, path string, wantUnix int64) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := fi.ModTime().Unix()
+	if got != wantUnix {
+		t.Fatalf("mtime = %d (%v), want capture instant %d", got, fi.ModTime(), wantUnix)
 	}
 }
 

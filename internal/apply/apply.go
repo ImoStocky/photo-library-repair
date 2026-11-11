@@ -444,6 +444,12 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 			rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: %v", g.ID, placeErr))
 			continue
 		}
+		// Stamp FS times from the planned capture (earliest EXIF in the
+		// group, else earliest file creation). Untouched outputs are
+		// included so a re-apply backfills an existing library.
+		if err := setCaptureTimes(destPath, g.CaptureInstant); err != nil {
+			rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: set capture times: %v", g.ID, err))
+		}
 
 		// Move mode: the destination is fully in place, so the source can
 		// go. If the removal fails, both files remain — the data is safe
