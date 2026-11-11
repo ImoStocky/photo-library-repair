@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"runtime"
 	"runtime/pprof"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"photo-library-repair/internal/apply"
@@ -484,7 +486,10 @@ func runPlan(args []string) int {
 	var res group.Resolver
 	if *ai {
 		var close func()
-		res, close, err = kronkai.New(context.Background(), *modelSource)
+		// Ctrl-C cancels model download and in-flight decision calls.
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		res, close, err = kronkai.New(ctx, *modelSource)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "plr plan:", err)
 			return 1

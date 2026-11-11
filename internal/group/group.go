@@ -197,6 +197,10 @@ func Aggregate(imgs []Image, maxHamming int) (map[string]int64, [][]Image) {
 			}
 		}
 		if len(bucketList) > 0 {
+			// shortcut: a fat bucket pair-tests O(k²) on one worker, so a
+			// dump of thousands of near-identical frames in one bucket
+			// takes minutes to hours; upgrade to size-capped buckets if
+			// that shows up in the field.
 			type edge struct{ i, j int }
 			edges := make([][]edge, len(bucketList))
 			workers := min(runtime.GOMAXPROCS(0), len(bucketList))

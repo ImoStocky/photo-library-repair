@@ -112,16 +112,11 @@ func blockhashUneven(sum func(x, y int) int, b image.Rectangle, width, height in
 	return packBoolBits(blockBits(blocks, width, half)), nil
 }
 
-// pixelSum is r+g+b (0..765); fully transparent pixels count as white (765),
-// matching blockhash-python / img_hash.
-func pixelSum(img image.Image, x, y int) int {
-	return bindPixelSum(img)(x, y)
-}
-
 // bindPixelSum returns a per-image sampler matching img.At(x,y).RGBA()>>8
-// channel sums without boxing a color.Color on every pixel. JPEG-heavy
-// scans spent ~30% in YCbCr.At interface conversion; *image.YCbCr reads
-// the planes directly.
+// channel sums without boxing a color.Color on every pixel; fully
+// transparent pixels count as white (765), matching blockhash-python /
+// img_hash. JPEG-heavy scans spent ~30% in YCbCr.At interface conversion;
+// *image.YCbCr reads the planes directly.
 func bindPixelSum(img image.Image) func(x, y int) int {
 	switch m := img.(type) {
 	case *image.YCbCr:

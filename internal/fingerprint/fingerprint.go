@@ -188,6 +188,9 @@ func decode(data []byte, kind string) (image.Image, error) {
 		}
 		return img, nil
 	default:
+		// shortcut: webp/tiff have no decoder, so they are recorded
+		// unhashable and never group with re-encodes of other formats;
+		// add a CGO-free decoder dependency when that under-grouping bites.
 		return nil, errNoDecoder
 	}
 }

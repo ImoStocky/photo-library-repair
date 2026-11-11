@@ -439,7 +439,11 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 			} else {
 				placeErr = place(srcPath, destPath, writeEXIF, facts, opts.EXIF)
 				if placeErr == nil {
-					os.Remove(prevPath) // free the old name; best effort
+					// Free the old name; a leftover is reported, not fatal,
+					// the new file is already in place.
+					if err := os.Remove(prevPath); err != nil {
+						rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: remove old name %s: %v", g.ID, prev.Name, err))
+					}
 				}
 			}
 		case ActionNew:

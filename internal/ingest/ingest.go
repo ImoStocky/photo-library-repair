@@ -91,6 +91,16 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 
 	seenInodes := map[uint64]bool{} // (dev, inode) already recorded this run
 
+	// sha256 identifies processed content: a file whose digest is already
+	// known is not recorded and not fingerprinted. The set starts from the
+	// library and grows as this scan adds new digests, so later copies in
+	// the same walk are pruned too. Loaded once per scan, not per source
+	// directory.
+	known, err := s.KnownSHA256s()
+	if err != nil {
+		return rep, err
+	}
+
 	for _, dir := range opts.Dirs {
 		abs, err := filepath.Abs(dir)
 		if err != nil {
@@ -145,15 +155,6 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 			if err != nil {
 				return rep, fmt.Errorf("scan %q: %w", dir, err)
 			}
-		}
-
-		// sha256 identifies processed content: a file whose digest is
-		// already known is not recorded and not fingerprinted. The set
-		// starts from the library and grows as this scan adds new
-		// digests, so later copies in the same walk are pruned too.
-		known, err := s.KnownSHA256s()
-		if err != nil {
-			return rep, fmt.Errorf("scan %q: %w", dir, err)
 		}
 
 		if err := hashAll(s, jobs, opts.Workers, hash, runStart, &imageSeq, rep, facts, known, opts.OnProgress); err != nil {
@@ -407,8 +408,22 @@ func dropMissing(s *store.Store, sourceID int64, seen map[string]bool) error {
 	if _, err := tx.Exec(`CREATE TEMP TABLE plr_seen (rel_path TEXT PRIMARY KEY)`); err != nil {
 		return err
 	}
+	// Multi-row batches keep a 200k-file source from issuing one
+	// prepared-statement round trip per file.
+	rels := make([]string, 0, len(seen))
 	for rel := range seen {
-		if _, err := tx.Exec(`INSERT OR IGNORE INTO plr_seen (rel_path) VALUES (?)`, rel); err != nil {
+		rels = append(rels, rel)
+	}
+	const batch = 500
+	for start := 0; start < len(rels); start += batch {
+		chunk := rels[start:min(start+batch, len(rels))]
+		// One tuple per row: VALUES (?),(?),...
+		tuples := strings.Repeat("(?), ", len(chunk)-1) + "(?)"
+		args := make([]any, len(chunk))
+		for i, r := range chunk {
+			args[i] = r
+		}
+		if _, err := tx.Exec(`INSERT OR IGNORE INTO plr_seen (rel_path) VALUES `+tuples, args...); err != nil {
 			return err
 		}
 	}

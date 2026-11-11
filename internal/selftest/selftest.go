@@ -241,11 +241,11 @@ func inverted(data []byte) []byte {
 
 // checkScanAndGroup verifies that the scan records real images, counts a
 // file that only pretends to be a JPEG as non-image, that the group phase
-// chains the exact copy and the quality re-encoding into one group while an
-// unrelated picture stays apart, and that a forced re-scan of unchanged
-// files reuses the stored fingerprints.
+// chains the quality re-encodings into one group while an unrelated
+// picture stays apart, and that a forced re-scan of unchanged files reuses
+// the stored fingerprints.
 func checkScanAndGroup() Check {
-	const name = "scan: records images, counts fakes, groups exact and near copies, caches unchanged re-scans, skips known content"
+	const name = "scan: records images, counts fakes, groups near copies, caches unchanged re-scans, skips known content"
 	e, err := newEnv()
 	if err != nil {
 		return Check{Name: name, Detail: err.Error()}
@@ -255,7 +255,7 @@ func checkScanAndGroup() Check {
 	base := exifJPEG(1, 95, "2024:05:01 12:30:00", "+02:00", true)
 	files := map[string][]byte{
 		"IMG_0001.jpg":       base,
-		"copy.jpg":           base, // byte-identical duplicate under a different name
+		"copy.jpg":           exifJPEG(1, 85, "2024:05:01 12:30:00", "+02:00", true), // quality re-encode under a different name
 		"IMG_0001_reenc.jpg": exifJPEG(1, 90, "2024:05:01 12:30:00", "+02:00", true),
 		"other.jpg":          inverted(base),
 		"fake.jpg":           []byte("this is not a JPEG"),
@@ -396,7 +396,7 @@ func checkCaptureRules() Check {
 // checkConflicts verifies that the remaining data-quality conflicts (GPS
 // positions beyond tolerance, a lone undecodable picture without EXIF) are
 // surfaced with a reason, while capture-time disagreements no longer conflict
-// (identity is a grouping concern, not a planning one) and exact duplicates
+// (identity is a grouping concern, not a planning one) and near-duplicates
 // with the same capture time resolve normally (bestPixels picks the winner).
 func checkConflicts() Check {
 	const name = "plan: flags GPS and undecodable conflicts; capture-time disagreement resolves"
@@ -412,7 +412,7 @@ func checkConflicts() Check {
 		"IMG_D1.jpg":  exifJPEG(5, 95, "2024:05:01 12:30:00", "+02:00", true),
 		"IMG_D2.jpg":  gpsShiftJPEG(5, 90, "2024:05:01 12:30:00", "+02:00"), // GPS beyond tolerance
 		"IMG_E1.jpg":  exifJPEG(6, 95, "2024:05:01 12:30:00", "+02:00", true),
-		"IMG_E2.jpg":  exifJPEG(6, 95, "2024:05:01 12:30:00", "+02:00", true), // byte-identical, same capture
+		"IMG_E2.jpg":  exifJPEG(6, 90, "2024:05:01 12:30:00", "+02:00", true), // re-encode, same capture
 		"orphan.webp": testimg.WebpHeader(),                                   // no decoder, no EXIF
 	}
 	for rel, data := range files {
@@ -444,7 +444,7 @@ func checkConflicts() Check {
 	}
 	dupPlan, ok := planFor(plans, members, "IMG_E1.jpg")
 	if !ok || dupPlan.Status != group.StatusResolved {
-		return Check{Name: name, Detail: fmt.Sprintf("exact-duplicate group: status %q reason %q (want resolved)", dupPlan.Status, dupPlan.Reason)}
+		return Check{Name: name, Detail: fmt.Sprintf("near-duplicate group: status %q reason %q (want resolved)", dupPlan.Status, dupPlan.Reason)}
 	}
 	orphanPlan, ok := planFor(plans, members, "orphan.webp")
 	if !ok || orphanPlan.Status != group.StatusConflict {

@@ -25,9 +25,12 @@ const DefaultModel = "chaoliangUNSW/Jev-Style-0.8B-Decision-v3-Q8_0"
 const callTimeout = 5 * time.Minute
 
 // Resolver settles group.Conflict values with a Kronk decision model.
+// The ctx passed to New bounds every Resolve call, so cancelling it
+// (e.g. on Ctrl-C) stops a running decision.
 type Resolver struct {
 	krn     *kronksdk.Kronk
 	modelID string
+	ctx     context.Context
 }
 
 // New loads the decision model named modelSource and returns a resolver
@@ -66,7 +69,7 @@ func New(ctx context.Context, modelSource string) (*Resolver, func(), error) {
 		_ = krn.Unload(ctx)
 		return nil, nil, fmt.Errorf("model %q is not a decision model", modelSource)
 	}
-	return &Resolver{krn: krn, modelID: krn.ModelID()}, func() {
+	return &Resolver{krn: krn, modelID: krn.ModelID(), ctx: ctx}, func() {
 		_ = krn.Unload(context.Background())
 	}, nil
 }
@@ -77,7 +80,7 @@ func (r *Resolver) Name() string { return r.modelID }
 // Resolve asks the decision model to settle one conflict group.
 func (r *Resolver) Resolve(c group.Conflict) (group.Decision, error) {
 	req := buildRequest(c)
-	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	ctx, cancel := context.WithTimeout(r.ctx, callTimeout)
 	defer cancel()
 	resp, err := r.krn.Decision(ctx, req)
 	if err != nil {
