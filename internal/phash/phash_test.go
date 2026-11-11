@@ -503,3 +503,82 @@ func TestParseAlg(t *testing.T) {
 		t.Fatal("want error")
 	}
 }
+
+func pixelSumAt(img image.Image, x, y int) int {
+	r, g, b, a := img.At(x, y).RGBA()
+	if a>>8 == 0 {
+		return 255 * 3
+	}
+	return int(r>>8) + int(g>>8) + int(b>>8)
+}
+
+func TestBindPixelSumMatchesAt(t *testing.T) {
+	base := photoLike(64, 48, 8)
+	nrgba := image.NewNRGBA(base.Bounds())
+	for y := base.Bounds().Min.Y; y < base.Bounds().Max.Y; y++ {
+		for x := base.Bounds().Min.X; x < base.Bounds().Max.X; x++ {
+			v := base.GrayAt(x, y).Y
+			a := uint8(255)
+			if (x+y)%17 == 0 {
+				a = 0
+			} else if (x+y)%11 == 0 {
+				a = 128
+			}
+			nrgba.SetNRGBA(x, y, color.NRGBA{R: v, G: v / 2, B: 255 - v, A: a})
+		}
+	}
+	rgba := image.NewRGBA(base.Bounds())
+	for y := base.Bounds().Min.Y; y < base.Bounds().Max.Y; y++ {
+		for x := base.Bounds().Min.X; x < base.Bounds().Max.X; x++ {
+			rgba.Set(x, y, nrgba.At(x, y))
+		}
+	}
+	// Gray JPEG round-trips as *image.Gray; feed RGB so Decode yields YCbCr.
+	ycbcr := jpegEncode(t, nrgba, 90)
+	if _, ok := ycbcr.(*image.YCbCr); !ok {
+		t.Fatalf("jpeg.Decode returned %T, want *image.YCbCr", ycbcr)
+	}
+
+	for _, img := range []image.Image{base, nrgba, rgba, ycbcr} {
+		sum := bindPixelSum(img)
+		b := img.Bounds()
+		for y := b.Min.Y; y < b.Max.Y; y++ {
+			for x := b.Min.X; x < b.Max.X; x++ {
+				got, want := sum(x, y), pixelSumAt(img, x, y)
+				if got != want {
+					t.Fatalf("%T (%d,%d): bind=%d at=%d", img, x, y, got, want)
+				}
+			}
+		}
+	}
+}
+
+func TestBlockhashYCbCrMatchesGeneric(t *testing.T) {
+	src := image.NewNRGBA(image.Rect(0, 0, 320, 240))
+	g := photoLike(320, 240, 12)
+	for y := range 240 {
+		for x := range 320 {
+			v := g.GrayAt(x, y).Y
+			src.SetNRGBA(x, y, color.NRGBA{R: v, G: uint8(255 - v), B: v / 2, A: 255})
+		}
+	}
+	ycbcr := jpegEncode(t, src, 85)
+	if _, ok := ycbcr.(*image.YCbCr); !ok {
+		t.Fatalf("jpeg.Decode returned %T, want *image.YCbCr", ycbcr)
+	}
+	fast, err := blockhash(ycbcr, ycbcr.Bounds(), 16, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Force the At fallback by wrapping so type switch misses.
+	slow, err := blockhash(image.Image(atOnly{ycbcr}), ycbcr.Bounds(), 16, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fast.Hex() != slow.Hex() {
+		t.Fatalf("fast %s != slow %s", fast.Hex(), slow.Hex())
+	}
+}
+
+// atOnly hides concrete types so bindPixelSum uses img.At.
+type atOnly struct{ image.Image }
