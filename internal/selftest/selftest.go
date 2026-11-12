@@ -102,9 +102,9 @@ func (e *env) scanForce() (ingest.Report, error) {
 }
 
 // groupPlan runs the group and plan phases. It returns the stored plans and
-// the member file names per plan id. (The store's group_id column is
-// transient: the plan phase's ClearGroups resets it, so membership must be
-// tracked from the assignment.)
+// the member file names per plan id. Membership is taken from the Aggregate
+// assignment (not re-read from the store) so checks stay independent of
+// how plan persistence rewrites group_id.
 func (e *env) groupPlan() (plans []store.Group, members map[int64][]string, err error) {
 	imgs, err := e.s.AllImages()
 	if err != nil {
@@ -130,12 +130,6 @@ func (e *env) groupPlan() (plans []store.Group, members map[int64][]string, err 
 		}
 	}
 	assign, _ := group.Aggregate(gimgs, maxHamming)
-	if err := e.s.SetGroupAssignments(assign); err != nil {
-		return nil, nil, err
-	}
-	if err := e.s.ClearGroups(); err != nil {
-		return nil, nil, err
-	}
 	members = map[int64][]string{}
 	for _, im := range gimgs {
 		members[assign[im.ID]] = append(members[assign[im.ID]], im.Name)
@@ -148,7 +142,7 @@ func (e *env) groupPlan() (plans []store.Group, members map[int64][]string, err 
 			}
 		}
 		p := group.ResolveGroup(planMembers, nil)
-		g := store.Group{
+		plans = append(plans, store.Group{
 			ID:              id,
 			Status:          p.Status,
 			Reason:          p.Reason,
@@ -162,11 +156,10 @@ func (e *env) groupPlan() (plans []store.Group, members map[int64][]string, err 
 			GPSLat:          p.GPSLat,
 			GPSLon:          p.GPSLon,
 			StoredName:      p.StoredName,
-		}
-		if err := e.s.SaveGroup(g); err != nil {
-			return nil, nil, err
-		}
-		plans = append(plans, g)
+		})
+	}
+	if err := e.s.ReplacePlans(plans, assign); err != nil {
+		return nil, nil, err
 	}
 	return plans, members, nil
 }

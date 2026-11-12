@@ -67,6 +67,10 @@ plr apply --target RESULT --db plr.db
 Gaps and bypasses: [`docs/mvp-gaps.md`](docs/mvp-gaps.md). Every tunable
 and its default: [`docs/defaults.md`](docs/defaults.md).
 
+Eval helper: [`scripts/compare_groups.py`](scripts/compare_groups.py)
+compares a `plr.db` group partition against Czkawka
+`results_similar_images*.json` files (exact component match).
+
 ## Design notes for agents
 
 Chapter index: [`.manual/INDEX.md`](.manual/INDEX.md).  

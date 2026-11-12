@@ -131,6 +131,100 @@ func TestImageUpsertAndGroups(t *testing.T) {
 	}
 }
 
+func TestReplacePlansAndDeletePlans(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	sid, err := s.AddSource("/photos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := Image{ID: "1-000001", SourceID: sid, RelPath: "a.jpg", Name: "a.jpg", SHA256: "aa"}
+	b := Image{ID: "1-000002", SourceID: sid, RelPath: "b.jpg", Name: "b.jpg", SHA256: "bb"}
+	for _, img := range []Image{a, b} {
+		if _, _, err := s.UpsertImage(img); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SaveGroup(Group{ID: 9, Status: "resolved", PixelImageID: a.ID, StoredName: "old.jpg"}); err != nil {
+		t.Fatal(err)
+	}
+
+	plans := []Group{
+		{ID: 1, Status: "resolved", PixelImageID: a.ID, StoredName: "a.jpg"},
+		{ID: 2, Status: "singleton", PixelImageID: b.ID, StoredName: "b.jpg"},
+	}
+	assign := map[string]int64{a.ID: 1, b.ID: 2}
+	if err := s.ReplacePlans(plans, assign); err != nil {
+		t.Fatal(err)
+	}
+	groups, err := s.AllGroups()
+	if err != nil || len(groups) != 2 {
+		t.Fatalf("AllGroups after ReplacePlans = (%+v, %v)", groups, err)
+	}
+	for _, g := range groups {
+		if g.ID == 9 {
+			t.Fatal("obsolete plan 9 survived ReplacePlans")
+		}
+	}
+	images, err := s.AllImages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]Image{}
+	for _, img := range images {
+		byID[img.ID] = img
+	}
+	if byID[a.ID].GroupID != 1 || byID[b.ID].GroupID != 2 {
+		t.Fatalf("assignments = a:%d b:%d", byID[a.ID].GroupID, byID[b.ID].GroupID)
+	}
+
+	if err := s.DeletePlans(); err != nil {
+		t.Fatal(err)
+	}
+	groups, err = s.AllGroups()
+	if err != nil || len(groups) != 0 {
+		t.Fatalf("AllGroups after DeletePlans = (%+v, %v)", groups, err)
+	}
+	images, _ = s.AllImages()
+	byID = map[string]Image{}
+	for _, img := range images {
+		byID[img.ID] = img
+	}
+	if byID[a.ID].GroupID != 1 || byID[b.ID].GroupID != 2 {
+		t.Fatalf("DeletePlans cleared assignments: a:%d b:%d", byID[a.ID].GroupID, byID[b.ID].GroupID)
+	}
+}
+
+func TestUpsertImageWithHashes(t *testing.T) {
+	s, err := Open(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	sid, err := s.AddSource("/photos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := Image{ID: "1-000001", SourceID: sid, RelPath: "a.jpg", Name: "a.jpg", SHA256: "abc", Phash: "aa"}
+	hashes := []ContentPhash{
+		{SHA256: "abc", Alg: "dct", Size: 0, Hex: "aa"},
+		{SHA256: "abc", Alg: "blockhash", Size: 16, Hex: "bb"},
+	}
+	id, created, err := s.UpsertImageWithHashes(img, hashes)
+	if err != nil || !created || id != img.ID {
+		t.Fatalf("UpsertImageWithHashes = (%q, %v, %v)", id, created, err)
+	}
+	all, err := s.ContentPhashes("abc")
+	if err != nil || len(all) != 2 {
+		t.Fatalf("ContentPhashes = %v, err %v", all, err)
+	}
+}
+
 func TestContentPhashKeyedBySHA256(t *testing.T) {
 	s, err := Open(":memory:")
 	if err != nil {

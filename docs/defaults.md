@@ -16,7 +16,7 @@ changes.
 | `--phash-alg` (scan, build, increment) | `dct` | primary (candidate) hash algorithm; the secondary gate hashes are stored regardless (see constants) |
 | `--phash-size` (scan, build, increment) | `0` = legacy 16×8 DCT (128 bits) | square hash size 8/16/32 |
 | `--max-hamming-chunking` (group, build, increment) | `20` | candidate bucket radius on the primary hash — **chunking only, never identity** |
-| `--identity` (group, build, increment) | `exif-first` | identity strategy (`pass`, `double-phash`, `vision` also exist) |
+| `--identity` (group, build, increment) | `exif-first` | identity strategy (`pass`, `double-phash`; `vision` is rejected until implemented) |
 | `--same-image-window` (group, build, increment) | `1s` | zone-resolved capture gap meaning "same instant": drives the camera-block split veto **and** the timestamp candidate sweep |
 | `--identity-block-hamming` | `0` → strategy default (`10` exif-first, `24` double-phash) | configured blockhash-16 radius; **add the built-in slack below** |
 | `--identity-grad-hamming` | `0` → strategy default (`10` exif-first, `20` double-phash) | configured double-gradient-16 radius; **add the built-in slack below** |

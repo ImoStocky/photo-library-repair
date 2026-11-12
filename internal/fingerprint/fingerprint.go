@@ -85,6 +85,7 @@ var IdentityExtras = []phash.Config{
 }
 
 func compute(path, kind string, t *exif.Tool, cfg phash.Config) (Info, error) {
+	// shortcut: loads the whole file; stream when huge RAWs become common
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return Info{}, err

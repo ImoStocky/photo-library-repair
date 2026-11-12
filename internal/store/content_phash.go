@@ -16,10 +16,14 @@ type ContentPhash struct {
 
 // PutContentPhash upserts one content-addressed perceptual hash.
 func (s *Store) PutContentPhash(h ContentPhash) error {
+	return putContentPhash(s.db, h)
+}
+
+func putContentPhash(q dbQuerier, h ContentPhash) error {
 	if h.SHA256 == "" || h.Alg == "" || h.Hex == "" {
 		return fmt.Errorf("content_phash: sha256, alg and hex are required")
 	}
-	_, err := s.db.Exec(`
+	_, err := q.Exec(`
 		INSERT INTO content_phash (sha256, alg, size, hex) VALUES (?, ?, ?, ?)
 		ON CONFLICT(sha256, alg, size) DO UPDATE SET hex = excluded.hex`,
 		h.SHA256, h.Alg, h.Size, h.Hex)

@@ -339,6 +339,12 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 		if err := os.MkdirAll(opts.Target, 0o755); err != nil {
 			return rep, fmt.Errorf("create target %q: %w", opts.Target, err)
 		}
+		// Leftover place() temps from a killed prior run; ignore remove errors.
+		if matches, err := filepath.Glob(filepath.Join(opts.Target, "*.tmp")); err == nil {
+			for _, p := range matches {
+				_ = os.Remove(p)
+			}
+		}
 	}
 
 	reserved := map[string]int64{} // names claimed during this run

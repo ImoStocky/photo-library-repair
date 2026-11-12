@@ -9,6 +9,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -303,13 +304,45 @@ func (s *Store) Sources() (map[int64]string, error) {
 	return out, rows.Err()
 }
 
+// dbQuerier is the shared surface of *sql.DB and *sql.Tx used by image
+// and content_phash writers so UpsertImageWithHashes can run both in one
+// transaction without duplicating SQL.
+type dbQuerier interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	QueryRow(query string, args ...any) *sql.Row
+}
+
 // UpsertImage inserts img (img.ID must be set) or, when an image with the
 // same (source, rel_path) already exists, updates its mutable fields and
 // keeps the original id and group assignment.
 func (s *Store) UpsertImage(img Image) (id string, created bool, err error) {
-	err = s.db.QueryRow(`SELECT id FROM images WHERE source_id = ? AND rel_path = ?`, img.SourceID, img.RelPath).Scan(&id)
+	return upsertImage(s.db, img)
+}
+
+// UpsertImageWithHashes upserts img and its content_phash rows in one
+// transaction so a crash cannot leave an image without its secondary hashes.
+func (s *Store) UpsertImageWithHashes(img Image, hashes []ContentPhash) (id string, created bool, err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", false, err
+	}
+	defer tx.Rollback()
+	id, created, err = upsertImage(tx, img)
+	if err != nil {
+		return "", false, err
+	}
+	for _, h := range hashes {
+		if err := putContentPhash(tx, h); err != nil {
+			return "", false, err
+		}
+	}
+	return id, created, tx.Commit()
+}
+
+func upsertImage(q dbQuerier, img Image) (id string, created bool, err error) {
+	err = q.QueryRow(`SELECT id FROM images WHERE source_id = ? AND rel_path = ?`, img.SourceID, img.RelPath).Scan(&id)
 	if err == nil {
-		_, err = s.db.Exec(`
+		_, err = q.Exec(`
 			UPDATE images SET
 			  name = ?, sha256 = ?, phash = ?, created_at = ?,
 			  exif_capture = ?, exif_offset = ?, exif_camera = ?,
@@ -325,7 +358,7 @@ func (s *Store) UpsertImage(img Image) (id string, created bool, err error) {
 	if err != sql.ErrNoRows {
 		return "", false, err
 	}
-	_, err = s.db.Exec(`
+	_, err = q.Exec(`
 		INSERT INTO images (id, source_id, rel_path, name, sha256, phash, created_at,
 		                      exif_capture, exif_offset, exif_camera, width, height, kind, size, mtime,
 		                      gps_lat, gps_lon, has_gps, group_id)
@@ -412,11 +445,26 @@ func (s *Store) ImagesBySource(sourceID int64) (map[string]Image, error) {
 	return out, rows.Err()
 }
 
-// ClearGroups drops all group assignments and plans.
+// ClearGroups drops all group assignments and plans in one transaction.
 func (s *Store) ClearGroups() error {
-	if _, err := s.db.Exec(`UPDATE images SET group_id = 0`); err != nil {
+	tx, err := s.db.Begin()
+	if err != nil {
 		return err
 	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE images SET group_id = 0`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM groups`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// DeletePlans drops every stored plan without touching image group
+// assignments. Group/increment call it after rewriting assignments so a
+// re-group cannot leave stale plans that apply would still materialize.
+func (s *Store) DeletePlans() error {
 	_, err := s.db.Exec(`DELETE FROM groups`)
 	return err
 }
@@ -428,17 +476,20 @@ func (s *Store) SetGroupAssignments(assign map[string]int64) error {
 		return err
 	}
 	defer tx.Rollback()
+	stmt, err := tx.Prepare(`UPDATE images SET group_id = ? WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
 	for id, groupID := range assign {
-		if _, err := tx.Exec(`UPDATE images SET group_id = ? WHERE id = ?`, groupID, id); err != nil {
+		if _, err := stmt.Exec(groupID, id); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-// SaveGroup upserts the plan for one group.
-func (s *Store) SaveGroup(g Group) error {
-	_, err := s.db.Exec(`
+const saveGroupSQL = `
 		INSERT INTO groups (id, status, reason, resolved_by, pixel_image_id, pixel_phash, capture_image_id,
 		                     capture_time, capture_instant, capture_fallback,
 		                     gps_lat, gps_lon, has_gps, stored_name)
@@ -456,11 +507,67 @@ func (s *Store) SaveGroup(g Group) error {
 		  gps_lat = excluded.gps_lat,
 		  gps_lon = excluded.gps_lon,
 		  has_gps = excluded.has_gps,
-		  stored_name = excluded.stored_name`,
+		  stored_name = excluded.stored_name`
+
+// SaveGroup upserts the plan for one group.
+func (s *Store) SaveGroup(g Group) error {
+	_, err := s.db.Exec(saveGroupSQL,
 		g.ID, g.Status, g.Reason, g.ResolvedBy, g.PixelImageID, g.PixelPhash, g.CaptureImageID,
 		g.CaptureTime, g.CaptureInstant, boolInt(g.CaptureFallback),
 		g.GPSLat, g.GPSLon, boolInt(g.HasGPS), g.StoredName)
 	return err
+}
+
+// ReplacePlans atomically replaces every plan and restores image group
+// assignments. Plans are upserted, obsolete plan ids are deleted, then
+// assignments are zeroed and rewritten — so a crash cannot leave half
+// the new plans with cleared membership.
+func (s *Store) ReplacePlans(plans []Group, assign map[string]int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	save, err := tx.Prepare(saveGroupSQL)
+	if err != nil {
+		return err
+	}
+	defer save.Close()
+	keep := make([]any, 0, len(plans))
+	for _, g := range plans {
+		if _, err := save.Exec(
+			g.ID, g.Status, g.Reason, g.ResolvedBy, g.PixelImageID, g.PixelPhash, g.CaptureImageID,
+			g.CaptureTime, g.CaptureInstant, boolInt(g.CaptureFallback),
+			g.GPSLat, g.GPSLon, boolInt(g.HasGPS), g.StoredName); err != nil {
+			return err
+		}
+		keep = append(keep, g.ID)
+	}
+	if len(keep) == 0 {
+		if _, err := tx.Exec(`DELETE FROM groups`); err != nil {
+			return err
+		}
+	} else {
+		placeholders := strings.Repeat("?,", len(keep)-1) + "?"
+		if _, err := tx.Exec(`DELETE FROM groups WHERE id NOT IN (`+placeholders+`)`, keep...); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`UPDATE images SET group_id = 0`); err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(`UPDATE images SET group_id = ? WHERE id = ?`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for id, groupID := range assign {
+		if _, err := stmt.Exec(groupID, id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // AllGroups returns every stored plan.

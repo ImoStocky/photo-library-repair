@@ -93,7 +93,7 @@ Usage:
 
   plr scan     --dir DIR... [--force] [--db PATH] [--workers N] [--min-size-kb N]
                [--photoslibrary-all] [--phash-alg ALG] [--phash-size 8|16|32]
-  plr group    [--max-hamming-chunking N] [--identity exif-first|pass|double-phash|vision]
+  plr group    [--max-hamming-chunking N] [--identity exif-first|pass|double-phash]
                [--same-image-window DUR] [--db PATH]
   plr plan     [--ai] [--model SOURCE] [--db PATH]
   plr apply    --target DIR [--dry-run] [--no-exif] [--move] [--db PATH]
@@ -124,8 +124,8 @@ Commands:
             every pair, and EXIF only splits one the gate joined — two
             camera blocks (Make + Model) that differ at a capture
             instant within --same-image-window. pass = legacy bucket
-            grouping; double-phash = blockhash∩double-gradient by sha256;
-            vision = Kronk stub.
+            grouping; double-phash = blockhash∩double-gradient by sha256.
+            --identity vision is rejected until a real VisionDecider ships.
   plan      Resolve every group: pixels from the HEIC member when one
             exists, else the highest-resolution member; earliest
             zone-resolved EXIF capture time (file creation time as
@@ -246,7 +246,7 @@ func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB 
 func runGroup(args []string) int {
 	fs := flag.NewFlagSet("group", flag.ExitOnError)
 	maxHamming := fs.Int("max-hamming-chunking", 20, "maximum DCT phash hamming distance for candidate buckets")
-	identity := fs.String("identity", "exif-first", "identity strategy: exif-first, pass, double-phash, or vision")
+	identity := fs.String("identity", "exif-first", "identity strategy: exif-first, pass, or double-phash")
 	sameWindowStr := fs.String("same-image-window", "1s", "exif-first: zone-resolved capture-time gap that means the same image; a bare number is seconds")
 	blockH := fs.Int("identity-block-hamming", 0, "dual-hash gate: max blockhash-16 distance (0 = strategy default: 10 exif-first, 24 double-phash)")
 	gradH := fs.Int("identity-grad-hamming", 0, "dual-hash gate: max double-gradient-16 distance (0 = strategy default: 10 exif-first, 20 double-phash)")
@@ -308,6 +308,10 @@ func runGroupPhase(s *store.Store, opts groupPhaseOpts) int {
 	fmt.Fprintf(os.Stderr, "plr: group Pipeline %s (%d images)\n",
 		time.Since(t0).Round(time.Millisecond), len(imgs))
 	if err := s.SetGroupAssignments(assign); err != nil {
+		fmt.Fprintln(os.Stderr, "plr group:", err)
+		return 1
+	}
+	if err := s.DeletePlans(); err != nil {
 		fmt.Fprintln(os.Stderr, "plr group:", err)
 		return 1
 	}
@@ -412,6 +416,10 @@ func runIncrementGroupPhase(s *store.Store, opts groupPhaseOpts, before map[stri
 		fmt.Fprintln(os.Stderr, "plr increment:", err)
 		return 1
 	}
+	if err := s.DeletePlans(); err != nil {
+		fmt.Fprintln(os.Stderr, "plr increment:", err)
+		return 1
+	}
 	fmt.Printf("increment: %d incoming -> %d present, %d joined, %d new (%d ambiguous) [identity=%s]\n",
 		len(incoming), len(present), len(matched), len(unmatched), ambiguous, strat.Name())
 	if ambiguous > 0 {
@@ -438,9 +446,9 @@ func identityStrategy(s *store.Store, opts groupPhaseOpts) (group.IdentityStrate
 			GradHamming:  opts.GradH,
 		}, nil
 	case "vision":
-		return group.DecisionModel{Decider: group.UnsureDecider{}}, nil
+		return nil, fmt.Errorf("--identity vision is not implemented")
 	default:
-		return nil, fmt.Errorf("unknown --identity %q (want exif-first, pass, double-phash, or vision)", opts.Identity)
+		return nil, fmt.Errorf("unknown --identity %q (want exif-first, pass, or double-phash)", opts.Identity)
 	}
 }
 
@@ -521,10 +529,6 @@ func runPlanPhase(s *store.Store, res group.Resolver) int {
 		byGroup[im.GroupID] = append(byGroup[im.GroupID], toGroupImage(im))
 		assign[im.ID] = im.GroupID
 	}
-	if err := s.ClearGroups(); err != nil {
-		fmt.Fprintln(os.Stderr, "plr plan:", err)
-		return 1
-	}
 	counts := map[string]int{}
 	ids := make([]int64, 0, len(byGroup))
 	for id := range byGroup {
@@ -535,12 +539,13 @@ func runPlanPhase(s *store.Store, res group.Resolver) int {
 	prog.SetTotal(int64(len(ids)))
 	defer prog.Stop()
 	aiSettled := 0
+	plans := make([]store.Group, 0, len(ids))
 	for _, id := range ids {
 		p := group.ResolveGroup(byGroup[id], res)
 		if p.ResolvedBy != group.Rules {
 			aiSettled++
 		}
-		g := store.Group{
+		plans = append(plans, store.Group{
 			ID:              id,
 			Status:          p.Status,
 			Reason:          p.Reason,
@@ -555,16 +560,11 @@ func runPlanPhase(s *store.Store, res group.Resolver) int {
 			GPSLat:          p.GPSLat,
 			GPSLon:          p.GPSLon,
 			StoredName:      p.StoredName,
-		}
-		if err := s.SaveGroup(g); err != nil {
-			fmt.Fprintln(os.Stderr, "plr plan:", err)
-			return 1
-		}
+		})
 		counts[p.Status]++
 		prog.Add(1)
 	}
-	// Re-apply the assignments: ClearGroups above zeroes images.group_id.
-	if err := s.SetGroupAssignments(assign); err != nil {
+	if err := s.ReplacePlans(plans, assign); err != nil {
 		fmt.Fprintln(os.Stderr, "plr plan:", err)
 		return 1
 	}
@@ -700,7 +700,7 @@ func runPipeline(cmd string, args []string) int {
 	target := fs.String("target", "", "directory that receives the final images (required)")
 	force := fs.Bool("force", false, "re-scan directories that were already scanned")
 	maxHamming := fs.Int("max-hamming-chunking", 20, "maximum DCT phash hamming distance for candidate buckets")
-	identity := fs.String("identity", "exif-first", "identity strategy: exif-first, pass, double-phash, or vision")
+	identity := fs.String("identity", "exif-first", "identity strategy: exif-first, pass, or double-phash")
 	sameWindowStr := fs.String("same-image-window", "1s", "exif-first: zone-resolved capture-time gap that means the same image; a bare number is seconds")
 	blockH := fs.Int("identity-block-hamming", 0, "dual-hash gate: max blockhash-16 distance (0 = strategy default: 10 exif-first, 24 double-phash)")
 	gradH := fs.Int("identity-grad-hamming", 0, "dual-hash gate: max double-gradient-16 distance (0 = strategy default: 10 exif-first, 20 double-phash)")

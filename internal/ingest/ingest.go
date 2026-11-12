@@ -89,7 +89,7 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 	rep := &Report{}
 	runStart := time.Now()
 
-	seenInodes := map[uint64]bool{} // (dev, inode) already recorded this run
+	seenInodes := map[[2]uint64]bool{} // {Dev, Ino} already recorded this run
 
 	// sha256 identifies processed content: a file whose digest is already
 	// known is not recorded and not fingerprinted. The set starts from the
@@ -176,7 +176,7 @@ func Scan(s *store.Store, opts Options, hash Hasher) (*Report, error) {
 // thumbnails and edited derivatives under resources/ and the SQLite files
 // under database/ are never image sources. A bundle without originals/ is
 // an error rather than a silent (or thumbnail-filled) empty scan.
-func collect(root string, minSize int64, scanAll bool, seenInodes map[uint64]bool) ([]job, map[string]bool, int, error) {
+func collect(root string, minSize int64, scanAll bool, seenInodes map[[2]uint64]bool) ([]job, map[string]bool, int, error) {
 	var jobs []job
 	seen := map[string]bool{}
 	nonImage := 0
@@ -196,7 +196,7 @@ func collect(root string, minSize int64, scanAll bool, seenInodes map[uint64]boo
 		if !ok {
 			return nil
 		}
-		inodeKey := uint64(st.Dev)<<32 | uint64(st.Ino)
+		inodeKey := [2]uint64{uint64(st.Dev), uint64(st.Ino)}
 		if seenInodes[inodeKey] {
 			return nil
 		}
@@ -354,25 +354,23 @@ func hashAll(s *store.Store, jobs []job, workers int, hash Hasher, runStart time
 					HasGPS:      info.HasGPS,
 					GPSLat:      info.GPSLat,
 					GPSLon:      info.GPSLon,
-				}
-				img.SourceID = j.sourceID
-				_, created, err := s.UpsertImage(img)
-				if err == nil && sum != "" {
+
+					SourceID: j.sourceID}
+				var hashes []store.ContentPhash
+				if sum != "" {
 					for _, eh := range info.ExtraHashes {
 						if eh.Hex == "" {
 							continue
 						}
-						if putErr := s.PutContentPhash(store.ContentPhash{
+						hashes = append(hashes, store.ContentPhash{
 							SHA256: sum,
 							Alg:    string(eh.Alg),
 							Size:   int(eh.Size),
 							Hex:    eh.Hex,
-						}); putErr != nil {
-							err = putErr
-							break
-						}
+						})
 					}
 				}
+				_, created, err := s.UpsertImageWithHashes(img, hashes)
 				mu.Lock()
 				if err != nil {
 					rep.Errors++
@@ -405,6 +403,9 @@ func dropMissing(s *store.Store, sourceID int64, seen map[string]bool) error {
 		return err
 	}
 	defer tx.Rollback()
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS plr_seen`); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`CREATE TEMP TABLE plr_seen (rel_path TEXT PRIMARY KEY)`); err != nil {
 		return err
 	}
