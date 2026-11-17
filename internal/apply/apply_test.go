@@ -754,3 +754,34 @@ func TestClearDroppedOutputs(t *testing.T) {
 		t.Fatalf("keep missing: %v", ledger)
 	}
 }
+
+func TestUpdateMovedOutputs(t *testing.T) {
+	s, _, _ := newStore(t)
+	target := t.TempDir()
+	key := targetKey(target)
+	if err := s.SaveGroupOutput(key, 1, store.GroupOutput{Name: "a.jpg", PixelID: "p1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveGroupOutput(key, 2, store.GroupOutput{Name: "b.jpg", PixelID: "p2"}); err != nil {
+		t.Fatal(err)
+	}
+	n, err := UpdateMovedOutputs(s, target, []PathMove{
+		{From: "a.jpg", To: "screenshot/a.jpg"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("updated=%d", n)
+	}
+	ledger, err := s.GroupOutputs(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ledger[1].Name != "screenshot/a.jpg" {
+		t.Fatalf("a=%q", ledger[1].Name)
+	}
+	if ledger[2].Name != "b.jpg" {
+		t.Fatalf("b=%q", ledger[2].Name)
+	}
+}

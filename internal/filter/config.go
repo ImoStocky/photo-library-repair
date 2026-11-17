@@ -8,15 +8,18 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
 // Action values for rules and the ruleset default.
 const (
-	ActionAccept = "accept"
-	ActionDrop   = "drop"
-	ActionTag    = "tag"
+	ActionAccept   = "accept"
+	ActionDrop     = "drop"
+	ActionTag      = "tag"
+	ActionClassify = "classify"
 )
 
 // DefaultRuleName is the reserved directory name for default drops.
@@ -26,17 +29,21 @@ var ruleNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 
 // Ruleset is a compiled, read-only filter configuration.
 type Ruleset struct {
-	Default   string // accept | drop
-	Rules     []compiledRule
-	NeedsEXIF bool
+	Default     string // accept | drop
+	Rules       []compiledRule
+	NeedsEXIF   bool
+	HasClassify bool
 }
 
 type compiledRule struct {
-	Name   string
-	Action string
-	Tag    string
-	Match  Matcher
-	Line   int
+	Name       string
+	Action     string
+	Tag        string
+	Prompt     string            // classify only
+	Categories map[string]string // label → description; classify only
+	Labels     []string          // stable category keys for prompting
+	Match      Matcher
+	Line       int
 }
 
 // raw document shapes for KnownFields decoding.
@@ -47,10 +54,16 @@ type rawDoc struct {
 }
 
 type rawRule struct {
-	Name   string `yaml:"name"`
-	Match  Match  `yaml:"match"`
-	Action string `yaml:"action"`
-	Tag    string `yaml:"tag"`
+	Name     string       `yaml:"name"`
+	Match    Match        `yaml:"match"`
+	Action   string       `yaml:"action"`
+	Tag      string       `yaml:"tag"`
+	Classify *rawClassify `yaml:"classify"`
+}
+
+type rawClassify struct {
+	Prompt     string            `yaml:"prompt"`
+	Categories map[string]string `yaml:"categories"`
 }
 
 // Match is a recursive boolean expression over image conditions.
@@ -171,15 +184,50 @@ func compileDoc(doc rawDoc) (*Ruleset, error) {
 		if action == "" {
 			return nil, fmt.Errorf("filter rules: rule %q: action is required", r.Name)
 		}
+		cr := compiledRule{Name: r.Name, Action: action, Tag: r.Tag, Line: line}
 		switch action {
 		case ActionAccept, ActionDrop:
 			if r.Tag != "" {
 				return nil, fmt.Errorf("filter rules: rule %q: tag is only valid with action tag", r.Name)
 			}
+			if r.Classify != nil {
+				return nil, fmt.Errorf("filter rules: rule %q: classify is only valid with action classify", r.Name)
+			}
 		case ActionTag:
 			if r.Tag == "" {
 				return nil, fmt.Errorf("filter rules: rule %q: tag action requires tag", r.Name)
 			}
+			if r.Classify != nil {
+				return nil, fmt.Errorf("filter rules: rule %q: classify is only valid with action classify", r.Name)
+			}
+		case ActionClassify:
+			if r.Tag != "" {
+				return nil, fmt.Errorf("filter rules: rule %q: tag is only valid with action tag", r.Name)
+			}
+			if r.Classify == nil {
+				return nil, fmt.Errorf("filter rules: rule %q: classify action requires classify block", r.Name)
+			}
+			if strings.TrimSpace(r.Classify.Prompt) == "" {
+				return nil, fmt.Errorf("filter rules: rule %q: classify.prompt is required", r.Name)
+			}
+			if len(r.Classify.Categories) == 0 {
+				return nil, fmt.Errorf("filter rules: rule %q: classify.categories must be non-empty", r.Name)
+			}
+			cr.Prompt = r.Classify.Prompt
+			cr.Categories = make(map[string]string, len(r.Classify.Categories))
+			cr.Labels = make([]string, 0, len(r.Classify.Categories))
+			for label, desc := range r.Classify.Categories {
+				if !ruleNameRE.MatchString(label) {
+					return nil, fmt.Errorf("filter rules: rule %q: category %q: name must match %s", r.Name, label, ruleNameRE.String())
+				}
+				if label == DefaultRuleName {
+					return nil, fmt.Errorf("filter rules: rule %q: category %q is reserved", r.Name, label)
+				}
+				cr.Categories[label] = desc
+				cr.Labels = append(cr.Labels, label)
+			}
+			slices.Sort(cr.Labels)
+			rs.HasClassify = true
 		default:
 			return nil, fmt.Errorf("filter rules: rule %q: unknown action %q", r.Name, action)
 		}
@@ -191,13 +239,22 @@ func compileDoc(doc rawDoc) (*Ruleset, error) {
 		if needsEXIF {
 			rs.NeedsEXIF = true
 		}
-		rs.Rules = append(rs.Rules, compiledRule{
-			Name:   r.Name,
-			Action: action,
-			Tag:    r.Tag,
-			Match:  matcher,
-			Line:   line,
-		})
+		cr.Match = matcher
+		rs.Rules = append(rs.Rules, cr)
 	}
 	return rs, nil
+}
+
+// CategoryDirs returns every classify label used as a folder name under the library.
+func (rs *Ruleset) CategoryDirs() map[string]bool {
+	if rs == nil {
+		return nil
+	}
+	out := map[string]bool{}
+	for _, r := range rs.Rules {
+		for label := range r.Categories {
+			out[label] = true
+		}
+	}
+	return out
 }

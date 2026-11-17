@@ -252,6 +252,45 @@ func ClearDroppedOutputs(s *store.Store, target string, rels []string) (int, err
 	return n, nil
 }
 
+// PathMove is one library-relative relocate (filter classify).
+type PathMove struct {
+	From string
+	To   string
+}
+
+// UpdateMovedOutputs rewrites apply-ledger Names when filter classify moves
+// files under a category folder. Matches From on relative path or base name.
+func UpdateMovedOutputs(s *store.Store, target string, moves []PathMove) (int, error) {
+	if s == nil || len(moves) == 0 {
+		return 0, nil
+	}
+	byFrom := make(map[string]string, len(moves)*2)
+	for _, m := range moves {
+		from := filepath.Clean(m.From)
+		to := filepath.ToSlash(filepath.Clean(m.To))
+		byFrom[strings.ToLower(from)] = to
+		byFrom[strings.ToLower(filepath.Base(from))] = to
+	}
+	key := targetKey(target)
+	ledger, err := s.GroupOutputs(key)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for gid, row := range ledger {
+		to, ok := byFrom[strings.ToLower(row.Name)]
+		if !ok {
+			continue
+		}
+		row.Name = to
+		if err := s.SaveGroupOutput(key, gid, row); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
+}
+
 // adoptLedger seeds the ledger from a report.json left by a pre-ledger
 // apply: prior file names are adopted without content fingerprints (empty
 // SHA256/Facts), so an upgrade never re-duplicates an existing target.

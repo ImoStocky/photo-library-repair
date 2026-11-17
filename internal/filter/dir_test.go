@@ -45,7 +45,7 @@ rules:
 	denier := NewDenier(denied, false, nil)
 	defer denier.Close()
 
-	rep, err := FilterDir(root, rs, denier, 2, nil)
+	rep, err := FilterDir(t.Context(), root, rs, denier, DirOpts{Workers: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -62,7 +62,7 @@ rules:
 		t.Fatal(err)
 	}
 
-	rep2, err := FilterDir(root, rs, denier, 2, nil)
+	rep2, err := FilterDir(t.Context(), root, rs, denier, DirOpts{Workers: 2})
 	if err != nil {
 		t.Fatal(err)
 	}

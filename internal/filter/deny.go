@@ -117,6 +117,13 @@ func (d *Denier) moveFile(src, dst string) error {
 	if rename == nil {
 		rename = os.Rename
 	}
+	return renameOrCopy(rename, src, dst)
+}
+
+func renameOrCopy(rename renameFunc, src, dst string) error {
+	if rename == nil {
+		rename = os.Rename
+	}
 	err := rename(src, dst)
 	if err == nil {
 		return nil
@@ -124,7 +131,6 @@ func (d *Denier) moveFile(src, dst string) error {
 	if !isEXDEV(err) {
 		return err
 	}
-	// Cross-device: copy, fsync, verify size, remove original.
 	return copyVerifyRemove(src, dst)
 }
 

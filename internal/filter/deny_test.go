@@ -99,6 +99,44 @@ func TestDenyDryRun(t *testing.T) {
 	}
 }
 
+func TestRestoreDenied(t *testing.T) {
+	root := t.TempDir()
+	lib := filepath.Join(root, "lib")
+	srcDir := filepath.Join(lib, "2021", "trip")
+	if err := os.MkdirAll(srcDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(srcDir, "IMG_1.jpg")
+	if err := os.WriteFile(src, []byte("hello"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	denied := filepath.Join(lib, "denied")
+	d := NewDenier(denied, false, nil)
+	if _, err := d.Drop(src, filepath.Join("2021", "trip", "IMG_1.jpg"), "clutter", 5); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := RestoreDenied(denied, FlattenOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Moved != 1 || rep.Errors != 0 {
+		t.Fatalf("moved=%d missing=%d errors=%d", rep.Moved, rep.Missing, rep.Errors)
+	}
+	if _, err := os.Stat(src); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(denied, denyManifestName)); !os.IsNotExist(err) {
+		t.Fatalf("manifest should be removed: %v", err)
+	}
+	if _, err := os.Stat(denied); !os.IsNotExist(err) {
+		t.Fatalf("empty denied dir should be removed: %v", err)
+	}
+}
+
 func TestDenyEXDEVFallback(t *testing.T) {
 	root := t.TempDir()
 	src := filepath.Join(root, "a.jpg")

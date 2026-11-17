@@ -103,7 +103,8 @@ Usage:
   plr apply    --target DIR [--dry-run] [--no-exif] [--move] [--strict] [--db PATH]
                [--filter-rules PATH] [--denied-dir PATH]
   plr filter   --dir DIR --filter-rules PATH [--denied-dir PATH] [--dry-run]
-               [--db PATH] [--explain FILE] [--workers N]
+               [--db PATH] [--explain FILE] [--workers N] [--no-model]
+               [--model SOURCE]
   plr build    --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr increment --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr commit   [--message TEXT] [--db PATH]
@@ -151,9 +152,13 @@ Commands:
             --filter-rules skips materializing drops and moves an existing
             target file to --denied-dir (default <target>/denied).
   filter    Walk a materialized library (--dir), apply YAML firewall rules,
-            and move drops to --denied-dir (default <dir>/denied). Clears
-            matching apply-ledger rows in --db (default plr.db) so a later
-            apply does not treat moved files as still present.
+            and move drops to --denied-dir (default <dir>/denied). Then
+            classify survivors (action: classify) with a Kronk vision model
+            unless --no-model. Clears drop ledger rows and updates ledger
+            paths for classify moves in --db (default plr.db).
+            --flatten restores classified files to their pre-classify paths
+            via classify-manifest.jsonl (no rules needed). --denied restores
+            drops from denied-dir/manifest.jsonl (default <dir>/denied).
             --explain FILE prints per-rule match detail for one file.
   build     scan + group + plan + apply in one go.
    increment Merge new photos into an existing library: scan the new dirs
@@ -247,6 +252,67 @@ func filterExifLoader(tool *exif.Tool) filter.ExifLoader {
 	}
 }
 
+func runFilterRestore(dir, dbPath, deniedDir string, dryRun, doFlatten, doDenied bool) int {
+	var out io.Writer
+	if dryRun {
+		out = os.Stdout
+	}
+	opts := filter.FlattenOpts{DryRun: dryRun, Out: out}
+	exit := 0
+	if doFlatten {
+		if !dryRun {
+			s, err := store.Open(dbPath)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "plr filter:", err)
+				return 1
+			}
+			defer s.Close()
+			opts.OnMoves = func(moves []filter.ClassifyMove) error {
+				pm := make([]apply.PathMove, len(moves))
+				for i, m := range moves {
+					pm[i] = apply.PathMove{From: m.FromRel, To: m.ToRel}
+				}
+				_, err := apply.UpdateMovedOutputs(s, dir, pm)
+				return err
+			}
+		}
+		rep, err := filter.FlattenClassify(dir, opts)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "plr filter:", err)
+			return 1
+		}
+		fmt.Printf("flatten: moved=%d", rep.Moved)
+		if rep.Missing > 0 {
+			fmt.Printf(", missing=%d", rep.Missing)
+		}
+		if rep.Errors > 0 {
+			fmt.Printf(", errors=%d", rep.Errors)
+			exit = 1
+		}
+		fmt.Println()
+	}
+	if doDenied {
+		if deniedDir == "" {
+			deniedDir = filepath.Join(dir, "denied")
+		}
+		rep, err := filter.RestoreDenied(deniedDir, filter.FlattenOpts{DryRun: dryRun, Out: out})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "plr filter:", err)
+			return 1
+		}
+		fmt.Printf("denied: restored=%d", rep.Moved)
+		if rep.Missing > 0 {
+			fmt.Printf(", missing=%d", rep.Missing)
+		}
+		if rep.Errors > 0 {
+			fmt.Printf(", errors=%d", rep.Errors)
+			exit = 1
+		}
+		fmt.Println()
+	}
+	return exit
+}
+
 func runFilterExplain(rulesPath, file string) int {
 	rs, err := filter.Load(rulesPath)
 	if err != nil {
@@ -270,12 +336,16 @@ func runFilterExplain(rulesPath, file string) int {
 func runFilter(args []string) int {
 	fs := flag.NewFlagSet("filter", flag.ExitOnError)
 	dir := fs.String("dir", "", "materialized library directory to filter")
-	filterRules := fs.String("filter-rules", "", "YAML firewall rules (required)")
+	filterRules := fs.String("filter-rules", "", "YAML firewall rules (required unless --flatten/--denied)")
 	deniedDir := fs.String("denied-dir", "", "where dropped images are moved (default: <dir>/denied)")
-	dryRun := fs.Bool("dry-run", false, "print planned drops without moving files")
-	db := fs.String("db", "plr.db", "SQLite library whose apply ledger is cleared for drops")
+	dryRun := fs.Bool("dry-run", false, "print planned drops/classify without moving files")
+	db := fs.String("db", "plr.db", "SQLite library whose apply ledger is updated for moves")
 	explain := fs.String("explain", "", "print per-rule match detail for one file and exit")
-	workers := fs.Int("workers", 4, "parallel filter workers")
+	flatten := fs.Bool("flatten", false, "restore classified files to flat pre-classify paths (classify-manifest.jsonl)")
+	restoreDenied := fs.Bool("denied", false, "restore dropped files from denied-dir/manifest.jsonl")
+	workers := fs.Int("workers", 4, "parallel filter/classify workers (also classify batch size)")
+	noModel := fs.Bool("no-model", false, "skip classify rules (drop/accept/tag only)")
+	modelSource := fs.String("model", kronkai.DefaultVisionModel, "Kronk vision model for classify rules")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -285,6 +355,13 @@ func runFilter(args []string) int {
 			return 2
 		}
 		return runFilterExplain(*filterRules, *explain)
+	}
+	if *flatten || *restoreDenied {
+		if *dir == "" {
+			fmt.Fprintln(os.Stderr, "plr filter: --flatten/--denied requires --dir")
+			return 2
+		}
+		return runFilterRestore(*dir, *db, *deniedDir, *dryRun, *flatten, *restoreDenied)
 	}
 	if *dir == "" || *filterRules == "" {
 		fmt.Fprintln(os.Stderr, "plr filter: --dir and --filter-rules are required")
@@ -313,7 +390,43 @@ func runFilter(args []string) int {
 	if rs.NeedsEXIF {
 		exifLoad = filterExifLoader(tool)
 	}
-	rep, err := filter.FilterDir(*dir, rs, denier, *workers, exifLoad)
+
+	opts := filter.DirOpts{Workers: *workers, Exif: exifLoad}
+	ctx := context.Background()
+	if rs.HasClassify && !*noModel {
+		var stop context.CancelFunc
+		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		vc, closeFn, err := kronkai.NewVisionClassifier(ctx, *modelSource)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "plr filter:", err)
+			return 1
+		}
+		defer closeFn()
+		opts.Classifier = vc
+		opts.ClassMover = &filter.ClassMover{Root: *dir, DryRun: *dryRun, Out: out}
+		defer opts.ClassMover.Close()
+		fmt.Printf("vision model %s loaded; classify enabled\n", vc.Name())
+
+		if !*dryRun {
+			s, err := store.Open(*db)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, "plr filter:", err)
+				return 1
+			}
+			defer s.Close()
+			opts.OnClassifyBatch = func(moves []filter.ClassifyMove) error {
+				pm := make([]apply.PathMove, len(moves))
+				for i, m := range moves {
+					pm[i] = apply.PathMove{From: m.FromRel, To: m.ToRel}
+				}
+				_, err := apply.UpdateMovedOutputs(s, *dir, pm)
+				return err
+			}
+		}
+	}
+
+	rep, err := filter.FilterDir(ctx, *dir, rs, denier, opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr filter:", err)
 		return 1
@@ -342,6 +455,17 @@ func runFilter(args []string) int {
 		fmt.Printf(", dropped")
 		for _, k := range keys {
 			fmt.Printf(" %s=%d", k, rep.Dropped[k])
+		}
+	}
+	if len(rep.Classified) > 0 {
+		keys := make([]string, 0, len(rep.Classified))
+		for k := range rep.Classified {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fmt.Printf(", classified")
+		for _, k := range keys {
+			fmt.Printf(" %s=%d", k, rep.Classified[k])
 		}
 	}
 	if cleared > 0 {

@@ -29,6 +29,9 @@ func (rs *Ruleset) Evaluate(info *ImageInfo) Decision {
 		case ActionTag:
 			tags = append(tags, r.Tag)
 			continue
+		case ActionClassify:
+			// Model I/O lives in FilterDir's classify phase; sync Evaluate continues.
+			continue
 		case ActionAccept, ActionDrop:
 			return Decision{Action: r.Action, Rule: r.Name, Tags: tags}
 		}
@@ -52,6 +55,10 @@ func (rs *Ruleset) Explain(info *ImageInfo) (Decision, []ExplainStep) {
 			case ActionTag:
 				tags = append(tags, r.Tag)
 				step.Detail = "tag=" + r.Tag + " (continue)"
+				steps = append(steps, step)
+				continue
+			case ActionClassify:
+				step.Detail = "classify (deferred to model phase)"
 				steps = append(steps, step)
 				continue
 			case ActionAccept, ActionDrop:
