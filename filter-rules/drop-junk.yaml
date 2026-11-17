@@ -1,0 +1,27 @@
+version: 1
+default: accept
+
+rules:
+  - name: abnormal-aspect-ratio
+    match:
+      min_aspect_ratio: 16        # long side / short side > 16, either orientation
+    action: drop
+
+  - name: miniature
+    match:
+      format: jpeg
+      aspect_ratio: 1             # square
+      max_width: 499              # < 500x500
+      max_height: 499
+    action: drop
+
+  - name: clutter
+    match:
+      any:
+        - all:
+            - { format: png }
+            - { max_file_size: 50KB }
+        - all:                      # any format
+            - { max_width: 127 }    # < 128x128
+            - { max_height: 127 }
+    action: drop

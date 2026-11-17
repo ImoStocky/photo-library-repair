@@ -20,7 +20,7 @@ import (
 )
 
 // DefaultVisionModel is used by plr filter classify when --model is omitted.
-const DefaultVisionModel = "unsloth/Qwen3.5-0.8B-Q8_0"
+const DefaultVisionModel = "unsloth/Qwen3-VL-4B-Instruct-BF16"
 
 const classifyTimeout = 5 * time.Minute
 const classifyMaxSide = 1024

@@ -1,0 +1,24 @@
+version: 1
+default: accept
+
+rules:
+  - name: content-type
+    match: { format: [jpeg, png, heic, webp] }   # optional pre-filter, saves model calls
+    action: classify
+    classify:
+      # model / min_confidence / dest are CLI defaults in this build:
+      #   --model (default unsloth/Qwen3-VL-4B-Instruct-BF16)
+      #   dest = {library}/{label}/{relpath}
+      #   "none" / unknown label → leave in place (no confidence gate yet)
+      prompt: |
+        Classify this image. Answer with exactly one label from the list,
+        or "none" if no label fits. Only classify if confidence is high. 
+      categories:
+        email: "image shows an email"
+        screenshot: "screenshot of a computer screen"
+        phone-screenshot: "screenshot of a phone screen"
+        document: "scanned or photographed document"
+        handwriting: "handwritten notes"
+        book-page: "photo of a book page"
+        logo: "logo or application asset"
+        product: "product image with background extracted"

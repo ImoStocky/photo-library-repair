@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // DirReport summarizes a FilterDir run against a materialized library.
@@ -22,10 +23,15 @@ type DirReport struct {
 // DirOpts configures FilterDir workers, EXIF, and the optional classify phase.
 type DirOpts struct {
 	Workers         int
+	Limit           int // max images to process after walk; 0 = no limit
 	Exif            ExifLoader
 	Classifier      Classifier // nil skips classify (e.g. --no-model)
 	ClassMover      *ClassMover
 	OnClassifyBatch func([]ClassifyMove) error // called after each finished batch of moves
+	// OnDropProgress reports (done, total) as each image finishes the drop/accept phase.
+	OnDropProgress func(done, total int64)
+	// OnClassifyProgress reports (done, total) as each survivor finishes classify.
+	OnClassifyProgress func(done, total int64)
 }
 
 var libraryExts = map[string]bool{
@@ -111,6 +117,9 @@ func FilterDir(ctx context.Context, root string, rs *Ruleset, denier *Denier, op
 	if err != nil {
 		return nil, err
 	}
+	if opts.Limit > 0 && len(items) > opts.Limit {
+		items = items[:opts.Limit]
+	}
 
 	rep := &DirReport{
 		Seen:       len(items),
@@ -122,7 +131,7 @@ func FilterDir(ctx context.Context, root string, rs *Ruleset, denier *Denier, op
 	}
 
 	dropped := make(map[string]bool)
-	if err := phaseDrop(ctx, items, rs, denier, opts.Exif, workers, rep, dropped); err != nil {
+	if err := phaseDrop(ctx, items, rs, denier, opts.Exif, workers, rep, dropped, opts.OnDropProgress); err != nil {
 		return rep, err
 	}
 	if opts.Classifier == nil || !rs.HasClassify || opts.ClassMover == nil {
@@ -149,7 +158,7 @@ func underCategory(rel string, cats map[string]bool) bool {
 	return ok && cats[first]
 }
 
-func phaseDrop(ctx context.Context, items []walkItem, rs *Ruleset, denier *Denier, exif ExifLoader, workers int, rep *DirReport, dropped map[string]bool) error {
+func phaseDrop(ctx context.Context, items []walkItem, rs *Ruleset, denier *Denier, exif ExifLoader, workers int, rep *DirReport, dropped map[string]bool, onProgress func(done, total int64)) error {
 	type result struct {
 		rule string
 		rel  string
@@ -194,11 +203,19 @@ func phaseDrop(ctx context.Context, items []walkItem, rs *Ruleset, denier *Denie
 	}()
 
 	var firstErr error
+	total := int64(len(items))
+	var done int64
 	for r := range ch {
+		done++
+		if onProgress != nil {
+			onProgress(done, total)
+		}
 		if r.err != nil {
 			rep.Errors++
-			if firstErr == nil {
-				firstErr = r.err
+			// Only abort the whole run on cancellation; per-file decode/IO
+			// errors are counted so classify can still run on survivors.
+			if firstErr == nil && ctx.Err() != nil {
+				firstErr = ctx.Err()
 			}
 			continue
 		}
@@ -213,6 +230,14 @@ func phaseDrop(ctx context.Context, items []walkItem, rs *Ruleset, denier *Denie
 
 func phaseClassify(ctx context.Context, items []walkItem, rs *Ruleset, opts DirOpts, workers int, rep *DirReport) error {
 	batchSize := max(workers, 1)
+	total := int64(len(items))
+	var done atomic.Int64
+	onItem := func() {
+		if opts.OnClassifyProgress == nil {
+			return
+		}
+		opts.OnClassifyProgress(done.Add(1), total)
+	}
 	var firstErr error
 	for i := 0; i < len(items); i += batchSize {
 		if err := ctx.Err(); err != nil {
@@ -223,7 +248,7 @@ func phaseClassify(ctx context.Context, items []walkItem, rs *Ruleset, opts DirO
 		}
 		end := min(i+batchSize, len(items))
 		batch := items[i:end]
-		moves, errs := classifyBatch(ctx, batch, rs, opts)
+		moves, errs := classifyBatch(ctx, batch, rs, opts, onItem)
 		rep.Errors += errs
 		for _, mv := range moves {
 			rep.Classified[mv.Label]++
@@ -241,7 +266,7 @@ func phaseClassify(ctx context.Context, items []walkItem, rs *Ruleset, opts DirO
 	return firstErr
 }
 
-func classifyBatch(ctx context.Context, batch []walkItem, rs *Ruleset, opts DirOpts) ([]ClassifyMove, int) {
+func classifyBatch(ctx context.Context, batch []walkItem, rs *Ruleset, opts DirOpts, onItem func()) ([]ClassifyMove, int) {
 	type result struct {
 		mv  *ClassifyMove
 		err error
@@ -261,6 +286,9 @@ func classifyBatch(ctx context.Context, batch []walkItem, rs *Ruleset, opts DirO
 	var moves []ClassifyMove
 	errs := 0
 	for r := range ch {
+		if onItem != nil {
+			onItem()
+		}
 		if r.err != nil {
 			errs++
 			continue

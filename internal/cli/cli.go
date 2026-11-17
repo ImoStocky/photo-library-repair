@@ -103,8 +103,8 @@ Usage:
   plr apply    --target DIR [--dry-run] [--no-exif] [--move] [--strict] [--db PATH]
                [--filter-rules PATH] [--denied-dir PATH]
   plr filter   --dir DIR --filter-rules PATH [--denied-dir PATH] [--dry-run]
-               [--db PATH] [--explain FILE] [--workers N] [--no-model]
-               [--model SOURCE]
+               [--db PATH] [--explain FILE] [--workers N] [--limit N]
+               [--no-model] [--model SOURCE]
   plr build    --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr increment --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr commit   [--message TEXT] [--db PATH]
@@ -344,6 +344,7 @@ func runFilter(args []string) int {
 	flatten := fs.Bool("flatten", false, "restore classified files to flat pre-classify paths (classify-manifest.jsonl)")
 	restoreDenied := fs.Bool("denied", false, "restore dropped files from denied-dir/manifest.jsonl")
 	workers := fs.Int("workers", 4, "parallel filter/classify workers (also classify batch size)")
+	limit := fs.Int("limit", 0, "max images to process after walk (0 = all)")
 	noModel := fs.Bool("no-model", false, "skip classify rules (drop/accept/tag only)")
 	modelSource := fs.String("model", kronkai.DefaultVisionModel, "Kronk vision model for classify rules")
 	if err := fs.Parse(args); err != nil {
@@ -391,8 +392,13 @@ func runFilter(args []string) int {
 		exifLoad = filterExifLoader(tool)
 	}
 
-	opts := filter.DirOpts{Workers: *workers, Exif: exifLoad}
+	opts := filter.DirOpts{Workers: *workers, Limit: *limit, Exif: exifLoad}
+	dropProg := progress.New("filter")
+	defer dropProg.Stop()
+	opts.OnDropProgress = func(_, total int64) { dropProg.SetTotal(total); dropProg.Add(1) }
+
 	ctx := context.Background()
+	var classProg *progress.Reporter
 	if rs.HasClassify && !*noModel {
 		var stop context.CancelFunc
 		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -407,6 +413,10 @@ func runFilter(args []string) int {
 		opts.ClassMover = &filter.ClassMover{Root: *dir, DryRun: *dryRun, Out: out}
 		defer opts.ClassMover.Close()
 		fmt.Printf("vision model %s loaded; classify enabled\n", vc.Name())
+
+		classProg = progress.New("classify")
+		defer classProg.Stop()
+		opts.OnClassifyProgress = func(_, total int64) { classProg.SetTotal(total); classProg.Add(1) }
 
 		if !*dryRun {
 			s, err := store.Open(*db)
@@ -427,6 +437,10 @@ func runFilter(args []string) int {
 	}
 
 	rep, err := filter.FilterDir(ctx, *dir, rs, denier, opts)
+	dropProg.Stop()
+	if classProg != nil {
+		classProg.Stop()
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr filter:", err)
 		return 1

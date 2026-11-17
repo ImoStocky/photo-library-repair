@@ -45,9 +45,24 @@ rules:
 	denier := NewDenier(denied, false, nil)
 	defer denier.Close()
 
-	rep, err := FilterDir(t.Context(), root, rs, denier, DirOpts{Workers: 2})
+	var dropCalls int
+	rep, err := FilterDir(t.Context(), root, rs, denier, DirOpts{
+		Workers: 2,
+		OnDropProgress: func(done, total int64) {
+			dropCalls++
+			if total != 2 {
+				t.Fatalf("drop total=%d, want 2", total)
+			}
+			if done < 1 || done > total {
+				t.Fatalf("drop done=%d total=%d", done, total)
+			}
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if dropCalls != 2 {
+		t.Fatalf("OnDropProgress calls=%d, want 2", dropCalls)
 	}
 	if rep.Dropped["abnormal-aspect-ratio"] != 1 {
 		t.Fatalf("dropped=%v", rep.Dropped)
