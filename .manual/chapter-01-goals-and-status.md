@@ -62,7 +62,7 @@ SQLite `plr.db`: `sources` / `images` / `groups`. Local CLI only.
 | Metadata engine | `internal/exif` | Done — embedded ExifTool 13.59 (WebAssembly, pure Go): reads every available tag, writes merged facts, preserves all other tags; built-in minimal reader/writer as fallback |
 | Materialize / apply | `internal/apply` | Done — copy + merged EXIF via the engine (all other tags preserved); `--move` deletes the source after a successful copy; writes `report.json` |
 | One-shot | `plr build` | Done |
-| Incremental growth | `plr increment` | Done — scan + group + plan + apply into the existing DB; S6 partition actions (present/matched/new) remain out of scope |
+| Incremental growth | `plr increment` | Done — scan + group + plan + apply into the existing DB; S6 partition (present/joined/new) + ambiguity → `ambiguous_merge` plan conflict; `--strict` optional pre-apply gate |
 | Kronk conflict resolve | `internal/kronk` | Done — opt-in `plr plan --ai` (Kronk decision model); rules remain the default |
 
 ## Related

@@ -81,7 +81,18 @@ Mid-walk `known` sha256 growth (already landed) prunes fingerprinting of byte-id
 2. Counters: candidates/incoming, SameFunc calls, sha256 short-circuits.
 3. Checkpoint `SetGroupAssignments` in batches so a kill does not lose all group work (optional).
 
-## Suggested order
+## Status (2026-11)
+
+| Item | Status |
+| --- | --- |
+| P0 band + sha256 index | Landed (`buildLibIndex` / `classifyIndexed`) |
+| P1 rotation cache / pool | Landed (`phash.Rotations` / min-rot path) |
+| P2 group representatives | Landed where used by Partition shortlist |
+| P3 parallel Partition | Landed (`partitionParallel`, threshold 64) |
+| P4 scan known-sha prune | Landed earlier |
+| P5 timers / PartitionStats | Landed (stderr phase timers + `PartitionWithStats`; mirrored into `report.json` `stages` on build/increment) |
+
+## Suggested order (historical)
 
 1. **P0** band + sha256 index in Partition (must-have).  
 2. **P1** rotation cache / pool (multiplies with P0; cheap alone).  

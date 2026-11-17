@@ -112,7 +112,7 @@ func TestPartitionUnhashableStaysUnmatched(t *testing.T) {
 func TestPartitionParallelMatchesSerial(t *testing.T) {
 	lib := []LibMember{libm(1, "aaa", hZero, 100, 100)}
 	var comps [][]Image
-	for i := 0; i < partitionParallelMin+8; i++ {
+	for i := range partitionParallelMin + 8 {
 		sha := "n" + string(rune('a'+i%26)) + string(rune('0'+i/26))
 		ph := hOne
 		if i%5 == 0 {
@@ -181,9 +181,9 @@ func TestPartitionMatchesGroupRepresentative(t *testing.T) {
 	// Incoming is near the smaller member's hash — still must join group 1
 	// via the rep when hashes are equal across the group.
 	lib := []LibMember{
-		{Image: Image{ID: "small", SHA256: "s", Phash: hZero, Width: 50, Height: 50}, GroupID: 1},
-		{Image: Image{ID: "big", SHA256: "b", Phash: hZero, Width: 200, Height: 200}, GroupID: 1},
-		{Image: Image{ID: "other", SHA256: "o", Phash: hFar, Width: 200, Height: 200}, GroupID: 2},
+		{ID: "small", SHA256: "s", Phash: hZero, Width: 50, Height: 50, GroupID: 1},
+		{ID: "big", SHA256: "b", Phash: hZero, Width: 200, Height: 200, GroupID: 1},
+		{ID: "other", SHA256: "o", Phash: hFar, Width: 200, Height: 200, GroupID: 2},
 	}
 	comps := [][]Image{{
 		{ID: "n1", SHA256: "in", Phash: hOne, Width: 100, Height: 100},

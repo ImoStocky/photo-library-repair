@@ -23,6 +23,11 @@ changes.
 | `--ai` (plan) | off | settle conflict groups with the Kronk decision model |
 | `--model` (plan) | `chaoliangUNSW/Jev-Style-0.8B-Decision-v3-Q8_0` | Kronk decision model source |
 | `--target` (apply, build, increment) | — (required) | materialize destination |
+| `--filter-rules` (apply, filter, build, increment) | off | YAML firewall rules on the materialized library (apply gate / `plr filter`) |
+| `--denied-dir` (apply, filter, build, increment) | `<target-or-dir>/denied` | where filter drops are moved |
+| `--db` (filter) | `plr.db` | SQLite library whose apply ledger is cleared for drops |
+| `--dry-run` (filter; apply/build/increment) | off | report-only (apply also skips copies; with filter rules, skips deny moves; filter skips ledger clears) |
+| `--explain` (filter) | off | print per-rule match detail for one file and exit |
 | `--dry-run` / `--no-exif` / `--move` (apply, build, increment) | off | report-only / skip EXIF write / delete source after copy |
 | `--message` (commit) | `plan` | commit summary |
 | `--to` (rollback) | latest commit | commit id to restore |

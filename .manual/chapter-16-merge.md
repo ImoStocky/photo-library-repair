@@ -5,8 +5,8 @@
 **Spec:** [chapter 02 §2.5](chapter-02-semantics.md).
 **Workflow:** [chapter 03 Phase 3](chapter-03-workflow.md).
 **Status:** Core implemented (2026-10-27); S7 action marking implemented at
-apply time via the apply ledger (2026-10-28); ambiguity plan conflicts still
-deferred.
+apply time via the apply ledger (2026-10-28); ambiguity → plan conflict
+kind `ambiguous_merge` (2026-11-17).
 
 ## Responsibility
 
@@ -24,7 +24,9 @@ themselves, refines per `--identity`, then partitions them against the
 library (chapter-16 match table): present and matched members join their
 library group, unmatched members become new groups. Ties across groups
 join the lowest id and print an ambiguity warning instead of merging the
-library groups. It does **not** yet emit ambiguity conflicts in the plan.
+library groups, and the next plan marks that group as a conflict with kind
+`ambiguous_merge` (join assignment kept so non-strict apply can still
+best-effort materialize).
 
 The present/matched/new *actions* and name-collision prefixes are realized
 at apply time: apply keeps a `group_outputs` ledger per target directory

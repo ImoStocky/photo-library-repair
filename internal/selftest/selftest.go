@@ -146,6 +146,7 @@ func (e *env) groupPlan() (plans []store.Group, members map[int64][]string, err 
 			ID:              id,
 			Status:          p.Status,
 			Reason:          p.Reason,
+			ConflictKind:    p.Kind,
 			PixelImageID:    p.PixelImageID,
 			PixelPhash:      p.PixelPhash,
 			CaptureImageID:  p.CaptureImageID,
@@ -432,8 +433,8 @@ func checkConflicts() Check {
 	if !ok || gpsPlan.Status != group.StatusConflict {
 		return Check{Name: name, Detail: fmt.Sprintf("GPS group: status %q reason %q (want conflict)", gpsPlan.Status, gpsPlan.Reason)}
 	}
-	if !strings.Contains(gpsPlan.Reason, "GPS") {
-		return Check{Name: name, Detail: fmt.Sprintf("GPS conflict reason %q (want a GPS complaint)", gpsPlan.Reason)}
+	if gpsPlan.ConflictKind != group.ConflictKindGPS || !strings.Contains(gpsPlan.Reason, "GPS") {
+		return Check{Name: name, Detail: fmt.Sprintf("GPS conflict kind %q reason %q", gpsPlan.ConflictKind, gpsPlan.Reason)}
 	}
 	dupPlan, ok := planFor(plans, members, "IMG_E1.jpg")
 	if !ok || dupPlan.Status != group.StatusResolved {
@@ -443,8 +444,8 @@ func checkConflicts() Check {
 	if !ok || orphanPlan.Status != group.StatusConflict {
 		return Check{Name: name, Detail: fmt.Sprintf("undecodable group: status %q reason %q (want conflict)", orphanPlan.Status, orphanPlan.Reason)}
 	}
-	if !strings.Contains(orphanPlan.Reason, "decoded") {
-		return Check{Name: name, Detail: fmt.Sprintf("undecodable conflict reason %q (want an undecodable complaint)", orphanPlan.Reason)}
+	if orphanPlan.ConflictKind != group.ConflictKindUndecodable || !strings.Contains(orphanPlan.Reason, "decoded") {
+		return Check{Name: name, Detail: fmt.Sprintf("undecodable kind %q reason %q", orphanPlan.ConflictKind, orphanPlan.Reason)}
 	}
 	return Check{Name: name, OK: true}
 }

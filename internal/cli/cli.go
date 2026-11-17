@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"slices"
@@ -19,6 +20,7 @@ import (
 
 	"photo-library-repair/internal/apply"
 	"photo-library-repair/internal/exif"
+	"photo-library-repair/internal/filter"
 	"photo-library-repair/internal/fingerprint"
 	"photo-library-repair/internal/group"
 	"photo-library-repair/internal/ingest"
@@ -67,6 +69,8 @@ func Run(args []string) int {
 		return runPlan(rest)
 	case "apply":
 		return runApply(rest)
+	case "filter":
+		return runFilter(rest)
 	case "build":
 		return runBuild(rest)
 	case "increment":
@@ -96,7 +100,10 @@ Usage:
   plr group    [--max-hamming-chunking N] [--identity exif-first|pass|double-phash]
                [--same-image-window DUR] [--db PATH]
   plr plan     [--ai] [--model SOURCE] [--db PATH]
-  plr apply    --target DIR [--dry-run] [--no-exif] [--move] [--db PATH]
+  plr apply    --target DIR [--dry-run] [--no-exif] [--move] [--strict] [--db PATH]
+               [--filter-rules PATH] [--denied-dir PATH]
+  plr filter   --dir DIR --filter-rules PATH [--denied-dir PATH] [--dry-run]
+               [--db PATH] [--explain FILE] [--workers N]
   plr build    --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr increment --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr commit   [--message TEXT] [--db PATH]
@@ -139,7 +146,15 @@ Commands:
             source file is deleted once its copy is in place. Writes a
             report.json summary into --target. Conflict groups materialize
             as a plain copy of their best-effort pixels and the ledger
-            records the conflict reason.
+            records the conflict reason. --strict refuses to write when any
+            unresolved conflict remains (default off). Optional
+            --filter-rules skips materializing drops and moves an existing
+            target file to --denied-dir (default <target>/denied).
+  filter    Walk a materialized library (--dir), apply YAML firewall rules,
+            and move drops to --denied-dir (default <dir>/denied). Clears
+            matching apply-ledger rows in --db (default plr.db) so a later
+            apply does not treat moved files as still present.
+            --explain FILE prints per-rule match detail for one file.
   build     scan + group + plan + apply in one go.
    increment Merge new photos into an existing library: scan the new dirs
              into the same DB, then partition them against the library
@@ -197,7 +212,149 @@ func runScan(args []string) int {
 	if tool != nil {
 		defer tool.Close()
 	}
-	return runScanPhase(s, dirs, *force, *workers, *minSizeKB, *photosLibraryAll, tool, cfg)
+	return runScanPhaseCounted(s, scanPhaseOpts{
+		Dirs:             dirs,
+		Force:            *force,
+		Workers:          *workers,
+		MinSizeKB:        *minSizeKB,
+		PhotosLibraryAll: *photosLibraryAll,
+		Tool:             tool,
+		Cfg:              cfg,
+	}, nil)
+}
+
+func loadFilterRules(path string) (*filter.Ruleset, error) {
+	if path == "" {
+		return nil, nil
+	}
+	return filter.Load(path)
+}
+
+func filterExifLoader(tool *exif.Tool) filter.ExifLoader {
+	if tool == nil {
+		return nil
+	}
+	return func(path string) (map[string]string, error) {
+		m, err := tool.Read(path)
+		if err != nil {
+			return nil, err
+		}
+		out := make(map[string]string, len(m))
+		for k, v := range m {
+			out[k] = fmt.Sprint(v)
+		}
+		return out, nil
+	}
+}
+
+func runFilterExplain(rulesPath, file string) int {
+	rs, err := filter.Load(rulesPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr filter:", err)
+		return 2
+	}
+	info, err := filter.LoadImageInfo(file, file, nil)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr filter:", err)
+		return 1
+	}
+	dec, steps := rs.Explain(info)
+	fmt.Printf("file %s  format=%s %dx%d size=%d\n", file, info.Format, info.Width, info.Height, info.Size)
+	for _, s := range steps {
+		fmt.Printf("  rule=%s matched=%v action=%s %s\n", s.Rule, s.Matched, s.Action, s.Detail)
+	}
+	fmt.Printf("decision action=%s rule=%s tags=%v\n", dec.Action, dec.Rule, dec.Tags)
+	return 0
+}
+
+func runFilter(args []string) int {
+	fs := flag.NewFlagSet("filter", flag.ExitOnError)
+	dir := fs.String("dir", "", "materialized library directory to filter")
+	filterRules := fs.String("filter-rules", "", "YAML firewall rules (required)")
+	deniedDir := fs.String("denied-dir", "", "where dropped images are moved (default: <dir>/denied)")
+	dryRun := fs.Bool("dry-run", false, "print planned drops without moving files")
+	db := fs.String("db", "plr.db", "SQLite library whose apply ledger is cleared for drops")
+	explain := fs.String("explain", "", "print per-rule match detail for one file and exit")
+	workers := fs.Int("workers", 4, "parallel filter workers")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *explain != "" {
+		if *filterRules == "" {
+			fmt.Fprintln(os.Stderr, "plr filter: --explain requires --filter-rules")
+			return 2
+		}
+		return runFilterExplain(*filterRules, *explain)
+	}
+	if *dir == "" || *filterRules == "" {
+		fmt.Fprintln(os.Stderr, "plr filter: --dir and --filter-rules are required")
+		return 2
+	}
+	rs, err := loadFilterRules(*filterRules)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr filter:", err)
+		return 2
+	}
+	denied := *deniedDir
+	if denied == "" {
+		denied = filepath.Join(*dir, "denied")
+	}
+	var out io.Writer
+	if *dryRun {
+		out = os.Stdout
+	}
+	denier := filter.NewDenier(denied, *dryRun, out)
+	defer denier.Close()
+	tool := openEXIF("filter")
+	if tool != nil {
+		defer tool.Close()
+	}
+	var exifLoad filter.ExifLoader
+	if rs.NeedsEXIF {
+		exifLoad = filterExifLoader(tool)
+	}
+	rep, err := filter.FilterDir(*dir, rs, denier, *workers, exifLoad)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr filter:", err)
+		return 1
+	}
+	cleared := 0
+	if !*dryRun && len(rep.DropRels) > 0 {
+		s, err := store.Open(*db)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "plr filter:", err)
+			return 1
+		}
+		cleared, err = apply.ClearDroppedOutputs(s, *dir, rep.DropRels)
+		s.Close()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "plr filter: ledger:", err)
+			return 1
+		}
+	}
+	fmt.Printf("filter: seen %d", rep.Seen)
+	if len(rep.Dropped) > 0 {
+		keys := make([]string, 0, len(rep.Dropped))
+		for k := range rep.Dropped {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fmt.Printf(", dropped")
+		for _, k := range keys {
+			fmt.Printf(" %s=%d", k, rep.Dropped[k])
+		}
+	}
+	if cleared > 0 {
+		fmt.Printf(", ledger_cleared=%d", cleared)
+	}
+	if rep.Errors > 0 {
+		fmt.Printf(", errors=%d", rep.Errors)
+	}
+	fmt.Println()
+	if rep.Errors > 0 {
+		return 1
+	}
+	return 0
 }
 
 // parseDuration parses a duration that may also be given as bare seconds
@@ -219,17 +376,27 @@ func parsePhashConfig(alg string, size int) (phash.Config, error) {
 	return cfg.Normalize()
 }
 
-// runScanPhase is the scan step, shared by "plr scan" and "plr build".
-func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB int, photosLibraryAll bool, tool *exif.Tool, cfg phash.Config) int {
-	hasher := fingerprint.Hasher(cfg, tool)
+type scanPhaseOpts struct {
+	Dirs             []string
+	Force            bool
+	Workers          int
+	MinSizeKB        int
+	PhotosLibraryAll bool
+	Tool             *exif.Tool
+	Cfg              phash.Config
+}
+
+// runScanPhaseCounted is the scan step, shared by "plr scan" and "plr build".
+func runScanPhaseCounted(s *store.Store, opts scanPhaseOpts, stages *apply.StageCounters) int {
+	hasher := fingerprint.Hasher(opts.Cfg, opts.Tool)
 	prog := progress.New("scan")
 	defer prog.Stop()
 	rep, err := ingest.Scan(s, ingest.Options{
-		Dirs:             dirs,
-		Force:            force,
-		Workers:          workers,
-		MinSize:          int64(minSizeKB) * 1024,
-		PhotosLibraryAll: photosLibraryAll,
+		Dirs:             opts.Dirs,
+		Force:            opts.Force,
+		Workers:          opts.Workers,
+		MinSize:          int64(opts.MinSizeKB) * 1024,
+		PhotosLibraryAll: opts.PhotosLibraryAll,
 		OnProgress:       func(done, total int64) { prog.SetTotal(total); prog.Add(1) },
 	}, hasher)
 	if err != nil {
@@ -237,6 +404,12 @@ func runScanPhase(s *store.Store, dirs []string, force bool, workers, minSizeKB 
 		return 1
 	}
 	prog.Stop()
+	if stages != nil {
+		stages.ScanCached = rep.ImagesCached
+		stages.ScanAlreadyKnown = rep.ImagesSkipped
+		stages.ScanAdded = rep.ImagesAdded
+		stages.ScanUpdated = rep.ImagesUpdated
+	}
 	fmt.Printf("scanned %d dir(s), skipped %d already scanned\n", rep.DirsScanned, rep.DirsSkipped)
 	fmt.Printf("files seen %d: %d added, %d updated, %d cached, %d already-known, %d non-image, %d errors\n",
 		rep.FilesSeen, rep.ImagesAdded, rep.ImagesUpdated, rep.ImagesCached, rep.ImagesSkipped, rep.NonImage, rep.Errors)
@@ -332,7 +505,7 @@ func runGroupPhase(s *store.Store, opts groupPhaseOpts) int {
 // Present members join the group they duplicate, matched members join the
 // closest library group, and unmatched members form new groups. Library
 // groups never chain into each other through incoming images.
-func runIncrementGroupPhase(s *store.Store, opts groupPhaseOpts, before map[string]bool) int {
+func runIncrementGroupPhaseCounted(s *store.Store, opts groupPhaseOpts, before map[string]bool, stages *apply.StageCounters) int {
 	strat, err := identityStrategy(s, opts)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr increment:", err)
@@ -388,16 +561,19 @@ func runIncrementGroupPhase(s *store.Store, opts groupPhaseOpts, before map[stri
 		pstats.Incoming, pstats.SHAHits, pstats.Candidates, pstats.SameCalls, pstats.LibMembers)
 	assign := make(map[string]int64, len(incoming))
 	ambiguous := 0
+	ambGroups := map[int64]bool{}
 	for _, p := range present {
 		assign[p.ID] = p.GroupID
 		if p.Ambiguous {
 			ambiguous++
+			ambGroups[p.GroupID] = true
 		}
 	}
 	for _, m := range matched {
 		assign[m.ID] = m.GroupID
 		if m.Ambiguous {
 			ambiguous++
+			ambGroups[m.GroupID] = true
 		}
 	}
 	next := int64(0)
@@ -420,10 +596,28 @@ func runIncrementGroupPhase(s *store.Store, opts groupPhaseOpts, before map[stri
 		fmt.Fprintln(os.Stderr, "plr increment:", err)
 		return 1
 	}
+	ambIDs := make([]int64, 0, len(ambGroups))
+	for id := range ambGroups {
+		ambIDs = append(ambIDs, id)
+	}
+	slices.Sort(ambIDs)
+	if err := s.ReplaceAmbiguousGroups(ambIDs); err != nil {
+		fmt.Fprintln(os.Stderr, "plr increment:", err)
+		return 1
+	}
+	if stages != nil {
+		stages.Present = len(present)
+		stages.Joined = len(matched)
+		stages.New = len(unmatched)
+		stages.Ambiguous = ambiguous
+		stages.PartitionSHAHits = pstats.SHAHits
+		stages.PartitionCandidates = pstats.Candidates
+		stages.PartitionSameCalls = pstats.SameCalls
+	}
 	fmt.Printf("increment: %d incoming -> %d present, %d joined, %d new (%d ambiguous) [identity=%s]\n",
 		len(incoming), len(present), len(matched), len(unmatched), ambiguous, strat.Name())
 	if ambiguous > 0 {
-		fmt.Printf("warning: %d incoming images match more than one library group; joined the lowest group id\n", ambiguous)
+		fmt.Printf("warning: %d incoming images match more than one library group; joined the lowest group id (plan conflict ambiguous_merge)\n", ambiguous)
 	}
 	return 0
 }
@@ -529,6 +723,11 @@ func runPlanPhase(s *store.Store, res group.Resolver) int {
 		byGroup[im.GroupID] = append(byGroup[im.GroupID], toGroupImage(im))
 		assign[im.ID] = im.GroupID
 	}
+	ambiguous, err := s.AmbiguousGroups()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr plan:", err)
+		return 1
+	}
 	counts := map[string]int{}
 	ids := make([]int64, 0, len(byGroup))
 	for id := range byGroup {
@@ -542,6 +741,9 @@ func runPlanPhase(s *store.Store, res group.Resolver) int {
 	plans := make([]store.Group, 0, len(ids))
 	for _, id := range ids {
 		p := group.ResolveGroup(byGroup[id], res)
+		if ambiguous[id] {
+			p = group.MarkAmbiguousMerge(p)
+		}
 		if p.ResolvedBy != group.Rules {
 			aiSettled++
 		}
@@ -549,6 +751,7 @@ func runPlanPhase(s *store.Store, res group.Resolver) int {
 			ID:              id,
 			Status:          p.Status,
 			Reason:          p.Reason,
+			ConflictKind:    p.Kind,
 			ResolvedBy:      p.ResolvedBy,
 			PixelImageID:    p.PixelImageID,
 			PixelPhash:      p.PixelPhash,
@@ -568,6 +771,10 @@ func runPlanPhase(s *store.Store, res group.Resolver) int {
 		fmt.Fprintln(os.Stderr, "plr plan:", err)
 		return 1
 	}
+	if err := s.ClearAmbiguousGroups(); err != nil {
+		fmt.Fprintln(os.Stderr, "plr plan:", err)
+		return 1
+	}
 	fmt.Printf("%d groups: %d resolved, %d conflicts, %d singletons\n",
 		len(ids), counts[group.StatusResolved], counts[group.StatusConflict], counts[group.StatusSingleton])
 	if res != nil {
@@ -582,12 +789,20 @@ func runApply(args []string) int {
 	dryRun := fs.Bool("dry-run", false, "report what would be copied without touching the target")
 	noEXIF := fs.Bool("no-exif", false, "copy files without writing merged EXIF")
 	move := fs.Bool("move", false, "delete each source file once its copy is in place in --target")
+	strict := fs.Bool("strict", false, "refuse to materialize when unresolved conflict groups remain")
 	db := fs.String("db", "plr.db", "path to the SQLite library")
+	filterRules := fs.String("filter-rules", "", "YAML firewall rules; omit to disable filtering")
+	deniedDir := fs.String("denied-dir", "", "where filter drops are moved (default: <target>/denied)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if *target == "" {
 		fmt.Fprintln(os.Stderr, "plr apply: --target is required")
+		return 2
+	}
+	rs, err := loadFilterRules(*filterRules)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr apply:", err)
 		return 2
 	}
 	s, err := store.Open(*db)
@@ -600,12 +815,20 @@ func runApply(args []string) int {
 	if tool != nil {
 		defer tool.Close()
 	}
+	var exifLoad filter.ExifLoader
+	if rs != nil && rs.NeedsEXIF {
+		exifLoad = filterExifLoader(tool)
+	}
 	return runApplyPhase(s, apply.Options{
-		Target: *target,
-		DryRun: *dryRun,
-		NoEXIF: *noEXIF,
-		Move:   *move,
-		EXIF:   tool,
+		Target:    *target,
+		DryRun:    *dryRun,
+		NoEXIF:    *noEXIF,
+		Move:      *move,
+		Strict:    *strict,
+		EXIF:      tool,
+		Filter:    rs,
+		DeniedDir: *deniedDir,
+		ExifLoad:  exifLoad,
 	})
 }
 
@@ -615,10 +838,6 @@ func runApplyPhase(s *store.Store, opts apply.Options) int {
 	defer prog.Stop()
 	opts.OnProgress = func(done, total int64) { prog.SetTotal(total); prog.Add(1) }
 	rep, err := apply.Apply(s, opts)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "plr apply:", err)
-		return 1
-	}
 	prog.Stop()
 	for _, f := range rep.Files {
 		line := fmt.Sprintf("%s %s -> %s", applyVerb(f.Action, opts), f.Source, f.Dest)
@@ -632,6 +851,22 @@ func runApplyPhase(s *store.Store, opts apply.Options) int {
 	}
 	fmt.Printf("apply: %d new, %d updated, %d renamed, %d unchanged\n",
 		rep.Copied, rep.Updated, rep.Renamed, rep.Untouched)
+	if len(rep.FilterDropped) > 0 {
+		keys := make([]string, 0, len(rep.FilterDropped))
+		for k := range rep.FilterDropped {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fmt.Printf("filter dropped:")
+		for _, k := range keys {
+			fmt.Printf(" %s=%d", k, rep.FilterDropped[k])
+		}
+		fmt.Println()
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr apply:", err)
+		return 1
+	}
 	if len(rep.Errors) > 0 {
 		return 1
 	}
@@ -649,6 +884,8 @@ func applyVerb(action string, opts apply.Options) string {
 			return "would rewrite"
 		case apply.ActionRenamed:
 			return "would rename"
+		case apply.ActionDropped:
+			return "would drop"
 		default: // new
 			if opts.Move {
 				return "would move"
@@ -663,6 +900,8 @@ func applyVerb(action string, opts apply.Options) string {
 		return "rewrote"
 	case apply.ActionRenamed:
 		return "renamed"
+	case apply.ActionDropped:
+		return "dropped"
 	default: // new
 		if opts.Move {
 			return "moved"
@@ -704,15 +943,18 @@ func runPipeline(cmd string, args []string) int {
 	sameWindowStr := fs.String("same-image-window", "1s", "exif-first: zone-resolved capture-time gap that means the same image; a bare number is seconds")
 	blockH := fs.Int("identity-block-hamming", 0, "dual-hash gate: max blockhash-16 distance (0 = strategy default: 10 exif-first, 24 double-phash)")
 	gradH := fs.Int("identity-grad-hamming", 0, "dual-hash gate: max double-gradient-16 distance (0 = strategy default: 10 exif-first, 20 double-phash)")
-	dryRun := fs.Bool("dry-run", false, "report what would be copied without touching the target")
+	dryRun := fs.Bool("dry-run", false, "report what would be copied / filter-dropped without touching files")
 	noEXIF := fs.Bool("no-exif", false, "copy files without writing merged EXIF")
 	move := fs.Bool("move", false, "delete each source file once its copy is in place in --target")
+	strict := fs.Bool("strict", false, "refuse to materialize when unresolved conflict groups remain")
 	db := fs.String("db", "plr.db", "path to the SQLite library")
 	workers := fs.Int("workers", 4, "number of hash workers")
 	minSizeKB := fs.Int("min-size-kb", 0, "ignore images smaller than this many kilobytes")
 	photosLibraryAll := fs.Bool("photoslibrary-all", false, ".photoslibrary bundles (Apple Photos) anywhere in the tree: scan whole bundles instead of only originals/")
 	phashAlg := fs.String("phash-alg", "dct", "candidate perceptual hash (default dct)")
 	phashSize := fs.Int("phash-size", 0, "square DCT size 8, 16, or 32 (0 = legacy 16x8 DCT)")
+	filterRules := fs.String("filter-rules", "", "YAML firewall rules applied during apply; omit to disable")
+	deniedDir := fs.String("denied-dir", "", "where filter drops are moved (default: <target>/denied)")
 	fs.Var(&dirs, "dir", "directory to scan (repeatable)")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -722,6 +964,11 @@ func runPipeline(cmd string, args []string) int {
 		return 2
 	}
 	cfg, err := parsePhashConfig(*phashAlg, *phashSize)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "plr "+cmd+":", err)
+		return 2
+	}
+	rs, err := loadFilterRules(*filterRules)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "plr "+cmd+":", err)
 		return 2
@@ -755,11 +1002,26 @@ func runPipeline(cmd string, args []string) int {
 			libSnapshot[im.ID] = true
 		}
 	}
+	stages := &apply.StageCounters{}
+	identityName := *identity
+	if identityName == "" {
+		identityName = "exif-first"
+	}
 	phases := []struct {
 		label string
 		fn    func() int
 	}{
-		{"scan", func() int { return runScanPhase(s, dirs, *force, *workers, *minSizeKB, *photosLibraryAll, tool, cfg) }},
+		{"scan", func() int {
+			return runScanPhaseCounted(s, scanPhaseOpts{
+				Dirs:             dirs,
+				Force:            *force,
+				Workers:          *workers,
+				MinSizeKB:        *minSizeKB,
+				PhotosLibraryAll: *photosLibraryAll,
+				Tool:             tool,
+				Cfg:              cfg,
+			}, stages)
+		}},
 		{"group", func() int {
 			opts := groupPhaseOpts{
 				MaxHamming: *maxHamming,
@@ -769,19 +1031,29 @@ func runPipeline(cmd string, args []string) int {
 				GradH:      *gradH,
 			}
 			if cmd == "increment" && len(libSnapshot) > 0 {
-				return runIncrementGroupPhase(s, opts, libSnapshot)
+				return runIncrementGroupPhaseCounted(s, opts, libSnapshot, stages)
 			}
 			return runGroupPhase(s, opts)
 		}},
 		{"plan", func() int { return runPlanPhase(s, nil) }},
 		{"commit", func() int { return runCommitPhase(s, cmd) }},
 		{"apply", func() int {
+			var exifLoad filter.ExifLoader
+			if rs != nil && rs.NeedsEXIF {
+				exifLoad = filterExifLoader(tool)
+			}
 			return runApplyPhase(s, apply.Options{
-				Target: *target,
-				DryRun: *dryRun,
-				NoEXIF: *noEXIF,
-				Move:   *move,
-				EXIF:   tool,
+				Target:    *target,
+				DryRun:    *dryRun,
+				NoEXIF:    *noEXIF,
+				Move:      *move,
+				Strict:    *strict,
+				Identity:  identityName,
+				Stages:    stages,
+				EXIF:      tool,
+				Filter:    rs,
+				DeniedDir: *deniedDir,
+				ExifLoad:  exifLoad,
 			})
 		}},
 	}
@@ -964,7 +1236,11 @@ func runReport(args []string) int {
 	if len(conflicts) > 0 {
 		fmt.Println("\nconflicts:")
 		for _, g := range conflicts {
-			fmt.Printf("  #%d %s\n", g.ID, g.Reason)
+			if g.ConflictKind != "" {
+				fmt.Printf("  #%d [%s] %s\n", g.ID, g.ConflictKind, g.Reason)
+			} else {
+				fmt.Printf("  #%d %s\n", g.ID, g.Reason)
+			}
 		}
 	}
 

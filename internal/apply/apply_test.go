@@ -4,11 +4,14 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"image"
+	"image/jpeg"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"photo-library-repair/internal/filter"
 	"photo-library-repair/internal/group"
 	"photo-library-repair/internal/meta"
 	"photo-library-repair/internal/store"
@@ -233,6 +236,59 @@ func TestApplyCopiesConflictsPlainly(t *testing.T) {
 	}
 	if ledger[1].Conflict != "offsets disagree" {
 		t.Fatalf("ledger conflict = %q, want the plan reason", ledger[1].Conflict)
+	}
+}
+
+func TestApplyStrictRefusesConflicts(t *testing.T) {
+	s, srcDir, sid := newStore(t)
+	addFile(t, srcDir, "a.jpg", testimg.JPEG(testimg.Textured(32, 24, 1), 90))
+	addImage(t, s, sid, "a.jpg", "a.jpg", "a", "jpeg", 100)
+	if err := s.SaveGroup(store.Group{ID: 1, Status: group.StatusConflict, ConflictKind: group.ConflictKindGPS,
+		Reason: "EXIF GPS positions differ", PixelImageID: "a", CaptureInstant: instant, StoredName: "a.jpg"}); err != nil {
+		t.Fatal(err)
+	}
+	target := t.TempDir()
+	_, err := Apply(s, Options{Target: target, Strict: true})
+	if err == nil {
+		t.Fatal("strict apply must refuse unresolved conflicts")
+	}
+	entries, _ := os.ReadDir(target)
+	if len(entries) != 0 {
+		t.Fatalf("strict apply must write nothing: %v", entries)
+	}
+	rep, err := Apply(s, Options{Target: target, Strict: true, DryRun: true})
+	if err == nil {
+		t.Fatal("strict dry-run must still fail")
+	}
+	if len(rep.Files) != 1 {
+		t.Fatalf("strict dry-run should still report: %+v", rep.Files)
+	}
+}
+
+func TestApplyCaptureFallbackOmitsDateTimeOriginal(t *testing.T) {
+	s, srcDir, sid := newStore(t)
+	src := addFile(t, srcDir, "a.jpg", testimg.JPEG(testimg.Textured(32, 24, 1), 90))
+	addImage(t, s, sid, "a.jpg", "a.jpg", "a", "jpeg", 100)
+	if err := s.SaveGroup(store.Group{ID: 1, Status: group.StatusResolved, PixelImageID: "a",
+		CaptureTime: "2024:05:01 12:30:00", CaptureInstant: instant, CaptureFallback: true,
+		StoredName: "a.jpg"}); err != nil {
+		t.Fatal(err)
+	}
+	target := t.TempDir()
+	if _, err := Apply(s, Options{Target: target}); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(target, "a.jpg")
+	data, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := os.ReadFile(src)
+	if string(data) != string(want) {
+		t.Fatal("fallback capture must not invent EXIF; expect plain copy")
+	}
+	if _, err := meta.FromJPEG(data); err == nil {
+		t.Fatal("fallback materialize must not write DateTimeOriginal")
 	}
 }
 
@@ -586,4 +642,115 @@ func mustReadFile(t *testing.T, path string) []byte {
 		t.Fatal(err)
 	}
 	return data
+}
+
+func writeSizedJPEG(t *testing.T, path string, w, h int) {
+	t.Helper()
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	img := image.NewRGBA(image.Rect(0, 0, w, h))
+	if err := jpeg.Encode(f, img, &jpeg.Options{Quality: 90}); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+}
+
+func TestApplyFilterSkipsDropAndRemovesExisting(t *testing.T) {
+	s, srcDir, sid := newStore(t)
+	writeSizedJPEG(t, filepath.Join(srcDir, "keep.jpg"), 800, 600)
+	writeSizedJPEG(t, filepath.Join(srcDir, "strip.jpg"), 4000, 200)
+	addImage(t, s, sid, "keep.jpg", "keep.jpg", "k", "jpeg", 100)
+	addImage(t, s, sid, "strip.jpg", "strip.jpg", "s", "jpeg", 100)
+	for _, g := range []store.Group{
+		{ID: 1, Status: group.StatusResolved, PixelImageID: "k", StoredName: "keep.jpg"},
+		{ID: 2, Status: group.StatusResolved, PixelImageID: "s", StoredName: "strip.jpg"},
+	} {
+		if err := s.SaveGroup(g); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rs, err := filter.LoadBytes([]byte(`
+version: 1
+default: accept
+rules:
+  - name: abnormal-aspect-ratio
+    match: { min_aspect_ratio: 16 }
+    action: drop
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target := t.TempDir()
+	if _, err := Apply(s, Options{Target: target}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "strip.jpg")); err != nil {
+		t.Fatal(err)
+	}
+
+	rep, err := Apply(s, Options{Target: target, Filter: rs})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.FilterDropped["abnormal-aspect-ratio"] != 1 {
+		t.Fatalf("dropped=%v", rep.FilterDropped)
+	}
+	if _, err := os.Stat(filepath.Join(target, "keep.jpg")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "strip.jpg")); !os.IsNotExist(err) {
+		t.Fatalf("strip.jpg still in target: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(target, "denied", "abnormal-aspect-ratio", "strip.jpg")); err != nil {
+		t.Fatal(err)
+	}
+	ledger, err := s.GroupOutputs(targetKey(target))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ledger[2]; ok {
+		t.Fatalf("dropped group still in ledger: %v", ledger)
+	}
+	if _, ok := ledger[1]; !ok {
+		t.Fatalf("kept group missing from ledger: %v", ledger)
+	}
+}
+
+func TestClearDroppedOutputs(t *testing.T) {
+	s, _, _ := newStore(t)
+	target := t.TempDir()
+	key := targetKey(target)
+	for _, row := range []struct {
+		gid  int64
+		name string
+	}{
+		{1, "keep.jpg"},
+		{2, "strip.jpg"},
+	} {
+		if err := s.SaveGroupOutput(key, row.gid, store.GroupOutput{Name: row.name, PixelID: "x"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := ClearDroppedOutputs(s, target, []string{"strip.jpg"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("cleared=%d", n)
+	}
+	ledger, err := s.GroupOutputs(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ledger[2]; ok {
+		t.Fatalf("strip still present: %v", ledger)
+	}
+	if _, ok := ledger[1]; !ok {
+		t.Fatalf("keep missing: %v", ledger)
+	}
 }

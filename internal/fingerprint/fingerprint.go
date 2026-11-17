@@ -9,13 +9,13 @@
 package fingerprint
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"image"
 	"image/gif"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"os"
 
 	"github.com/gen2brain/heic"
@@ -85,16 +85,15 @@ var IdentityExtras = []phash.Config{
 }
 
 func compute(path, kind string, t *exif.Tool, cfg phash.Config) (Info, error) {
-	// shortcut: loads the whole file; stream when huge RAWs become common
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Info{}, err
-	}
 	info := Info{Kind: kind}
 
-	img, err := decode(data, kind)
+	img, err := decodeFile(path, kind)
 	if err != nil {
 		if errors.Is(err, errNoDecoder) {
+			// Still try EXIF for jpeg/heic so unhashable rows can carry capture facts.
+			if kind == "jpeg" || kind == "heic" {
+				applyEXIF(&info, path, t)
+			}
 			return info, nil
 		}
 		return info, fmt.Errorf("decode %s: %w", path, err)
@@ -128,31 +127,39 @@ func compute(path, kind string, t *exif.Tool, cfg phash.Config) (Info, error) {
 			Alg: extra.Alg, Size: extra.Size, Hex: eh.Hex(),
 		})
 	}
+	img = nil // allow GC before any JPEG meta re-read
 
 	// EXIF facts need the full-data engine for HEIC; without it the
 	// built-in reader (JPEG-only) below simply fails and the file keeps
 	// no capture facts, which is the correct degradation.
 	if kind == "jpeg" || kind == "heic" {
-		if f, ok := exifFacts(path, data, t); ok {
-			info.EXIFCapture = f.Capture
-			info.EXIFOffset = f.Offset
-			info.EXIFCamera = f.Camera
-			info.HasGPS = f.HasGPS
-			info.GPSLat = f.GPSLat
-			info.GPSLon = f.GPSLon
-			// Orientations 5-8 are the transposed ones: the displayed
-			// axes swap relative to the stored pixels.
-			if f.Orientation >= 5 && f.Orientation <= 8 {
-				info.Width, info.Height = info.Height, info.Width
-			}
-		}
+		applyEXIF(&info, path, t)
 	}
 	return info, nil
 }
 
-// exifFacts derives the EXIF facts of a JPEG, preferring the full-data
-// engine and falling back to the built-in reader.
-func exifFacts(path string, data []byte, t *exif.Tool) (meta.Facts, bool) {
+func applyEXIF(info *Info, path string, t *exif.Tool) {
+	f, ok := exifFacts(path, t)
+	if !ok {
+		return
+	}
+	info.EXIFCapture = f.Capture
+	info.EXIFOffset = f.Offset
+	info.EXIFCamera = f.Camera
+	info.HasGPS = f.HasGPS
+	info.GPSLat = f.GPSLat
+	info.GPSLon = f.GPSLon
+	// Orientations 5-8 are the transposed ones: the displayed
+	// axes swap relative to the stored pixels.
+	if f.Orientation >= 5 && f.Orientation <= 8 && info.Width > 0 {
+		info.Width, info.Height = info.Height, info.Width
+	}
+}
+
+// exifFacts derives EXIF facts, preferring the full-data engine and
+// falling back to a JPEG-only re-read (after decode, so peak RAM is not
+// file bytes + decoded image together).
+func exifFacts(path string, t *exif.Tool) (meta.Facts, bool) {
 	if t != nil {
 		if f, err := t.Facts(path); err == nil {
 			return meta.Facts{
@@ -166,32 +173,53 @@ func exifFacts(path string, data []byte, t *exif.Tool) (meta.Facts, bool) {
 			}, true
 		}
 	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return meta.Facts{}, false
+	}
 	f, err := meta.FromJPEG(data)
 	return f, err == nil
 }
 
+// decodeFile opens path and decodes from the file handle so we do not keep
+// a whole-file []byte beside the decoded image. Decoders may still buffer
+// internally (HEIC WASM especially).
+func decodeFile(path, kind string) (image.Image, error) {
+	switch kind {
+	case "jpeg", "png", "gif", "heic":
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		return decode(f, kind)
+	default:
+		// shortcut: webp/tiff have no decoder, so they are recorded
+		// unhashable and never group with re-encodes of other formats;
+		// add a CGO-free decoder dependency when that under-grouping bites.
+		return nil, errNoDecoder
+	}
+}
+
 // decode dispatches on the image kind.
-func decode(data []byte, kind string) (image.Image, error) {
+func decode(r io.Reader, kind string) (image.Image, error) {
 	switch kind {
 	case "jpeg":
-		return jpeg.Decode(bytes.NewReader(data))
+		return jpeg.Decode(r)
 	case "png":
-		return png.Decode(bytes.NewReader(data))
+		return png.Decode(r)
 	case "gif":
-		return gif.Decode(bytes.NewReader(data))
+		return gif.Decode(r)
 	case "heic":
 		// Decode failures degrade to EXIF-only rows (errNoDecoder): the
 		// young WASM decoder does not cover every HEIF variant, and one
 		// unreadable HEIC must not error its file out of the library.
-		img, err := heic.Decode(bytes.NewReader(data))
+		img, err := heic.Decode(r)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %w", errNoDecoder, err)
 		}
 		return img, nil
 	default:
-		// shortcut: webp/tiff have no decoder, so they are recorded
-		// unhashable and never group with re-encodes of other formats;
-		// add a CGO-free decoder dependency when that under-grouping bites.
 		return nil, errNoDecoder
 	}
 }

@@ -4,9 +4,12 @@ go 1.27.0
 
 require (
 	github.com/ardanlabs/kronk v1.32.9
+	github.com/bmatcuk/doublestar/v4 v4.10.4
 	github.com/gen2brain/heic v0.7.2
 	github.com/yashikota/exiftool-go v1.2.0
+	golang.org/x/image v0.46.0
 	golang.org/x/sys v0.48.0
+	gopkg.in/yaml.v3 v3.0.1
 	modernc.org/sqlite v1.60.1
 )
 
@@ -65,6 +68,7 @@ require (
 	github.com/hybridgroup/yzma v1.29.2-0.20261008090110-1a800a2f3861 // indirect
 	github.com/jupiterrider/ffi v0.8.0 // indirect
 	github.com/klauspost/compress v1.20.1 // indirect
+	github.com/kr/text v0.2.0 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
@@ -93,7 +97,6 @@ require (
 	go.opentelemetry.io/proto/otlp v1.11.1 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
-	golang.org/x/image v0.46.0 // indirect
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
 	golang.org/x/sync v0.23.0 // indirect

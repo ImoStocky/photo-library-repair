@@ -91,11 +91,11 @@ func (s *Store) Rollback(commitID int64) (CommitResult, error) {
 	groups := snapshotList(snap)
 	for _, g := range groups {
 		if _, err := tx.Exec(`
-			INSERT INTO groups (id, status, reason, resolved_by, pixel_image_id, pixel_phash,
+			INSERT INTO groups (id, status, reason, conflict_kind, resolved_by, pixel_image_id, pixel_phash,
 			                    capture_image_id, capture_time, capture_instant, capture_fallback,
 			                    gps_lat, gps_lon, has_gps, stored_name)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			g.ID, g.Status, g.Reason, g.ResolvedBy,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			g.ID, g.Status, g.Reason, g.ConflictKind, g.ResolvedBy,
 			g.PixelImageID, g.PixelPhash, g.CaptureImageID,
 			g.CaptureTime, g.CaptureInstant, boolInt(g.CaptureFallback),
 			g.GPSLat, g.GPSLon, boolInt(g.HasGPS), g.StoredName); err != nil {
@@ -165,12 +165,12 @@ func (s *Store) insertCommit(res *CommitResult, groups []Group) error {
 	}
 	for _, g := range groups {
 		if _, err := tx.Exec(`
-			INSERT INTO commit_groups (commit_id, group_id, status, reason, resolved_by,
+			INSERT INTO commit_groups (commit_id, group_id, status, reason, conflict_kind, resolved_by,
 			                          pixel_image_id, pixel_phash, capture_image_id,
 			                          capture_time, capture_instant, capture_fallback,
 			                          gps_lat, gps_lon, has_gps, stored_name)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			res.Commit.ID, g.ID, g.Status, g.Reason, g.ResolvedBy,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			res.Commit.ID, g.ID, g.Status, g.Reason, g.ConflictKind, g.ResolvedBy,
 			g.PixelImageID, g.PixelPhash, g.CaptureImageID,
 			g.CaptureTime, g.CaptureInstant, boolInt(g.CaptureFallback),
 			g.GPSLat, g.GPSLon, boolInt(g.HasGPS), g.StoredName); err != nil {
@@ -229,7 +229,7 @@ func (s *Store) snapshot(commitID int64) (map[int64]Group, bool, error) {
 		return nil, false, nil
 	}
 	rows, err := s.db.Query(`
-		SELECT group_id, status, reason, resolved_by, pixel_image_id, pixel_phash, capture_image_id,
+		SELECT group_id, status, reason, conflict_kind, resolved_by, pixel_image_id, pixel_phash, capture_image_id,
 		       capture_time, capture_instant, capture_fallback,
 		       gps_lat, gps_lon, has_gps, stored_name
 		FROM commit_groups WHERE commit_id = ?`, commitID)
@@ -241,7 +241,7 @@ func (s *Store) snapshot(commitID int64) (map[int64]Group, bool, error) {
 	for rows.Next() {
 		var g Group
 		var fallback, hasGPS int
-		if err := rows.Scan(&g.ID, &g.Status, &g.Reason, &g.ResolvedBy, &g.PixelImageID, &g.PixelPhash, &g.CaptureImageID,
+		if err := rows.Scan(&g.ID, &g.Status, &g.Reason, &g.ConflictKind, &g.ResolvedBy, &g.PixelImageID, &g.PixelPhash, &g.CaptureImageID,
 			&g.CaptureTime, &g.CaptureInstant, &fallback,
 			&g.GPSLat, &g.GPSLon, &hasGPS, &g.StoredName); err != nil {
 			return nil, false, err

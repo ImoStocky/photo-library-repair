@@ -51,6 +51,14 @@ const (
 	StatusSingleton = "singleton"
 )
 
+// Stable conflict kinds on a plan row (beside free-text Reason).
+const (
+	ConflictKindGPS             = "gps"
+	ConflictKindUndecodable     = "undecodable"
+	ConflictKindBirthBeforeEXIF = "birth_before_exif"
+	ConflictKindAmbiguousMerge  = "ambiguous_merge"
+)
+
 // captureTolerance is how many seconds a file's creation time may precede
 // the EXIF capture time of its own picture before the group conflicts.
 const captureTolerance = 5
@@ -84,6 +92,7 @@ const Rules = "rules"
 // Plan is the outcome of resolving one group.
 type Plan struct {
 	Status          string // StatusResolved | StatusConflict | StatusSingleton
+	Kind            string // ConflictKind* when StatusConflict; empty otherwise
 	Reason          string
 	ResolvedBy      string // Rules, or the name of the resolver that settled a conflict
 	PixelImageID    string
@@ -100,6 +109,7 @@ type Plan struct {
 
 // Conflict is a group the automatic rules cannot resolve.
 type Conflict struct {
+	Kind   string
 	Reason string
 	Images []Image
 }
@@ -286,17 +296,20 @@ func ResolveGroup(imgs []Image, res Resolver) Plan {
 		plan.Reason = "earliest EXIF capture time"
 	}
 
-	conflictReason := ""
+	conflictReason, conflictKind := "", ""
 	if len(imgs) == 1 {
 		im := imgs[0]
 		if im.Phash == "" && !hasEXIFInstant(im) {
 			conflictReason = "picture cannot be decoded and carries no EXIF capture time"
+			conflictKind = ConflictKindUndecodable
 		} else {
 			plan.Status = StatusSingleton
 		}
 	} else {
 		plan.Status = StatusResolved
-		conflictReason = birthTimeDoubt(imgs)
+		if why := birthTimeDoubt(imgs); why != "" {
+			conflictReason, conflictKind = why, ConflictKindBirthBeforeEXIF
+		}
 	}
 
 	// GPS is supplementary: members without a position inherit, agreeing
@@ -305,8 +318,8 @@ func ResolveGroup(imgs []Image, res Resolver) Plan {
 	if g, why := gpsMedoid(imgs); g >= 0 {
 		gIm := imgs[g]
 		plan.HasGPS, plan.GPSLat, plan.GPSLon = gIm.HasGPS, gIm.GPSLat, gIm.GPSLon
-		if conflictReason == "" {
-			conflictReason = why
+		if conflictReason == "" && why != "" {
+			conflictReason, conflictKind = why, ConflictKindGPS
 		}
 	}
 
@@ -314,11 +327,12 @@ func ResolveGroup(imgs []Image, res Resolver) Plan {
 		return plan
 	}
 	plan.Status = StatusConflict
+	plan.Kind = conflictKind
 	plan.Reason = conflictReason
 	if res == nil {
 		return plan
 	}
-	d, err := res.Resolve(Conflict{Reason: conflictReason, Images: imgs})
+	d, err := res.Resolve(Conflict{Kind: conflictKind, Reason: conflictReason, Images: imgs})
 	if err != nil {
 		plan.Reason += "; resolver failed: " + err.Error()
 		return plan
@@ -328,6 +342,7 @@ func ResolveGroup(imgs []Image, res Resolver) Plan {
 		return plan
 	}
 	plan.Status = StatusResolved
+	plan.Kind = ""
 	plan.Reason = "conflict settled by resolver: " + conflictReason
 	plan.ResolvedBy = res.Name()
 	plan.PixelImageID = d.PixelImageID
@@ -339,6 +354,23 @@ func ResolveGroup(imgs []Image, res Resolver) Plan {
 	plan.CaptureInstant = captureInstant(capIm)
 	plan.HasGPS, plan.GPSLat, plan.GPSLon = capIm.HasGPS, capIm.GPSLat, capIm.GPSLon
 	return plan
+}
+
+// MarkAmbiguousMerge upgrades a plan to an ambiguous-merge conflict when an
+// increment join tied across library groups. Existing conflict kinds stay;
+// the reason gains a note. Join assignment is unchanged.
+func MarkAmbiguousMerge(p Plan) Plan {
+	const note = "matches more than one library group"
+	if p.Status != StatusConflict {
+		p.Status = StatusConflict
+		p.Kind = ConflictKindAmbiguousMerge
+		p.Reason = note
+		return p
+	}
+	if !strings.Contains(p.Reason, note) {
+		p.Reason += "; " + note
+	}
+	return p
 }
 
 // pickCapture returns the index of the member that provides the kept

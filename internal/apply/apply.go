@@ -20,6 +20,7 @@ package apply
 import (
 	"cmp"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -30,20 +31,49 @@ import (
 
 	"photo-library-repair/internal/exif"
 	"photo-library-repair/internal/exifwrite"
+	"photo-library-repair/internal/filter"
 	"photo-library-repair/internal/group"
 	"photo-library-repair/internal/meta"
 	"photo-library-repair/internal/store"
 )
 
+// ErrStrictConflicts means Options.Strict refused to materialize because
+// unresolved conflict groups remain in the plan.
+var ErrStrictConflicts = errors.New("unresolved conflict groups (--strict)")
+
 // Options controls an apply run.
 type Options struct {
-	Target string     // directory that receives the final images
-	DryRun bool       // report what would be done without touching the target
-	NoEXIF bool       // copy files without writing merged EXIF
-	Move   bool       // delete the source file once its copy is in place
-	EXIF   *exif.Tool // full-data engine; nil uses the built-in writer
+	Target   string     // directory that receives the final images
+	DryRun   bool       // report what would be done without touching the target
+	NoEXIF   bool       // copy files without writing merged EXIF
+	Move     bool       // delete the source file once its copy is in place
+	Strict   bool       // refuse to write when any StatusConflict remains
+	EXIF     *exif.Tool // full-data engine; nil uses the built-in writer
+	Identity string     // identity strategy name for report lineage (optional)
+	Stages   *StageCounters
+	// Filter, when set, evaluates each planned pixel before writing. Drops
+	// skip materialization; an existing target file is moved to DeniedDir.
+	Filter    *filter.Ruleset
+	DeniedDir string            // default: <Target>/denied
+	Denier    *filter.Denier    // optional; built from DeniedDir when nil
+	ExifLoad  filter.ExifLoader // optional EXIF tag source for rules
 	// OnProgress reports (done, total) as each group is processed.
 	OnProgress func(done, total int64)
+}
+
+// StageCounters are optional pipeline counts mirrored into report.json.
+type StageCounters struct {
+	ScanCached          int `json:"scan_cached,omitempty"`
+	ScanAlreadyKnown    int `json:"scan_already_known,omitempty"`
+	ScanAdded           int `json:"scan_added,omitempty"`
+	ScanUpdated         int `json:"scan_updated,omitempty"`
+	Present             int `json:"present,omitempty"`
+	Joined              int `json:"joined,omitempty"`
+	New                 int `json:"new,omitempty"`
+	Ambiguous           int `json:"ambiguous,omitempty"`
+	PartitionSHAHits    int `json:"partition_sha_hits,omitempty"`
+	PartitionCandidates int `json:"partition_candidates,omitempty"`
+	PartitionSameCalls  int `json:"partition_same_calls,omitempty"`
 }
 
 // Per-file actions reported by FileResult.Action.
@@ -52,6 +82,7 @@ const (
 	ActionUpdated   = "updated"   // the output exists but its content was rewritten
 	ActionRenamed   = "renamed"   // the existing output was moved to a new name
 	ActionUntouched = "untouched" // the recorded output is already current
+	ActionDropped   = "dropped"   // filter rules refused materialization
 )
 
 // FileResult describes one file the run placed, would place, or left alone.
@@ -68,14 +99,15 @@ type FileResult struct {
 // Report summarizes an apply run. Copied, Updated and Renamed count files
 // the run acted on; Untouched counts outputs the ledger proved current.
 type Report struct {
-	DryRun    bool
-	Files     []FileResult
-	Copied    int // new outputs placed
-	Updated   int // existing outputs rewritten
-	Moved     int // move mode: files whose source was deleted
-	Renamed   int // outputs moved to a new name (incl. first-time prefixed placements)
-	Untouched int // outputs left in place by the ledger
-	Errors    []string
+	DryRun        bool
+	Files         []FileResult
+	Copied        int            // new outputs placed
+	Updated       int            // existing outputs rewritten
+	Moved         int            // move mode: files whose source was deleted
+	Renamed       int            // outputs moved to a new name (incl. first-time prefixed placements)
+	Untouched     int            // outputs left in place by the ledger
+	FilterDropped map[string]int // rule name → count
+	Errors        []string
 }
 
 func (rep *Report) count(action string, renamed bool) {
@@ -86,6 +118,8 @@ func (rep *Report) count(action string, renamed bool) {
 		rep.Updated++
 	case ActionRenamed:
 		rep.Renamed++
+	case ActionDropped:
+		// counted in FilterDropped
 	default:
 		rep.Copied++
 		if renamed {
@@ -96,39 +130,48 @@ func (rep *Report) count(action string, renamed bool) {
 
 // groupJSON is one plan entry in report.json.
 type groupJSON struct {
-	ID              int64   `json:"id"`
-	StoredName      string  `json:"stored_name"`
-	Status          string  `json:"status"`
-	Reason          string  `json:"reason,omitempty"`
-	CaptureTime     string  `json:"capture_time,omitempty"`
-	CaptureFallback bool    `json:"capture_fallback,omitempty"`
-	HasGPS          bool    `json:"has_gps,omitempty"`
-	GPSLat          float64 `json:"gps_lat,omitzero"`
-	GPSLon          float64 `json:"gps_lon,omitzero"`
-	PixelSource     string  `json:"pixel_source,omitempty"`
+	ID              int64    `json:"id"`
+	StoredName      string   `json:"stored_name"`
+	Status          string   `json:"status"`
+	ConflictKind    string   `json:"conflict_kind,omitempty"`
+	Reason          string   `json:"reason,omitempty"`
+	CaptureTime     string   `json:"capture_time,omitempty"`
+	CaptureFallback bool     `json:"capture_fallback,omitempty"`
+	HasGPS          bool     `json:"has_gps,omitempty"`
+	GPSLat          float64  `json:"gps_lat,omitzero"`
+	GPSLon          float64  `json:"gps_lon,omitzero"`
+	PixelImageID    string   `json:"pixel_image_id,omitempty"`
+	PixelSource     string   `json:"pixel_source,omitempty"`
+	Members         []string `json:"members,omitempty"`
 }
 
 // reportJSON is the machine-readable summary written into the target
 // directory as report.json after a non-dry-run apply.
 type reportJSON struct {
-	Generated string       `json:"generated"`
-	Target    string       `json:"target"`
-	Copied    int          `json:"copied"`
-	Updated   int          `json:"updated,omitempty"`
-	Untouched int          `json:"untouched,omitempty"`
-	Moved     int          `json:"moved,omitempty"`
-	Renamed   int          `json:"renamed,omitempty"`
-	Files     []FileResult `json:"files"`
-	Groups    []groupJSON  `json:"groups"`
-	Errors    []string     `json:"errors,omitempty"`
+	Generated string         `json:"generated"`
+	Target    string         `json:"target"`
+	CommitID  int64          `json:"commit_id,omitzero"`
+	Identity  string         `json:"identity,omitempty"`
+	Stages    *StageCounters `json:"stages,omitempty"`
+	Copied    int            `json:"copied"`
+	Updated   int            `json:"updated,omitempty"`
+	Untouched int            `json:"untouched,omitempty"`
+	Moved     int            `json:"moved,omitempty"`
+	Renamed   int            `json:"renamed,omitempty"`
+	Files     []FileResult   `json:"files"`
+	Groups    []groupJSON    `json:"groups"`
+	Errors    []string       `json:"errors,omitempty"`
 }
 
 // writeReportJSON writes report.json into target summarizing the run and
 // every group's plan (conflict groups included, with their reason).
-func writeReportJSON(target string, rep Report, groups []store.Group, byID map[string]store.Image, sources map[int64]string) error {
+func writeReportJSON(target string, rep Report, groups []store.Group, byID map[string]store.Image, sources map[int64]string, opts Options, commitID int64, membersByGroup map[int64][]string) error {
 	rj := reportJSON{
 		Generated: time.Now().UTC().Format(time.RFC3339),
 		Target:    target,
+		CommitID:  commitID,
+		Identity:  opts.Identity,
+		Stages:    opts.Stages,
 		Copied:    rep.Copied,
 		Updated:   rep.Updated,
 		Untouched: rep.Untouched,
@@ -145,12 +188,15 @@ func writeReportJSON(target string, rep Report, groups []store.Group, byID map[s
 			ID:              g.ID,
 			StoredName:      g.StoredName,
 			Status:          g.Status,
+			ConflictKind:    g.ConflictKind,
 			Reason:          g.Reason,
 			CaptureTime:     g.CaptureTime,
 			CaptureFallback: g.CaptureFallback,
 			HasGPS:          g.HasGPS,
 			GPSLat:          g.GPSLat,
 			GPSLon:          g.GPSLon,
+			PixelImageID:    g.PixelImageID,
+			Members:         membersByGroup[g.ID],
 		}
 		if im, ok := byID[g.PixelImageID]; ok {
 			ej.PixelSource = filepath.Join(sources[im.SourceID], im.RelPath)
@@ -172,6 +218,38 @@ func targetKey(target string) string {
 		return filepath.Clean(abs)
 	}
 	return filepath.Clean(target)
+}
+
+// ClearDroppedOutputs removes apply-ledger rows whose Name matches a path
+// plr filter moved out of the target (match on the relative path or its
+// base name). Same end state as an apply-time filter drop.
+func ClearDroppedOutputs(s *store.Store, target string, rels []string) (int, error) {
+	if s == nil || len(rels) == 0 {
+		return 0, nil
+	}
+	want := make(map[string]struct{}, len(rels)*2)
+	for _, rel := range rels {
+		rel = filepath.Clean(rel)
+		want[strings.ToLower(rel)] = struct{}{}
+		want[strings.ToLower(filepath.Base(rel))] = struct{}{}
+	}
+	key := targetKey(target)
+	ledger, err := s.GroupOutputs(key)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	for gid, row := range ledger {
+		name := strings.ToLower(row.Name)
+		if _, ok := want[name]; !ok {
+			continue
+		}
+		if err := s.DeleteGroupOutput(key, gid); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
 }
 
 // adoptLedger seeds the ledger from a report.json left by a pre-ledger
@@ -222,21 +300,31 @@ func stale(prev store.GroupOutput, pixelSHA, factsSig string) bool {
 }
 
 // planFacts derives the merged EXIF facts the plan writes for one group.
+// CaptureFallback never invents DateTimeOriginal/offset (file birth is not
+// authoritative EXIF); GPS from the plan may still be written.
 func planFacts(g store.Group, pixel store.Image, opts Options) (bool, exifwrite.Facts) {
 	if pixel.Kind != "jpeg" || opts.NoEXIF {
 		return false, exifwrite.Facts{}
 	}
-	offsetSec, ok := captureOffsetSec(g.CaptureTime, g.CaptureInstant)
-	if !ok {
+	f := exifwrite.Facts{
+		HasGPS: g.HasGPS,
+		GPSLat: g.GPSLat,
+		GPSLon: g.GPSLon,
+	}
+	if !g.CaptureFallback {
+		offsetSec, ok := captureOffsetSec(g.CaptureTime, g.CaptureInstant)
+		if !ok {
+			if !g.HasGPS {
+				return false, exifwrite.Facts{}
+			}
+			return true, f
+		}
+		f.Capture = exifWallClock(g.CaptureInstant, offsetSec)
+		f.Offset = offsetString(offsetSec)
+	} else if !g.HasGPS {
 		return false, exifwrite.Facts{}
 	}
-	return true, exifwrite.Facts{
-		Capture: exifWallClock(g.CaptureInstant, offsetSec),
-		Offset:  offsetString(offsetSec),
-		HasGPS:  g.HasGPS,
-		GPSLat:  g.GPSLat,
-		GPSLon:  g.GPSLon,
-	}
+	return true, f
 }
 
 // factsSignature fingerprints the merged EXIF facts for the ledger.
@@ -287,6 +375,30 @@ func planName(g store.Group, prev store.GroupOutput, hadPrev bool, taken func(st
 func Apply(s *store.Store, opts Options) (Report, error) {
 	var rep Report
 	rep.DryRun = opts.DryRun
+	if opts.Filter != nil {
+		rep.FilterDropped = map[string]int{}
+	}
+
+	var denier *filter.Denier
+	if opts.Filter != nil {
+		deniedDir := opts.DeniedDir
+		if deniedDir == "" {
+			deniedDir = filepath.Join(opts.Target, "denied")
+		}
+		if opts.Denier != nil {
+			denier = opts.Denier
+		} else {
+			var out io.Writer
+			if opts.DryRun {
+				out = os.Stdout
+			}
+			denier = filter.NewDenier(deniedDir, opts.DryRun, out)
+		}
+		if err := denier.EnsureDir(); err != nil {
+			return rep, fmt.Errorf("denied dir: %w", err)
+		}
+		defer denier.Close()
+	}
 
 	groups, err := s.AllGroups()
 	if err != nil {
@@ -301,11 +413,28 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 		return rep, fmt.Errorf("read sources: %w", err)
 	}
 	byID := make(map[string]store.Image, len(images))
+	membersByGroup := map[int64][]string{}
 	for _, im := range images {
 		byID[im.ID] = im
+		if im.GroupID != 0 {
+			membersByGroup[im.GroupID] = append(membersByGroup[im.GroupID],
+				filepath.Join(sources[im.SourceID], im.RelPath))
+		}
 	}
 	if len(groups) == 0 {
 		return rep, nil
+	}
+
+	strictN := 0
+	if opts.Strict {
+		for _, g := range groups {
+			if g.Status == group.StatusConflict {
+				strictN++
+			}
+		}
+		if strictN > 0 && !opts.DryRun {
+			return rep, fmt.Errorf("%w: %d unresolved", ErrStrictConflicts, strictN)
+		}
 	}
 
 	key := targetKey(opts.Target)
@@ -357,9 +486,9 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 		if opts.OnProgress != nil {
 			opts.OnProgress(int64(i+1), int64(len(groups)))
 		}
-		// Conflict groups are never dropped: the plan's best-effort
-		// pixels materialize as a plain copy and the ledger records
-		// why the plan is only best effort.
+		// Conflict groups still materialize (plain copy, no merged EXIF);
+		// the ledger records why the plan is only best effort. A filter
+		// drop may still move the file afterward, same as any other group.
 		conflict := g.Status == group.StatusConflict
 
 		pixel, ok := byID[g.PixelImageID]
@@ -415,6 +544,52 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 				action = ActionUntouched
 			}
 		}
+
+		if opts.Filter != nil {
+			info, ferr := filter.LoadImageInfo(srcPath, pixel.RelPath, opts.ExifLoad)
+			if ferr != nil {
+				rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: filter: %v", g.ID, ferr))
+				continue
+			}
+			dec := opts.Filter.Evaluate(info)
+			if dec.Action == filter.ActionDrop {
+				fr := FileResult{
+					Source: srcPath,
+					Dest:   destPath,
+					Group:  g.ID,
+					Action: ActionDropped,
+				}
+				// Remove this group's current library file (ledger name),
+				// not only planName — an unclaimed same-name file may force
+				// a prefix that does not exist on disk yet.
+				removeName := name
+				if hadPrev {
+					removeName = prev.Name
+				}
+				removePath := filepath.Join(opts.Target, removeName)
+				if _, err := os.Stat(removePath); err == nil {
+					if _, err := denier.Drop(removePath, removeName, dec.Rule, pixel.Size); err != nil {
+						rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: deny existing: %v", g.ID, err))
+						continue
+					}
+				}
+				if !opts.DryRun && hadPrev {
+					if err := s.DeleteGroupOutput(key, g.ID); err != nil {
+						rep.Errors = append(rep.Errors, fmt.Sprintf("group %d: drop ledger: %v", g.ID, err))
+					}
+					delete(ledger, g.ID)
+					delete(owner, strings.ToLower(prev.Name))
+					if prev.PixelID != "" {
+						delete(pixelOwner, prev.PixelID)
+					}
+				}
+				rep.FilterDropped[dec.Rule]++
+				rep.Files = append(rep.Files, fr)
+				rep.count(ActionDropped, false)
+				continue
+			}
+		}
+
 		reserved[strings.ToLower(name)] = g.ID
 
 		fr := FileResult{
@@ -515,10 +690,17 @@ func Apply(s *store.Store, opts Options) (Report, error) {
 		}
 	}
 
+	var commitID int64
+	if commits, err := s.Commits(); err == nil && len(commits) > 0 {
+		commitID = commits[len(commits)-1].ID
+	}
 	if !opts.DryRun {
-		if err := writeReportJSON(opts.Target, rep, groups, byID, sources); err != nil {
+		if err := writeReportJSON(opts.Target, rep, groups, byID, sources, opts, commitID, membersByGroup); err != nil {
 			rep.Errors = append(rep.Errors, fmt.Sprintf("write report.json: %v", err))
 		}
+	}
+	if strictN > 0 {
+		return rep, fmt.Errorf("%w: %d unresolved", ErrStrictConflicts, strictN)
 	}
 	return rep, nil
 }

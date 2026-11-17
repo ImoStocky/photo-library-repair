@@ -124,7 +124,7 @@ func TestResolveSingleEXIFFileTooOldConflicts(t *testing.T) {
 	a.ExifOffset = "Z"
 	b := im("b", "b.jpg", hb, created, 800, 600, 20)
 	p := ResolveGroup([]Image{a, b}, nil)
-	if p.Status != StatusConflict {
+	if p.Status != StatusConflict || p.Kind != ConflictKindBirthBeforeEXIF {
 		t.Fatalf("plan = %+v", p)
 	}
 	if p.Reason == "" {
@@ -243,7 +243,7 @@ func TestResolveUndecodableSingletonConflicts(t *testing.T) {
 	// A lone picture with neither pixels nor EXIF cannot be vetted.
 	blank := im("blank", "blank.webp", "", ts(2024, 5, 1, 9, 0, 0), 0, 0, 10)
 	p := ResolveGroup([]Image{blank}, nil)
-	if p.Status != StatusConflict || !strings.Contains(p.Reason, "decoded") {
+	if p.Status != StatusConflict || p.Kind != ConflictKindUndecodable || !strings.Contains(p.Reason, "decoded") {
 		t.Fatalf("plan = %+v", p)
 	}
 
@@ -263,7 +263,7 @@ func TestResolveMultipleEXIFGPSDisagreementConflicts(t *testing.T) {
 	b.ExifCapture, b.ExifOffset = "2024:05:01 12:00:00", "+02:00"
 	b.HasGPS, b.GPSLat, b.GPSLon = true, 48.85, 2.35
 	p := ResolveGroup([]Image{a, b}, nil)
-	if p.Status != StatusConflict || !strings.Contains(p.Reason, "GPS") {
+	if p.Status != StatusConflict || p.Kind != ConflictKindGPS || !strings.Contains(p.Reason, "GPS") {
 		t.Fatalf("plan = %+v", p)
 	}
 	// The medoid stays the plan's best effort (with two members, the first).
@@ -329,6 +329,19 @@ func (failingResolver) Name() string { return "failing-resolver" }
 
 func (failingResolver) Resolve(Conflict) (Decision, error) {
 	return Decision{}, errors.New("resolver exploded")
+}
+
+func TestMarkAmbiguousMerge(t *testing.T) {
+	p := Plan{Status: StatusResolved, Reason: "earliest EXIF capture time"}
+	p = MarkAmbiguousMerge(p)
+	if p.Status != StatusConflict || p.Kind != ConflictKindAmbiguousMerge {
+		t.Fatalf("resolved -> ambiguous: %+v", p)
+	}
+	gps := Plan{Status: StatusConflict, Kind: ConflictKindGPS, Reason: "EXIF GPS positions differ"}
+	gps = MarkAmbiguousMerge(gps)
+	if gps.Kind != ConflictKindGPS || !strings.Contains(gps.Reason, "more than one library group") {
+		t.Fatalf("keep gps kind: %+v", gps)
+	}
 }
 
 func TestPickNamePreferences(t *testing.T) {

@@ -33,6 +33,7 @@ plr increment --dir NEW_PHOTOS --target RESULT --db plr.db
 | Command | Role |
 | --- | --- |
 | `scan` | Walk dirs; record sha256, 16-byte perceptual hash, EXIF into SQLite. Skips already-scanned dirs unless `--force`. |
+| `filter` | Walk a materialized library; apply YAML firewall rules; move drops to `--denied-dir`. |
 | `group` | Exact sha256 + Hamming-near phash → groups |
 | `plan` | Per group: best pixels, earliest capture, GPS; mark conflicts |
 | `apply` | **Materialize:** copy (or `--move`) planned files to `--target`, write merged EXIF and `report.json` |
@@ -40,6 +41,51 @@ plr increment --dir NEW_PHOTOS --target RESULT --db plr.db
 | `increment` | Grow an existing library: scan new dirs into the same DB, then re-group / re-plan / re-apply |
 | `report` | Summarize library / groups / plans |
 | `selftest` | Built-in parity checks |
+
+## Filtering
+
+Optional firewall-style rules act on the **materialized library** (`--target`),
+not on source scans. Omit `--filter-rules` and behaviour is unchanged.
+
+```text
+plr apply --target LIB --filter-rules rules.yaml [--denied-dir LIB/denied] [--dry-run]
+plr filter --dir LIB --filter-rules rules.yaml [--db plr.db] [--denied-dir LIB/denied] [--dry-run]
+plr filter --filter-rules rules.yaml --explain LIB/suspect.jpg
+```
+
+`apply --filter-rules` skips writing drops and moves an existing target file
+into denied (and clears that group's apply-ledger row). `plr filter` walks an
+already-materialized library the same way and then clears matching ledger
+rows in `--db` so a later apply does not treat the move as still present.
+Conflict groups still materialize; filter may move them like any other file.
+`build` / `increment` pass `--filter-rules` through to the apply phase only.
+
+Example `rules.yaml`:
+
+```yaml
+version: 1
+default: accept
+
+rules:
+  - name: abnormal-aspect-ratio
+    match: { min_aspect_ratio: 16 }
+    action: drop
+
+  - name: miniature
+    match: { format: jpeg, aspect_ratio: 1, max_width: 499, max_height: 499 }
+    action: drop
+
+  - name: clutter
+    match:
+      any:
+        - all: [ { format: png }, { max_file_size: 50KB } ]
+        - all: [ { max_width: 127 }, { max_height: 127 } ]
+    action: drop
+```
+
+Dropped files are **moved** to `<denied-dir>/<rule-name>/<relative-path>` (default
+`<target-or-dir>/denied`). Default drops use `_default/`. Moves are logged in
+`denied/manifest.jsonl`. The denied directory is skipped on later `plr filter` walks.
 
 **EXIF engine:** read/write uses the real ExifTool 13.59 embedded as
 WebAssembly (pure Go, no system dependencies); commands print

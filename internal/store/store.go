@@ -43,6 +43,7 @@ type Group struct {
 	ID              int64
 	Status          string // resolved|conflict|singleton
 	Reason          string
+	ConflictKind    string // stable kind (gps, undecodable, ...); empty when not a conflict
 	ResolvedBy      string // "rules" or the resolver that settled the conflict
 	PixelImageID    string
 	PixelPhash      string // perceptual hash of the selected pixel file
@@ -98,6 +99,7 @@ CREATE TABLE IF NOT EXISTS groups (
   id INTEGER PRIMARY KEY,
   status TEXT NOT NULL,
   reason TEXT NOT NULL DEFAULT '',
+  conflict_kind TEXT NOT NULL DEFAULT '',
   resolved_by TEXT NOT NULL DEFAULT 'rules',
   pixel_image_id TEXT NOT NULL DEFAULT '',
   pixel_phash TEXT NOT NULL DEFAULT '',
@@ -111,6 +113,10 @@ CREATE TABLE IF NOT EXISTS groups (
   stored_name TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS ambiguous_groups (
+  group_id INTEGER PRIMARY KEY
+);
+
 CREATE TABLE IF NOT EXISTS commits (
   id INTEGER PRIMARY KEY,
   at INTEGER NOT NULL,
@@ -122,6 +128,7 @@ CREATE TABLE IF NOT EXISTS commit_groups (
   group_id INTEGER NOT NULL,
   status TEXT NOT NULL,
   reason TEXT NOT NULL DEFAULT '',
+  conflict_kind TEXT NOT NULL DEFAULT '',
   resolved_by TEXT NOT NULL DEFAULT 'rules',
   pixel_image_id TEXT NOT NULL DEFAULT '',
   pixel_phash TEXT NOT NULL DEFAULT '',
@@ -205,6 +212,8 @@ func migrate(db *sql.DB) error {
 		{"images", "has_gps", "INTEGER NOT NULL DEFAULT 0"},
 		{"groups", "pixel_phash", "TEXT NOT NULL DEFAULT ''"},
 		{"groups", "resolved_by", "TEXT NOT NULL DEFAULT 'rules'"},
+		{"groups", "conflict_kind", "TEXT NOT NULL DEFAULT ''"},
+		{"commit_groups", "conflict_kind", "TEXT NOT NULL DEFAULT ''"},
 		{"images", "mtime", "INTEGER NOT NULL DEFAULT 0"},
 		{"images", "exif_camera", "TEXT NOT NULL DEFAULT ''"},
 		{"group_outputs", "conflict", "TEXT NOT NULL DEFAULT ''"},
@@ -490,13 +499,14 @@ func (s *Store) SetGroupAssignments(assign map[string]int64) error {
 }
 
 const saveGroupSQL = `
-		INSERT INTO groups (id, status, reason, resolved_by, pixel_image_id, pixel_phash, capture_image_id,
+		INSERT INTO groups (id, status, reason, conflict_kind, resolved_by, pixel_image_id, pixel_phash, capture_image_id,
 		                     capture_time, capture_instant, capture_fallback,
 		                     gps_lat, gps_lon, has_gps, stored_name)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 		  status = excluded.status,
 		  reason = excluded.reason,
+		  conflict_kind = excluded.conflict_kind,
 		  resolved_by = excluded.resolved_by,
 		  pixel_image_id = excluded.pixel_image_id,
 		  pixel_phash = excluded.pixel_phash,
@@ -512,7 +522,7 @@ const saveGroupSQL = `
 // SaveGroup upserts the plan for one group.
 func (s *Store) SaveGroup(g Group) error {
 	_, err := s.db.Exec(saveGroupSQL,
-		g.ID, g.Status, g.Reason, g.ResolvedBy, g.PixelImageID, g.PixelPhash, g.CaptureImageID,
+		g.ID, g.Status, g.Reason, g.ConflictKind, g.ResolvedBy, g.PixelImageID, g.PixelPhash, g.CaptureImageID,
 		g.CaptureTime, g.CaptureInstant, boolInt(g.CaptureFallback),
 		g.GPSLat, g.GPSLon, boolInt(g.HasGPS), g.StoredName)
 	return err
@@ -537,7 +547,7 @@ func (s *Store) ReplacePlans(plans []Group, assign map[string]int64) error {
 	keep := make([]any, 0, len(plans))
 	for _, g := range plans {
 		if _, err := save.Exec(
-			g.ID, g.Status, g.Reason, g.ResolvedBy, g.PixelImageID, g.PixelPhash, g.CaptureImageID,
+			g.ID, g.Status, g.Reason, g.ConflictKind, g.ResolvedBy, g.PixelImageID, g.PixelPhash, g.CaptureImageID,
 			g.CaptureTime, g.CaptureInstant, boolInt(g.CaptureFallback),
 			g.GPSLat, g.GPSLon, boolInt(g.HasGPS), g.StoredName); err != nil {
 			return err
@@ -573,7 +583,7 @@ func (s *Store) ReplacePlans(plans []Group, assign map[string]int64) error {
 // AllGroups returns every stored plan.
 func (s *Store) AllGroups() ([]Group, error) {
 	rows, err := s.db.Query(`
-		SELECT id, status, reason, resolved_by, pixel_image_id, pixel_phash, capture_image_id,
+		SELECT id, status, reason, conflict_kind, resolved_by, pixel_image_id, pixel_phash, capture_image_id,
 		       capture_time, capture_instant, capture_fallback,
 		       gps_lat, gps_lon, has_gps, stored_name
 		FROM groups ORDER BY id`)
@@ -585,7 +595,7 @@ func (s *Store) AllGroups() ([]Group, error) {
 	for rows.Next() {
 		var g Group
 		var fallback, hasGPS int
-		if err := rows.Scan(&g.ID, &g.Status, &g.Reason, &g.ResolvedBy, &g.PixelImageID, &g.PixelPhash, &g.CaptureImageID,
+		if err := rows.Scan(&g.ID, &g.Status, &g.Reason, &g.ConflictKind, &g.ResolvedBy, &g.PixelImageID, &g.PixelPhash, &g.CaptureImageID,
 			&g.CaptureTime, &g.CaptureInstant, &fallback,
 			&g.GPSLat, &g.GPSLon, &hasGPS, &g.StoredName); err != nil {
 			return nil, err
@@ -595,6 +605,54 @@ func (s *Store) AllGroups() ([]Group, error) {
 		out = append(out, g)
 	}
 	return out, rows.Err()
+}
+
+// ReplaceAmbiguousGroups records library groups that received an ambiguous
+// increment join (tie across groups). Cleared after the next plan phase.
+func (s *Store) ReplaceAmbiguousGroups(ids []int64) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM ambiguous_groups`); err != nil {
+		return err
+	}
+	stmt, err := tx.Prepare(`INSERT INTO ambiguous_groups (group_id) VALUES (?)`)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+	for _, id := range ids {
+		if _, err := stmt.Exec(id); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// AmbiguousGroups returns group ids pending an ambiguous_merge plan conflict.
+func (s *Store) AmbiguousGroups() (map[int64]bool, error) {
+	rows, err := s.db.Query(`SELECT group_id FROM ambiguous_groups`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
+// ClearAmbiguousGroups drops pending ambiguous-merge marks.
+func (s *Store) ClearAmbiguousGroups() error {
+	_, err := s.db.Exec(`DELETE FROM ambiguous_groups`)
+	return err
 }
 
 // GroupCounts returns the number of groups per status.
