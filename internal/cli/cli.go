@@ -104,7 +104,8 @@ Usage:
                [--filter-rules PATH] [--denied-dir PATH]
   plr filter   --dir DIR --filter-rules PATH [--denied-dir PATH] [--dry-run]
                [--db PATH] [--explain FILE] [--workers N] [--limit N]
-               [--no-model] [--model SOURCE]
+               [--no-model] [--model SOURCE] [--mmproj PATH]
+               (model/mmproj also settable in YAML; CLI overrides)
   plr build    --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr increment --dir DIR... --target DIR [scan, group, plan and apply flags]
   plr commit   [--message TEXT] [--db PATH]
@@ -154,8 +155,10 @@ Commands:
   filter    Walk a materialized library (--dir), apply YAML firewall rules,
             and move drops to --denied-dir (default <dir>/denied). Then
             classify survivors (action: classify) with a Kronk vision model
-            unless --no-model. Clears drop ledger rows and updates ledger
-            paths for classify moves in --db (default plr.db).
+            unless --no-model. model / mmproj may be set in YAML
+            (top-level or classify.*); --model / --mmproj override YAML.
+            Clears drop ledger rows and updates ledger paths for classify
+            moves in --db (default plr.db).
             --flatten restores classified files to their pre-classify paths
             via classify-manifest.jsonl (no rules needed). --denied restores
             drops from denied-dir/manifest.jsonl (default <dir>/denied).
@@ -346,7 +349,8 @@ func runFilter(args []string) int {
 	workers := fs.Int("workers", 4, "parallel filter/classify workers (also classify batch size)")
 	limit := fs.Int("limit", 0, "max images to process after walk (0 = all)")
 	noModel := fs.Bool("no-model", false, "skip classify rules (drop/accept/tag only)")
-	modelSource := fs.String("model", kronkai.DefaultVisionModel, "Kronk vision model for classify rules")
+	modelSource := fs.String("model", "", "Kronk vision model (overrides YAML; default "+kronkai.DefaultVisionModel+")")
+	mmproj := fs.String("mmproj", "", "vision projector GGUF path (overrides YAML)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -395,7 +399,14 @@ func runFilter(args []string) int {
 	opts := filter.DirOpts{Workers: *workers, Limit: *limit, Exif: exifLoad}
 	dropProg := progress.New("filter")
 	defer dropProg.Stop()
-	opts.OnDropProgress = func(_, total int64) { dropProg.SetTotal(total); dropProg.Add(1) }
+	opts.OnDropProgress = func(done, total int64) {
+		dropProg.SetTotal(total)
+		dropProg.Add(1)
+		// Finish the drop line before classify starts rewriting stderr.
+		if total > 0 && done >= total {
+			dropProg.Stop()
+		}
+	}
 
 	ctx := context.Background()
 	var classProg *progress.Reporter
@@ -403,7 +414,8 @@ func runFilter(args []string) int {
 		var stop context.CancelFunc
 		ctx, stop = signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		vc, closeFn, err := kronkai.NewVisionClassifier(ctx, *modelSource)
+		src, proj := filter.ResolveVisionModel(*modelSource, *mmproj, rs, kronkai.DefaultVisionModel)
+		vc, closeFn, err := kronkai.NewVisionClassifier(ctx, src, proj)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "plr filter:", err)
 			return 1
@@ -412,7 +424,11 @@ func runFilter(args []string) int {
 		opts.Classifier = vc
 		opts.ClassMover = &filter.ClassMover{Root: *dir, DryRun: *dryRun, Out: out}
 		defer opts.ClassMover.Close()
-		fmt.Printf("vision model %s loaded; classify enabled\n", vc.Name())
+		if proj != "" {
+			fmt.Printf("vision model %s (mmproj %s) loaded; classify enabled\n", vc.Name(), proj)
+		} else {
+			fmt.Printf("vision model %s loaded; classify enabled\n", vc.Name())
+		}
 
 		classProg = progress.New("classify")
 		defer classProg.Stop()

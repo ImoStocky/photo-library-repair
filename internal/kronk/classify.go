@@ -3,12 +3,14 @@ package kronk
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"image"
 	"image/jpeg"
 	_ "image/png"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	kronksdk "github.com/ardanlabs/kronk/sdk/kronk"
@@ -25,16 +27,23 @@ const DefaultVisionModel = "unsloth/Qwen3-VL-4B-Instruct-BF16"
 const classifyTimeout = 5 * time.Minute
 const classifyMaxSide = 1024
 
-// VisionClassifier labels images via Kronk Chat + ImageMessage.
+// VisionClassifier labels images via Kronk Chat.
+// The classify rule text is pinned once as a system prompt; each Classify
+// call sends only a new image user turn and expects a label reply.
 type VisionClassifier struct {
 	krn     *kronksdk.Kronk
 	modelID string
 	ctx     context.Context
+
+	sysOnce sync.Once
+	system  string
 }
 
 // NewVisionClassifier loads a vision (projection) model for classify.
-func NewVisionClassifier(ctx context.Context, modelSource string) (*VisionClassifier, func(), error) {
-	krn, err := loadKronk(ctx, modelSource)
+// projFile, when non-empty, overrides the downloaded mmproj (e.g. a Q8_0
+// projector paired with Q4 text weights).
+func NewVisionClassifier(ctx context.Context, modelSource, projFile string) (*VisionClassifier, func(), error) {
+	krn, err := loadKronk(ctx, modelSource, projFile)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -51,8 +60,15 @@ func NewVisionClassifier(ctx context.Context, modelSource string) (*VisionClassi
 func (c *VisionClassifier) Name() string { return c.modelID }
 
 // Classify implements filter.Classifier.
+//
+// The first call pins prompt (rule text + labels) as the system setup.
+// Later calls keep that system prompt and send only the image.
 func (c *VisionClassifier) Classify(ctx context.Context, imagePath, prompt string, labels []string) (filter.ClassifyResult, error) {
 	_ = labels // already embedded in prompt by filter.BuildClassifyPrompt
+	c.sysOnce.Do(func() { c.system = strings.TrimSpace(prompt) })
+	if c.system == "" {
+		return filter.ClassifyResult{}, fmt.Errorf("empty classify system prompt")
+	}
 	jpegBytes, err := imageJPEGBytes(imagePath, classifyMaxSide)
 	if err != nil {
 		return filter.ClassifyResult{}, err
@@ -66,7 +82,7 @@ func (c *VisionClassifier) Classify(ctx context.Context, imagePath, prompt strin
 	callCtx, cancel := context.WithTimeout(ctx, classifyTimeout)
 	defer cancel()
 	resp, err := c.krn.Chat(callCtx, model.D{
-		"messages":        model.ImageMessage(prompt, jpegBytes, "jpeg"),
+		"messages":        buildClassifyMessages(c.system, jpegBytes),
 		"max_tokens":      128,
 		"enable_thinking": false,
 		"temperature":     0.0,
@@ -79,6 +95,29 @@ func (c *VisionClassifier) Classify(ctx context.Context, imagePath, prompt strin
 		raw = resp.Choices[0].Message.Content
 	}
 	return filter.ClassifyResult{Raw: raw, Label: strings.TrimSpace(raw)}, nil
+}
+
+// buildClassifyMessages is system setup + image-only user turn.
+func buildClassifyMessages(systemPrompt string, jpeg []byte) []model.D {
+	return model.Messages(
+		model.TextMessage(model.RoleSystem, systemPrompt),
+		imageOnlyUserMessage(jpeg),
+	)
+}
+
+func imageOnlyUserMessage(jpeg []byte) model.D {
+	url := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(jpeg)
+	return model.D{
+		"role": model.RoleUser,
+		"content": []model.D{
+			{
+				"type": "image_url",
+				"image_url": model.D{
+					"url": url,
+				},
+			},
+		},
+	}
 }
 
 func imageJPEGBytes(path string, maxSide int) ([]byte, error) {

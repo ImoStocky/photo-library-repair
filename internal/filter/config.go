@@ -30,6 +30,8 @@ var ruleNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]*$`)
 // Ruleset is a compiled, read-only filter configuration.
 type Ruleset struct {
 	Default     string // accept | drop
+	Model       string // Kronk vision model source for classify (optional)
+	Mmproj      string // optional vision projector GGUF path
 	Rules       []compiledRule
 	NeedsEXIF   bool
 	HasClassify bool
@@ -50,6 +52,8 @@ type compiledRule struct {
 type rawDoc struct {
 	Version int       `yaml:"version"`
 	Default string    `yaml:"default"`
+	Model   string    `yaml:"model"`  // optional; CLI --model overrides
+	Mmproj  string    `yaml:"mmproj"` // optional; CLI --mmproj overrides
 	Rules   []rawRule `yaml:"rules"`
 }
 
@@ -62,6 +66,8 @@ type rawRule struct {
 }
 
 type rawClassify struct {
+	Model      string            `yaml:"model"`  // optional; same as top-level model
+	Mmproj     string            `yaml:"mmproj"` // optional; same as top-level mmproj
 	Prompt     string            `yaml:"prompt"`
 	Categories map[string]string `yaml:"categories"`
 }
@@ -162,7 +168,12 @@ func compileDoc(doc rawDoc) (*Ruleset, error) {
 		return nil, fmt.Errorf("filter rules: default must be accept or drop (got %q)", def)
 	}
 
-	rs := &Ruleset{Default: def, Rules: make([]compiledRule, 0, len(doc.Rules))}
+	rs := &Ruleset{
+		Default: def,
+		Model:   strings.TrimSpace(doc.Model),
+		Mmproj:  strings.TrimSpace(doc.Mmproj),
+		Rules:   make([]compiledRule, 0, len(doc.Rules)),
+	}
 	seen := map[string]bool{}
 	for i, r := range doc.Rules {
 		line := max(r.Match.Line, 0)
@@ -227,6 +238,9 @@ func compileDoc(doc rawDoc) (*Ruleset, error) {
 				cr.Labels = append(cr.Labels, label)
 			}
 			slices.Sort(cr.Labels)
+			if err := mergeVisionConfig(rs, r.Name, r.Classify.Model, r.Classify.Mmproj); err != nil {
+				return nil, err
+			}
 			rs.HasClassify = true
 		default:
 			return nil, fmt.Errorf("filter rules: rule %q: unknown action %q", r.Name, action)
@@ -243,6 +257,47 @@ func compileDoc(doc rawDoc) (*Ruleset, error) {
 		rs.Rules = append(rs.Rules, cr)
 	}
 	return rs, nil
+}
+
+// mergeVisionConfig folds a classify rule's model/mmproj into the ruleset.
+// Top-level YAML values win when already set; conflicting values error.
+func mergeVisionConfig(rs *Ruleset, rule, model, mmproj string) error {
+	model = strings.TrimSpace(model)
+	mmproj = strings.TrimSpace(mmproj)
+	if model != "" {
+		if rs.Model != "" && rs.Model != model {
+			return fmt.Errorf("filter rules: rule %q: classify.model %q conflicts with %q", rule, model, rs.Model)
+		}
+		if rs.Model == "" {
+			rs.Model = model
+		}
+	}
+	if mmproj != "" {
+		if rs.Mmproj != "" && rs.Mmproj != mmproj {
+			return fmt.Errorf("filter rules: rule %q: classify.mmproj %q conflicts with %q", rule, mmproj, rs.Mmproj)
+		}
+		if rs.Mmproj == "" {
+			rs.Mmproj = mmproj
+		}
+	}
+	return nil
+}
+
+// ResolveVisionModel picks the Kronk vision model and optional mmproj path.
+// CLI values override YAML; fallback is used when neither sets model.
+func ResolveVisionModel(cliModel, cliMmproj string, rs *Ruleset, fallback string) (model, mmproj string) {
+	model = strings.TrimSpace(cliModel)
+	if model == "" && rs != nil {
+		model = strings.TrimSpace(rs.Model)
+	}
+	if model == "" {
+		model = fallback
+	}
+	mmproj = strings.TrimSpace(cliMmproj)
+	if mmproj == "" && rs != nil {
+		mmproj = strings.TrimSpace(rs.Mmproj)
+	}
+	return model, mmproj
 }
 
 // CategoryDirs returns every classify label used as a folder name under the library.

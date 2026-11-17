@@ -51,6 +51,83 @@ rules:
 	}
 }
 
+func TestLoadVisionModelFromYAML(t *testing.T) {
+	rs, err := LoadBytes([]byte(`
+version: 1
+default: accept
+model: top/Model
+mmproj: /tmp/top-mmproj.gguf
+rules:
+  - name: content-type
+    match: { format: jpeg }
+    action: classify
+    classify:
+      prompt: "pick one"
+      categories: { screenshot: "s" }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rs.Model != "top/Model" || rs.Mmproj != "/tmp/top-mmproj.gguf" {
+		t.Fatalf("ruleset model=%q mmproj=%q", rs.Model, rs.Mmproj)
+	}
+
+	rs, err = LoadBytes([]byte(`
+version: 1
+default: accept
+rules:
+  - name: content-type
+    match: { format: jpeg }
+    action: classify
+    classify:
+      model: rule/Model
+      mmproj: /tmp/rule-mmproj.gguf
+      prompt: "pick one"
+      categories: { screenshot: "s" }
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rs.Model != "rule/Model" || rs.Mmproj != "/tmp/rule-mmproj.gguf" {
+		t.Fatalf("ruleset model=%q mmproj=%q", rs.Model, rs.Mmproj)
+	}
+}
+
+func TestLoadVisionModelConflict(t *testing.T) {
+	_, err := LoadBytes([]byte(`
+version: 1
+default: accept
+model: top/Model
+rules:
+  - name: content-type
+    match: { format: jpeg }
+    action: classify
+    classify:
+      model: other/Model
+      prompt: "pick one"
+      categories: { screenshot: "s" }
+`))
+	if err == nil {
+		t.Fatal("expected conflict between top-level and classify.model")
+	}
+}
+
+func TestResolveVisionModel(t *testing.T) {
+	rs := &Ruleset{Model: "yaml/Model", Mmproj: "/yaml/mmproj.gguf"}
+	model, mmproj := ResolveVisionModel("", "", rs, "fallback/Model")
+	if model != "yaml/Model" || mmproj != "/yaml/mmproj.gguf" {
+		t.Fatalf("yaml only: model=%q mmproj=%q", model, mmproj)
+	}
+	model, mmproj = ResolveVisionModel("cli/Model", "/cli/mmproj.gguf", rs, "fallback/Model")
+	if model != "cli/Model" || mmproj != "/cli/mmproj.gguf" {
+		t.Fatalf("cli override: model=%q mmproj=%q", model, mmproj)
+	}
+	model, mmproj = ResolveVisionModel("", "", nil, "fallback/Model")
+	if model != "fallback/Model" || mmproj != "" {
+		t.Fatalf("fallback: model=%q mmproj=%q", model, mmproj)
+	}
+}
+
 func TestParseClassifyLabel(t *testing.T) {
 	allowed := map[string]string{"screenshot": "s", "document": "d"}
 	if got := ParseClassifyLabel(`{"label":"screenshot"}`, allowed); got != "screenshot" {

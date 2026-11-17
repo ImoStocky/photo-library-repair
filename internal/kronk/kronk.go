@@ -33,7 +33,7 @@ type Resolver struct {
 // New loads the decision model named modelSource and returns a resolver
 // plus a close function that unloads the model.
 func New(ctx context.Context, modelSource string) (*Resolver, func(), error) {
-	krn, err := loadKronk(ctx, modelSource)
+	krn, err := loadKronk(ctx, modelSource, "")
 	if err != nil {
 		return nil, nil, err
 	}

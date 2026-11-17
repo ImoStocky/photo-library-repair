@@ -1,13 +1,14 @@
 // Package progress prints periodic one-line progress updates for the long
 // phases of plr. A Reporter counts work items with atomics while a
-// background goroutine prints one line per second to a writer (os.Stderr
-// by default); Stop always prints the final line.
+// background goroutine rewrites one stderr line per second (\r); Stop
+// always prints the final line with a trailing newline.
 package progress
 
 import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +24,9 @@ type Reporter struct {
 	stop    chan struct{}
 	stopped chan struct{}
 	once    sync.Once
+
+	mu      sync.Mutex
+	lastLen int
 }
 
 // New starts a reporter for one phase. The total amount of work is
@@ -56,7 +60,7 @@ func (r *Reporter) Stop() {
 	r.once.Do(func() {
 		close(r.stop)
 		<-r.stopped
-		r.print(time.Now())
+		r.print(true)
 	})
 }
 
@@ -69,29 +73,56 @@ func (r *Reporter) loop() {
 		case <-r.stop:
 			return
 		case <-t.C:
-			r.print(time.Now())
+			r.print(false)
 		}
 	}
 }
 
-// print writes one line, e.g.
+// print writes one progress line, e.g.
 //
-//	scan: 12345/98765 (12%) 64.5/s eta 21m03s [3m12s]
-func (r *Reporter) print(now time.Time) {
+//	scan: 12345/98765 (12%) 64.5/s eta 21m3s [3m12s]
+//
+// Live updates rewrite the current terminal line with \r; the final call
+// ends with a newline.
+func (r *Reporter) print(final bool) {
 	done := r.done.Load()
 	total := r.total.Load()
-	elapsed := now.Sub(r.start)
+	elapsed := time.Since(r.start)
+
+	var b strings.Builder
 	if total > 0 {
-		fmt.Fprintf(r.w, "%s: %d/%d (%d%%)", r.label, done, total, done*100/total)
+		fmt.Fprintf(&b, "%s: %d/%d (%d%%)", r.label, done, total, done*100/total)
 	} else {
-		fmt.Fprintf(r.w, "%s: %d", r.label, done)
+		fmt.Fprintf(&b, "%s: %d", r.label, done)
 	}
 	if done > 0 && elapsed > 0 {
 		rate := float64(done) / elapsed.Seconds()
-		fmt.Fprintf(r.w, " %.1f/s", rate)
+		fmt.Fprintf(&b, " %.1f/s", rate)
 		if total > done {
-			fmt.Fprintf(r.w, " eta %s", time.Duration(float64(total-done)/rate*float64(time.Second)))
+			eta := time.Duration(float64(total-done) / rate * float64(time.Second))
+			fmt.Fprintf(&b, " eta %s", eta.Round(time.Second))
 		}
 	}
-	fmt.Fprintf(r.w, " [%s]\n", elapsed.Round(time.Second))
+	fmt.Fprintf(&b, " [%s]", elapsed.Round(time.Second))
+	line := b.String()
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if final {
+		if r.lastLen > len(line) {
+			fmt.Fprintf(r.w, "\r%s\r%s\n", strings.Repeat(" ", r.lastLen), line)
+		} else if r.lastLen > 0 {
+			fmt.Fprintf(r.w, "\r%s\n", line)
+		} else {
+			fmt.Fprintf(r.w, "%s\n", line)
+		}
+		r.lastLen = 0
+		return
+	}
+	pad := ""
+	if n := r.lastLen - len(line); n > 0 {
+		pad = strings.Repeat(" ", n)
+	}
+	fmt.Fprintf(r.w, "\r%s%s", line, pad)
+	r.lastLen = len(line)
 }
