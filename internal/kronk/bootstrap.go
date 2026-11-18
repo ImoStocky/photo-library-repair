@@ -12,6 +12,10 @@ import (
 	"github.com/ardanlabs/kronk/sdk/tools/models"
 )
 
+// contextWindowTokens caps KV/context for loaded Kronk models (classify +
+// decision). Keeps Metal/RSS down versus the model's native max context.
+const contextWindowTokens = 16 * 1024
+
 // resolveProjFile picks the mmproj path Kronk should load.
 // An empty override keeps the downloaded projector; a non-empty override
 // must exist on disk (used to force a lower-quant vision encoder).
@@ -92,7 +96,17 @@ func loadKronkOnce(ctx context.Context, modelSource, projOverride, processor str
 	opts := []model.Option{
 		model.WithModelFiles(mp.ModelFiles),
 		model.WithProjFile(proj),
+		model.WithContextWindow(contextWindowTokens),
 		model.WithAutoTune(true),
+	}
+	// Vision path: match classifyMaxSide (1024) so the projector does not
+	// inflate detail beyond the JPEG we feed. NSeqMax allows parallel
+	// classify workers to share one loaded model.
+	if proj != "" {
+		opts = append(opts,
+			model.WithImageTokenBudget(classifyMaxSide),
+			model.WithNSeqMax(2),
+		)
 	}
 	if cpuOnly {
 		opts = append(opts, model.WithNGpuLayers(0))

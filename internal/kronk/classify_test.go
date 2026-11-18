@@ -8,8 +8,8 @@ import (
 )
 
 func TestBuildClassifyMessages(t *testing.T) {
-	jpeg := []byte{0xff, 0xd8, 0xff} // not a real JPEG; shape-only check
-	msgs := buildClassifyMessages("pick a label", jpeg)
+	data := []byte{0xff, 0xd8, 0xff} // not a real JPEG; shape-only check
+	msgs := buildClassifyMessages("pick a label", data, "jpeg")
 	if len(msgs) != 2 {
 		t.Fatalf("len(msgs)=%d, want 2 (system + user)", len(msgs))
 	}
@@ -36,5 +36,28 @@ func TestBuildClassifyMessages(t *testing.T) {
 	url, _ := img["url"].(string)
 	if !strings.HasPrefix(url, "data:image/jpeg;base64,") {
 		t.Fatalf("url=%q, want jpeg data URL", url)
+	}
+}
+
+func TestMimeFromMagic(t *testing.T) {
+	if got := mimeFromMagic([]byte{0xff, 0xd8, 0xff, 0xe0}); got != "jpeg" {
+		t.Fatalf("jpeg magic: %q", got)
+	}
+	png := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, 8)...)
+	if got := mimeFromMagic(png); got != "png" {
+		t.Fatalf("png magic: %q", got)
+	}
+	webp := []byte("RIFF1234WEBP")
+	if got := mimeFromMagic(webp); got != "webp" {
+		t.Fatalf("webp magic: %q", got)
+	}
+}
+
+func TestImageMIMEFromExt(t *testing.T) {
+	if got := imageMIME("x.HEIC", nil); got != "heic" {
+		t.Fatalf("heic ext: %q", got)
+	}
+	if got := imageMIME("x.jpg", nil); got != "jpeg" {
+		t.Fatalf("jpg ext: %q", got)
 	}
 }
