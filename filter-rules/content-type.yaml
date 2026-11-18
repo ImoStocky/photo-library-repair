@@ -3,7 +3,7 @@ default: accept
 
 # Optional; CLI --model / --mmproj override these when set.
 model: unsloth/Qwen3-VL-4B-Instruct-BF16
-mmproj: /Users/sylvia/Repos/photo-library-repair/unsloth/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf
+# mmproj: /path/to/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf
 
 rules:
   - name: content-type
@@ -15,7 +15,8 @@ rules:
       # "none" / unknown label → leave in place (no confidence gate yet)
       prompt: |
         You are sorting images within a library. Classify image as whole, dont focus on small details.
-        Answer with exactly one label from the list or "none" if no label fits.
+        Choose exactly one label from the list or "none" if no label fits.
+        Reply with JSON only: {"label":"<label or none>"}.
         
       categories:
         email: "image shows an email message"
