@@ -1,9 +1,13 @@
 package kronk
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"image"
+	"image/jpeg"
+	_ "image/png"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,6 +16,9 @@ import (
 
 	kronksdk "github.com/ardanlabs/kronk/sdk/kronk"
 	"github.com/ardanlabs/kronk/sdk/kronk/model"
+	_ "github.com/gen2brain/heic"
+	"golang.org/x/image/draw"
+	_ "golang.org/x/image/webp"
 
 	"photo-library-repair/internal/filter"
 )
@@ -20,11 +27,29 @@ import (
 const DefaultVisionModel = "unsloth/Qwen3-VL-4B-Instruct-BF16"
 
 const classifyTimeout = 5 * time.Minute
-const classifyMaxSide = 1024 // used for ImageTokenBudget; pixels are not re-encoded
+const classifyMaxSide = 1024 // JPEG long edge + ImageTokenBudget
+const classifyJPEGQuality = 85
+
+// Short EXIF keys for the per-image text sidecar (order preserved).
+var classifyExifKeys = []string{
+	"DateTimeOriginal",
+	"OffsetTimeOriginal",
+	"CreateDate",
+	"Make",
+	"Model",
+	"Camera",
+	"LensModel",
+	"Orientation",
+	"GPSLatitude",
+	"GPSLongitude",
+	"GPSPosition",
+	"ImageDescription",
+	"Software",
+}
 
 // VisionClassifier labels images via Kronk Chat.
 // The classify rule text is pinned once as a system prompt; each Classify
-// call sends only a new image user turn and expects a label reply.
+// call sends a new image user turn (resized JPEG + short filename/dims/EXIF text).
 type VisionClassifier struct {
 	krn     *kronksdk.Kronk
 	modelID string
@@ -57,15 +82,18 @@ func (c *VisionClassifier) Name() string { return c.modelID }
 // Classify implements filter.Classifier.
 //
 // The first call pins prompt (rule text + labels) as the system setup.
-// Later calls keep that system prompt and send only the image file bytes
-// (no decode/re-encode).
-func (c *VisionClassifier) Classify(ctx context.Context, imagePath, prompt string, labels []string) (filter.ClassifyResult, error) {
+// Later calls keep that system prompt and send a max-side JPEG plus a
+// short text sidecar (filename, dimensions, selected EXIF).
+func (c *VisionClassifier) Classify(ctx context.Context, info *filter.ImageInfo, prompt string, labels []string) (filter.ClassifyResult, error) {
 	_ = labels // already embedded in prompt by filter.BuildClassifyPrompt
 	c.sysOnce.Do(func() { c.system = strings.TrimSpace(prompt) })
 	if c.system == "" {
 		return filter.ClassifyResult{}, fmt.Errorf("empty classify system prompt")
 	}
-	data, mime, err := readImageFile(imagePath)
+	if info == nil || info.Path == "" {
+		return filter.ClassifyResult{}, fmt.Errorf("nil image info")
+	}
+	jpegBytes, err := imageJPEGBytes(info.Path, classifyMaxSide)
 	if err != nil {
 		return filter.ClassifyResult{}, err
 	}
@@ -78,7 +106,7 @@ func (c *VisionClassifier) Classify(ctx context.Context, imagePath, prompt strin
 	callCtx, cancel := context.WithTimeout(ctx, classifyTimeout)
 	defer cancel()
 	resp, err := c.krn.Chat(callCtx, model.D{
-		"messages":        buildClassifyMessages(c.system, data, mime),
+		"messages":        buildClassifyMessages(c.system, jpegBytes, classifySidecarText(info)),
 		"max_tokens":      128,
 		"enable_thinking": false,
 		"temperature":     0.0,
@@ -93,74 +121,107 @@ func (c *VisionClassifier) Classify(ctx context.Context, imagePath, prompt strin
 	return filter.ClassifyResult{Raw: raw, Label: strings.TrimSpace(raw)}, nil
 }
 
-// buildClassifyMessages is system setup + image-only user turn.
-func buildClassifyMessages(systemPrompt string, data []byte, mime string) []model.D {
+// buildClassifyMessages is system setup + JPEG(+text) user turn.
+// Text follows the image (Kronk ImageMessage order) so VL templates keep
+// media before the question.
+func buildClassifyMessages(systemPrompt string, jpeg []byte, sidecar string) []model.D {
 	return model.Messages(
 		model.TextMessage(model.RoleSystem, systemPrompt),
-		imageOnlyUserMessage(data, mime),
+		imageWithTextUserMessage(jpeg, sidecar),
 	)
 }
 
-func imageOnlyUserMessage(data []byte, mime string) model.D {
-	if mime == "" {
-		mime = "jpeg"
-	}
-	url := "data:image/" + mime + ";base64," + base64.StdEncoding.EncodeToString(data)
-	return model.D{
-		"role": model.RoleUser,
-		"content": []model.D{
-			{
-				"type": "image_url",
-				"image_url": model.D{
-					"url": url,
-				},
+func imageWithTextUserMessage(jpeg []byte, text string) model.D {
+	url := "data:image/jpeg;base64," + base64.StdEncoding.EncodeToString(jpeg)
+	parts := []model.D{
+		{
+			"type": "image_url",
+			"image_url": model.D{
+				"url": url,
 			},
 		},
 	}
+	if strings.TrimSpace(text) != "" {
+		parts = append(parts, model.D{
+			"type": "text",
+			"text": text,
+		})
+	}
+	return model.D{
+		"role":    model.RoleUser,
+		"content": parts,
+	}
 }
 
-// readImageFile returns the on-disk bytes and a mime subtype (jpeg/png/webp/…)
-// without decoding or re-encoding the image.
-func readImageFile(path string) ([]byte, string, error) {
-	data, err := os.ReadFile(path)
+// classifySidecarText is a short per-image fact line for the user turn.
+// Dimensions/format/bytes describe the original file, not the resized JPEG.
+func classifySidecarText(info *filter.ImageInfo) string {
+	if info == nil {
+		return ""
+	}
+	name := filepath.Base(info.Path)
+	if info.RelPath != "" {
+		name = filepath.ToSlash(info.RelPath)
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "filename: %s\n", name)
+	if info.Width > 0 && info.Height > 0 {
+		fmt.Fprintf(&b, "dimensions: %dx%d\n", info.Width, info.Height)
+	}
+	if info.Format != "" {
+		fmt.Fprintf(&b, "format: %s\n", info.Format)
+	}
+	if info.Size > 0 {
+		fmt.Fprintf(&b, "bytes: %d\n", info.Size)
+	}
+	exif := info.ExifAll()
+	var pairs []string
+	seen := map[string]bool{}
+	for _, key := range classifyExifKeys {
+		v := strings.TrimSpace(exif[key])
+		if v == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		pairs = append(pairs, key+"="+v)
+	}
+	if len(pairs) > 0 {
+		fmt.Fprintf(&b, "exif: %s\n", strings.Join(pairs, "; "))
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// imageJPEGBytes decodes path, downscales so the long edge is at most maxSide,
+// and re-encodes as JPEG for a sharp, budget-sized vision input.
+func imageJPEGBytes(path string, maxSide int) ([]byte, error) {
+	f, err := os.Open(path)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
-	return data, imageMIME(path, data), nil
+	defer f.Close()
+	img, _, err := image.Decode(f)
+	if err != nil {
+		return nil, fmt.Errorf("decode %s: %w", path, err)
+	}
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if maxSide > 0 && (w > maxSide || h > maxSide) {
+		img = downscale(img, maxSide)
+	}
+	var buf bytes.Buffer
+	if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: classifyJPEGQuality}); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
-func imageMIME(path string, data []byte) string {
-	if m := mimeFromMagic(data); m != "" {
-		return m
-	}
-	switch strings.ToLower(filepath.Ext(path)) {
-	case ".jpg", ".jpeg":
-		return "jpeg"
-	case ".png":
-		return "png"
-	case ".webp":
-		return "webp"
-	case ".gif":
-		return "gif"
-	case ".heic", ".heif":
-		return "heic"
-	default:
-		return "jpeg"
-	}
-}
-
-func mimeFromMagic(data []byte) string {
-	if len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff {
-		return "jpeg"
-	}
-	if len(data) >= 8 && string(data[:8]) == "\x89PNG\r\n\x1a\n" {
-		return "png"
-	}
-	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
-		return "webp"
-	}
-	if len(data) >= 6 && (string(data[:6]) == "GIF87a" || string(data[:6]) == "GIF89a") {
-		return "gif"
-	}
-	return ""
+func downscale(img image.Image, maxSide int) image.Image {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	scale := float64(maxSide) / float64(max(w, h))
+	nw := max(1, int(float64(w)*scale))
+	nh := max(1, int(float64(h)*scale))
+	dst := image.NewRGBA(image.Rect(0, 0, nw, nh))
+	draw.CatmullRom.Scale(dst, dst.Bounds(), img, b, draw.Src, nil)
+	return dst
 }

@@ -12,8 +12,12 @@ import (
 // mapClassifier returns a fixed label per basename (fake model).
 type mapClassifier map[string]string
 
-func (m mapClassifier) Classify(_ context.Context, imagePath, _ string, _ []string) (ClassifyResult, error) {
-	label := m[filepath.Base(imagePath)]
+func (m mapClassifier) Classify(_ context.Context, info *ImageInfo, _ string, _ []string) (ClassifyResult, error) {
+	name := ""
+	if info != nil {
+		name = filepath.Base(info.Path)
+	}
+	label := m[name]
 	if label == "" || label == "none" {
 		return ClassifyResult{Raw: `{"label":"none"}`}, nil
 	}

@@ -316,7 +316,7 @@ func classifyOne(ctx context.Context, it walkItem, rs *Ruleset, opts DirOpts) (*
 			continue
 		}
 		prompt := BuildClassifyPrompt(r.Prompt, r.Categories, r.Labels)
-		res, err := opts.Classifier.Classify(ctx, it.path, prompt, r.Labels)
+		res, err := opts.Classifier.Classify(ctx, info, prompt, r.Labels)
 		if err != nil {
 			// Model error ≠ match; try next classify rule.
 			continue
