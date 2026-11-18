@@ -2,8 +2,8 @@ version: 1
 default: accept
 
 # Optional; CLI --model / --mmproj override these when set.
-model: unsloth/Qwen3-VL-4B-Instruct-Q4_K_M
-# mmproj: /path/to/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf
+model: unsloth/Qwen3-VL-4B-Instruct-BF16
+mmproj: /Users/sylvia/Repos/photo-library-repair/unsloth/mmproj-Qwen3VL-4B-Instruct-Q8_0.gguf
 
 rules:
   - name: content-type
@@ -19,7 +19,7 @@ rules:
         
       categories:
         email: "image shows an email message"
-        screenshot: "image shows a creenshot of a computer screen"
+        screenshot: "image shows a screenshot of a computer screen"
         phone-screenshot: "image shows a screenshot of a phone screen"
         book-page: "image shows a photo of a book page"
         document: "image shows a scanned or photographed document"
