@@ -6,6 +6,7 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"maps"
 	"os"
 	"sync"
 
@@ -60,8 +61,7 @@ func LoadImageInfo(path, relPath string, exif ExifLoader) (*ImageInfo, error) {
 	}, nil
 }
 
-// EXIF returns a cached tag value. Missing tags yield ok=false.
-func (info *ImageInfo) EXIF(tag string) (string, bool) {
+func (info *ImageInfo) ensureExif() {
 	info.exifOnce.Do(func() {
 		info.exifMap = map[string]string{}
 		if info.exifLoader != nil {
@@ -93,6 +93,19 @@ func (info *ImageInfo) EXIF(tag string) (string, bool) {
 			info.exifMap["Camera"] = facts.Camera
 		}
 	})
+}
+
+// EXIF returns a cached tag value. Missing tags yield ok=false.
+func (info *ImageInfo) EXIF(tag string) (string, bool) {
+	info.ensureExif()
 	v, ok := info.exifMap[tag]
 	return v, ok
+}
+
+// ExifAll returns a copy of all loaded EXIF tags (lazy-loaded once).
+func (info *ImageInfo) ExifAll() map[string]string {
+	info.ensureExif()
+	out := make(map[string]string, len(info.exifMap))
+	maps.Copy(out, info.exifMap)
+	return out
 }

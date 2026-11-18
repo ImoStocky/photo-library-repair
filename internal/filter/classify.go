@@ -14,8 +14,9 @@ import (
 
 // Classifier labels one image. Implementations must treat errors as
 // non-matches (caller continues to the next classify rule).
+// info carries path, dimensions, and EXIF for optional sidecar text.
 type Classifier interface {
-	Classify(ctx context.Context, imagePath, prompt string, labels []string) (ClassifyResult, error)
+	Classify(ctx context.Context, info *ImageInfo, prompt string, labels []string) (ClassifyResult, error)
 }
 
 // ClassifyResult is the model answer for one image.
