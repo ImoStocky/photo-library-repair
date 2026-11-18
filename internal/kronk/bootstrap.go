@@ -100,12 +100,12 @@ func loadKronkOnce(ctx context.Context, modelSource, projOverride, processor str
 		model.WithAutoTune(true),
 	}
 	// Vision path: match classifyMaxSide (1024) so the projector does not
-	// inflate detail beyond the JPEG we feed. NSeqMax allows parallel
-	// classify workers to share one loaded model.
+	// inflate detail beyond the JPEG we feed. NSeqMax matches the default
+	// filter --workers (4) so parallel classify Chats can share one model.
 	if proj != "" {
 		opts = append(opts,
 			model.WithImageTokenBudget(classifyMaxSide),
-			model.WithNSeqMax(2),
+			model.WithNSeqMax(4),
 		)
 	}
 	if cpuOnly {

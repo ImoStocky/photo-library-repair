@@ -392,7 +392,9 @@ func runFilter(args []string) int {
 		defer tool.Close()
 	}
 	var exifLoad filter.ExifLoader
-	if rs.NeedsEXIF {
+	// Classify sidecars need Make/Model/GPS/etc.; match rules alone may not
+	// set NeedsEXIF (e.g. content-type.yaml matches on format only).
+	if rs.NeedsEXIF || (rs.HasClassify && !*noModel) {
 		exifLoad = filterExifLoader(tool)
 	}
 
